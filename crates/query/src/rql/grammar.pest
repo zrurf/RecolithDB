@@ -1,0 +1,45 @@
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ "//" ~ (!"\n" ~ ANY)* }
+
+ident_char = _{ ASCII_ALPHANUMERIC | "_" }
+ident = @{ (ASCII_ALPHA | "_") ~ ident_char* }
+
+keyword_select = @{ ^"select" ~ !ident_char }
+keyword_from = @{ ^"from" ~ !ident_char }
+keyword_where = @{ ^"where" ~ !ident_char }
+keyword_and = @{ ^"and" ~ !ident_char }
+keyword_include = @{ ^"include" ~ !ident_char }
+keyword_fragments = @{ ^"fragments" ~ !ident_char }
+keyword_limit = @{ ^"limit" ~ !ident_char }
+
+document_query = {
+    SOI
+    ~ keyword_select ~ projection_list
+    ~ keyword_from ~ ident
+    ~ keyword_where ~ predicate_list
+    ~ keyword_include ~ keyword_fragments ~ fragment_list
+    ~ (keyword_limit ~ integer)?
+    ~ ";"?
+    ~ EOI
+}
+
+projection_list = { projection ~ ("," ~ projection)* }
+projection = { path }
+path = { ident ~ selector? ~ ("." ~ ident)? }
+
+selector = { "[" ~ ident ~ comparison ~ operand ~ "]" }
+comparison = { "!=" | ">=" | "<=" | "=" | ">" | "<" }
+
+predicate_list = { predicate ~ (keyword_and ~ predicate)* }
+predicate = { path ~ comparison ~ operand }
+
+operand = { parameter | literal }
+parameter = { ":" ~ ident }
+
+literal = { string | float | integer | boolean }
+string = ${ "'" ~ ("\\" ~ ANY | !"'" ~ ANY)* ~ "'" }
+float = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+integer = @{ "-"? ~ ASCII_DIGIT+ }
+boolean = @{ (^"true" | ^"false") ~ !ident_char }
+
+fragment_list = { ident ~ ("," ~ ident)* }

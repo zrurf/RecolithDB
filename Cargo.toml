@@ -1,0 +1,106 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/common",
+    "crates/platform",
+    "crates/model",
+    "crates/schema",
+    "crates/catalog",
+    "crates/backend",
+    "crates/backend-memory",
+    "crates/backend-rocksdb",
+    "crates/backend-fjall",
+    "crates/backend-redb",
+    "crates/backend-conformance",
+    "crates/storage",
+    "crates/transaction",
+    "crates/query",
+    "crates/distributed",
+    "crates/protocol",
+    "crates/server",
+    "crates/client",
+    "crates/cli",
+    "crates/testkit",
+]
+default-members = ["crates/server", "crates/cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+recolith-common = { path = "crates/common", version = "0.1.0" }
+recolith-platform = { path = "crates/platform", version = "0.1.0" }
+recolith-model = { path = "crates/model", version = "0.1.0" }
+recolith-schema = { path = "crates/schema", version = "0.1.0" }
+recolith-catalog = { path = "crates/catalog", version = "0.1.0" }
+recolith-backend = { path = "crates/backend", version = "0.1.0" }
+recolith-backend-memory = { path = "crates/backend-memory", version = "0.1.0" }
+recolith-backend-rocksdb = { path = "crates/backend-rocksdb", version = "0.1.0" }
+recolith-backend-fjall = { path = "crates/backend-fjall", version = "0.1.0" }
+recolith-backend-redb = { path = "crates/backend-redb", version = "0.1.0" }
+recolith-backend-conformance = { path = "crates/backend-conformance", version = "0.1.0" }
+recolith-storage = { path = "crates/storage", version = "0.1.0" }
+recolith-transaction = { path = "crates/transaction", version = "0.1.0" }
+recolith-query = { path = "crates/query", version = "0.1.0" }
+recolith-distributed = { path = "crates/distributed", version = "0.1.0" }
+recolith-protocol = { path = "crates/protocol", version = "0.1.0" }
+recolith-server = { path = "crates/server", version = "0.1.0" }
+recolith-client = { path = "crates/client", version = "0.1.0" }
+recolith-cli = { path = "crates/cli", version = "0.1.0" }
+recolith-testkit = { path = "crates/testkit", version = "0.1.0" }
+
+brotli = "9.1.1"
+bytes = { version = "1.12.1", default-features = false }
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
+directories = "6.0.0"
+fjall = "3.1.13"
+flate2 = "1.1.11"
+io-uring = "0.7.15"
+libc = "0.2.191"
+log = "0.4.35"
+lz4 = "1.28.1"
+mimalloc = { version = "0.1.52", features = ["secure"] }
+mio = "1.2.4"
+parking_lot = "0.13.0"
+pest = "2.9.5"
+pest_derive = "2.9.5"
+rayon = "1.12.0"
+rustls = "0.23.46"
+semver = "1.0.28"
+serde = { version = "1.0.229", features = ["derive"] }
+sha2 = "0.11.1"
+similar = "3.2.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-stream = "0.1.19"
+toml = "1.2.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+twox-hash = "2.1.5"
+uuid = "1.29.1"
+windows-service = "0.8.1"
+windows-sys = "0.61.2"
+zstd = "0.14.3"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[profile.bench]
+inherits = "release"

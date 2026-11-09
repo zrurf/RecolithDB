@@ -1,0 +1,14 @@
+[package]
+name = "recolith-schema"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+recolith-common.workspace = true
+recolith-model.workspace = true
+
+[lints]
+workspace = true

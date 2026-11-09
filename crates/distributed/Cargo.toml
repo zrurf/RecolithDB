@@ -1,0 +1,17 @@
+[package]
+name = "recolith-distributed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+recolith-common.workspace = true
+recolith-model.workspace = true
+recolith-catalog.workspace = true
+recolith-storage.workspace = true
+recolith-transaction.workspace = true
+
+[lints]
+workspace = true

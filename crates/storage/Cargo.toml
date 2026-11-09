@@ -1,0 +1,19 @@
+[package]
+name = "recolith-storage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+recolith-common.workspace = true
+recolith-model.workspace = true
+recolith-schema.workspace = true
+recolith-backend.workspace = true
+
+[dev-dependencies]
+recolith-backend-memory.workspace = true
+
+[lints]
+workspace = true

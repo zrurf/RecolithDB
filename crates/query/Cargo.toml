@@ -1,0 +1,24 @@
+[package]
+name = "recolith-query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+pest.workspace = true
+pest_derive.workspace = true
+recolith-common.workspace = true
+recolith-model.workspace = true
+recolith-schema.workspace = true
+recolith-catalog.workspace = true
+recolith-backend.workspace = true
+recolith-storage.workspace = true
+recolith-transaction.workspace = true
+
+[dev-dependencies]
+recolith-backend-memory.workspace = true
+
+[lints]
+workspace = true

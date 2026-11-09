@@ -1,0 +1,17 @@
+[package]
+name = "recolith-backend-conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+recolith-common.workspace = true
+recolith-backend.workspace = true
+
+[dev-dependencies]
+recolith-backend-memory.workspace = true
+
+[lints]
+workspace = true

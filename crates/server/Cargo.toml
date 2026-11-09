@@ -1,0 +1,37 @@
+[package]
+name = "recolith-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+recolith-common.workspace = true
+recolith-platform.workspace = true
+recolith-model.workspace = true
+recolith-schema.workspace = true
+recolith-catalog.workspace = true
+recolith-backend.workspace = true
+recolith-storage.workspace = true
+recolith-transaction.workspace = true
+recolith-query.workspace = true
+recolith-distributed.workspace = true
+recolith-protocol.workspace = true
+recolith-backend-memory = { workspace = true, optional = true }
+recolith-backend-rocksdb = { workspace = true, optional = true }
+recolith-backend-fjall = { workspace = true, optional = true }
+recolith-backend-redb = { workspace = true, optional = true }
+
+[features]
+default = ["backend-memory"]
+backend-memory = ["dep:recolith-backend-memory"]
+backend-rocksdb = ["dep:recolith-backend-rocksdb"]
+backend-fjall = ["dep:recolith-backend-fjall"]
+backend-redb = ["dep:recolith-backend-redb"]
+
+[dev-dependencies]
+recolith-backend-fjall.workspace = true
+
+[lints]
+workspace = true
