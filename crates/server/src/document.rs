@@ -5,8 +5,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use recolith_backend::{StorageBackend, TxnOptions};
-use recolith_catalog::{Catalog, CatalogError};
-use recolith_common::{CollectionId, CommitTs, FragmentId, PartitionId};
+use recolith_catalog::{Catalog, CatalogError, CatalogSnapshot};
+use recolith_common::{CatalogGeneration, CollectionId, CommitTs, FragmentId, PartitionId};
 use recolith_model::{FragmentCardinality, IndexDefinition, IndexKind};
 use recolith_query::{DocumentReadRequest, QueryEngine, QueryError};
 use recolith_schema::RecordSchema;
@@ -72,6 +72,36 @@ impl FragmentWriteRequest {
     }
 }
 
+/// Idempotency record written in the same transaction as a document write.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Idempotency {
+    key: Vec<u8>,
+    request_hash: [u8; 32],
+}
+
+impl Idempotency {
+    /// Creates an idempotency record keyed by a caller-provided system key.
+    #[must_use]
+    pub fn new(key: impl Into<Vec<u8>>, request_hash: [u8; 32]) -> Self {
+        Self {
+            key: key.into(),
+            request_hash,
+        }
+    }
+
+    /// Returns the system key.
+    #[must_use]
+    pub fn key(&self) -> &[u8] {
+        &self.key
+    }
+
+    /// Returns the canonical request hash.
+    #[must_use]
+    pub const fn request_hash(&self) -> [u8; 32] {
+        self.request_hash
+    }
+}
+
 /// Atomic multi-fragment document write.
 #[derive(Clone, Debug)]
 pub struct DocumentWrite {
@@ -79,6 +109,7 @@ pub struct DocumentWrite {
     document_key: Vec<u8>,
     partition: PartitionId,
     fragments: Vec<FragmentWriteRequest>,
+    idempotency: Option<Idempotency>,
 }
 
 impl DocumentWrite {
@@ -94,6 +125,7 @@ impl DocumentWrite {
             document_key: document_key.into(),
             partition,
             fragments: Vec::new(),
+            idempotency: None,
         }
     }
 
@@ -127,6 +159,19 @@ impl DocumentWrite {
     pub fn fragments(&self) -> &[FragmentWriteRequest] {
         &self.fragments
     }
+
+    /// Adds an idempotency record written with the same transaction.
+    #[must_use]
+    pub fn with_idempotency(mut self, idempotency: Idempotency) -> Self {
+        self.idempotency = Some(idempotency);
+        self
+    }
+
+    /// Returns the idempotency record, if any.
+    #[must_use]
+    pub fn idempotency(&self) -> Option<&Idempotency> {
+        self.idempotency.as_ref()
+    }
 }
 
 /// Document operation error.
@@ -148,6 +193,10 @@ pub enum DocumentError {
     Storage(StorageError),
     /// The write request is inconsistent.
     InvalidRequest(String),
+    /// The same idempotency key was reused with a different request.
+    IdempotencyConflict,
+    /// The stored idempotency record is malformed.
+    InvalidIdempotencyRecord,
 }
 
 impl fmt::Display for DocumentError {
@@ -160,6 +209,12 @@ impl fmt::Display for DocumentError {
             Self::UnknownFragment(id) => write!(formatter, "unknown fragment: {id}"),
             Self::MissingMetadata(kind) => write!(formatter, "catalog is missing {kind}"),
             Self::Storage(error) => write!(formatter, "storage error: {error}"),
+            Self::IdempotencyConflict => {
+                formatter.write_str("idempotency key was reused with a different request")
+            }
+            Self::InvalidIdempotencyRecord => {
+                formatter.write_str("stored idempotency record is malformed")
+            }
             Self::InvalidRequest(message) => {
                 write!(formatter, "invalid document request: {message}")
             }
@@ -204,6 +259,27 @@ impl<B: StorageBackend> DocumentStore<B> {
     #[must_use]
     pub fn new(catalog: Arc<Catalog>, backend: Arc<B>) -> Self {
         Self { catalog, backend }
+    }
+
+    /// Returns the current catalog generation.
+    #[must_use]
+    pub fn catalog_generation(&self) -> CatalogGeneration {
+        self.catalog.generation()
+    }
+
+    /// Returns an immutable catalog snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] if an internal catalog lock is poisoned.
+    pub fn catalog_snapshot(&self) -> Result<CatalogSnapshot, DocumentError> {
+        Ok(self.catalog.snapshot()?)
+    }
+
+    /// Creates a query engine sharing this store's catalog and backend.
+    #[must_use]
+    pub fn query_engine(&self) -> QueryEngine<B> {
+        QueryEngine::new(self.catalog.clone(), self.backend.clone())
     }
 
     /// Writes all requested fragments with one commit timestamp.
@@ -308,6 +384,17 @@ impl<B: StorageBackend> DocumentStore<B> {
             PersistentCommitClock::with_default_key(),
             TxnOptions::default(),
         )?;
+        if let Some(idempotency) = request.idempotency()
+            && let Some(value) = path.get_raw(idempotency.key())?
+        {
+            let (hash, commit_ts) = decode_idempotency(&value)?;
+            if hash != idempotency.request_hash() {
+                return Err(DocumentError::IdempotencyConflict);
+            }
+
+            return Ok(commit_ts);
+        }
+
         let mut writes = Vec::with_capacity(targets.len());
         for target in targets {
             let old = path
@@ -336,6 +423,12 @@ impl<B: StorageBackend> DocumentStore<B> {
             writes.push(write);
         }
         let commit_ts = path.write_fragments(&writes)?;
+        if let Some(idempotency) = request.idempotency() {
+            path.put_raw(
+                idempotency.key(),
+                encode_idempotency(idempotency.request_hash(), commit_ts),
+            );
+        }
         path.commit()?;
 
         Ok(commit_ts)
@@ -351,6 +444,28 @@ impl<B: StorageBackend> DocumentStore<B> {
 
         Ok(engine.read_document(request)?)
     }
+}
+
+const IDEMPOTENCY_RECORD_VERSION: u8 = 1;
+const IDEMPOTENCY_RECORD_LEN: usize = 1 + 32 + 8;
+
+fn encode_idempotency(hash: [u8; 32], commit_ts: CommitTs) -> Vec<u8> {
+    let mut value = Vec::with_capacity(IDEMPOTENCY_RECORD_LEN);
+    value.push(IDEMPOTENCY_RECORD_VERSION);
+    value.extend_from_slice(&hash);
+    value.extend_from_slice(&commit_ts.get().to_le_bytes());
+    value
+}
+
+fn decode_idempotency(value: &[u8]) -> Result<([u8; 32], CommitTs), DocumentError> {
+    if value.len() != IDEMPOTENCY_RECORD_LEN || value[0] != IDEMPOTENCY_RECORD_VERSION {
+        return Err(DocumentError::InvalidIdempotencyRecord);
+    }
+    let mut hash = [0_u8; 32];
+    hash.copy_from_slice(&value[1..33]);
+    let commit_ts = u64::from_le_bytes(value[33..41].try_into().expect("eight bytes"));
+
+    Ok((hash, CommitTs::new(commit_ts)))
 }
 
 struct Target {

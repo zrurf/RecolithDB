@@ -18,6 +18,12 @@ recolith-transaction.workspace = true
 recolith-query.workspace = true
 recolith-distributed.workspace = true
 recolith-protocol.workspace = true
+prost.workspace = true
+sha2.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio-rustls.workspace = true
+tokio.workspace = true
 recolith-backend-memory = { workspace = true, optional = true }
 recolith-backend-rocksdb = { workspace = true, optional = true }
 recolith-backend-fjall = { workspace = true, optional = true }
@@ -32,6 +38,7 @@ backend-redb = ["dep:recolith-backend-redb"]
 
 [dev-dependencies]
 recolith-backend-fjall.workspace = true
+recolith-testkit.workspace = true
 
 [lints]
 workspace = true

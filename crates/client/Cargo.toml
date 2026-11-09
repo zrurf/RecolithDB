@@ -7,8 +7,22 @@ license.workspace = true
 publish = false
 
 [dependencies]
+prost.workspace = true
 recolith-common.workspace = true
 recolith-protocol.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+
+[dev-dependencies]
+recolith-backend-memory.workspace = true
+recolith-catalog.workspace = true
+recolith-model.workspace = true
+recolith-schema.workspace = true
+recolith-server.workspace = true
+recolith-storage.workspace = true
+recolith-testkit.workspace = true
 
 [lints]
 workspace = true

@@ -65,10 +65,10 @@ flowchart TB
 | `crates/transaction` | Local transactions, batch writes, unique reservations, commit clock |
 | `crates/query` | RQL parser and binder, query IR, planning, indexed execution |
 | `crates/distributed` | Membership, routing, replication, rebalancing, migration |
-| `crates/protocol` | Frames, sessions, transports, authentication, codecs |
+| `crates/protocol` | Fixed frame header, batch and compression codecs, Protobuf v1 messages |
 | `crates/platform` | OS I/O integration, Unix sockets, named pipes, service hooks |
 | `crates/server` | Composition root, in-process document service, and the `recolithd` binary |
-| `crates/client` | Rust SDK |
+| `crates/client` | Rust transport client with TLS, negotiation, and typed operations |
 | `crates/cli` | `recolith` command-line client |
 | `crates/testkit` | Fixtures, deterministic simulation, fault injection |
 
@@ -84,6 +84,10 @@ RecolithDB is in early single-node development. Implemented today:
 - Local transactions, multi-fragment commits with one timestamp, optimistic `if_match`, unique reservation workflow, persistent commit clock.
 - RQL document-query subset: parser, catalog binder, document key encoding, planner, and executor.
 - In-process document service: catalog-bound multi-fragment writes, cardinality and partition validation, multi-fragment reads, and automatic index maintenance with sparse and unique indexes.
+- Protocol frame layer: fixed 38-byte header, CRC32C, zstd/lz4 compression, BATCH codec, and Protobuf v1 messages.
+- TCP session layer: HELLO/WELCOME negotiation, bearer-token auth, compression selection, PING/PONG, BATCH dispatch, and structured errors.
+- TLS 1.3 transport with rustls and typed Rust client handshake, authentication, document, query, and batch calls.
+- Protocol document and query operations: DOC_GET, idempotent DOC_PUT with same-transaction deduplication, and RQL QUERY execution.
 - Process-exit crash recovery test and a full restart test covering catalog reload, commit-clock continuity, and persisted documents.
 - Point read/write benchmark example for the fjall adapter.
 
@@ -91,12 +95,12 @@ Not yet implemented:
 
 - Benchmarks on the target hardware profile and compaction tuning.
 - Additional persistent adapters (RocksDB, redb).
-- Network protocol, authentication, Rust SDK, and CLI.
+- Higher-level Rust SDK ergonomics, CLI, and streaming result descriptors.
 - Distributed placement, replication, and cross-partition workflows.
 
 ## Build
 
-Requires Rust 1.90 or newer (edition 2024).
+Requires Rust 1.90 or newer (edition 2024). Building the protocol crate requires `protoc`.
 
 ```text
 cargo build --workspace

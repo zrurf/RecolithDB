@@ -351,6 +351,20 @@ impl<B: StorageBackend> LocalWritePath<B> {
         Ok(read_record_fields(&mut self.transaction, key, schema)?)
     }
 
+    /// Reads raw bytes for a system key in this transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransactionError::Backend`] if the read fails.
+    pub fn get_raw(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        Ok(self.transaction.get(key)?)
+    }
+
+    /// Stages raw bytes for a system key in this transaction.
+    pub fn put_raw(&mut self, key: &[u8], value: Vec<u8>) {
+        self.transaction.put(key, value);
+    }
+
     /// Commits the transaction.
     ///
     /// # Errors

@@ -55,6 +55,7 @@ recolith-testkit = { path = "crates/testkit", version = "0.1.0" }
 brotli = "9.1.1"
 bytes = { version = "1.12.1", default-features = false }
 chrono = "0.4.45"
+crc32c = "0.6.9"
 chrono-tz = "0.10.4"
 directories = "6.0.0"
 fjall = "3.1.13"
@@ -66,16 +67,20 @@ lz4 = "1.28.1"
 mimalloc = { version = "0.1.52", features = ["secure"] }
 mio = "1.2.4"
 parking_lot = "0.13.0"
+prost = "0.14.4"
+prost-build = "0.14.4"
 pest = "2.9.5"
 pest_derive = "2.9.5"
 rayon = "1.12.0"
-rustls = "0.23.46"
+rustls = { version = "0.23.46", default-features = false, features = ["std", "ring"] }
+rustls-pemfile = "2.2.0"
 semver = "1.0.28"
 serde = { version = "1.0.229", features = ["derive"] }
 sha2 = "0.11.1"
 similar = "3.2.1"
 thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["full"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "logging"] }
 tokio-stream = "0.1.19"
 toml = "1.2.1"
 tracing = "0.1.44"

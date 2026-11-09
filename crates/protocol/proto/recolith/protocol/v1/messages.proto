@@ -1,0 +1,203 @@
+syntax = "proto3";
+
+package recolith.protocol.v1;
+
+// Metadata carried by every data-plane request.
+message RequestMeta {
+  uint64 deadline_unix_micros = 1;
+  uint64 catalog_generation = 2;
+  bytes trace_id = 3;
+  bytes idempotency_key = 4;
+}
+
+enum AuthMethod {
+  AUTH_METHOD_UNSPECIFIED = 0;
+  AUTH_METHOD_NONE = 1;
+  AUTH_METHOD_BEARER = 2;
+}
+
+enum AuthResult {
+  AUTH_RESULT_UNSPECIFIED = 0;
+  AUTH_RESULT_OK = 1;
+  AUTH_RESULT_FAILED = 2;
+}
+
+enum SecurityMode {
+  SECURITY_MODE_UNSPECIFIED = 0;
+  SECURITY_MODE_NONE = 1;
+  SECURITY_MODE_TLS13 = 2;
+}
+
+message HelloRequest {
+  uint32 protocol_min_major = 1;
+  uint32 protocol_min_minor = 2;
+  uint32 protocol_max_major = 3;
+  uint32 protocol_max_minor = 4;
+  string client_id = 5;
+  string client_version = 6;
+  AuthMethod auth_method = 7;
+  bytes auth_token = 8;
+  uint64 features = 9;
+  uint32 max_frame_size = 10;
+  uint32 max_batch_subframes = 11;
+  uint32 max_batch_bytes = 12;
+  uint32 compression_algorithms = 13;
+  uint32 compression_threshold = 14;
+  uint32 encodings = 15;
+}
+
+message WelcomeResponse {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string server_version = 3;
+  bytes session_id = 4;
+  AuthResult auth_result = 5;
+  uint64 features = 6;
+  uint32 max_frame_size = 7;
+  uint32 max_batch_subframes = 8;
+  uint32 max_batch_bytes = 9;
+  uint32 compression_algorithm = 10;
+  uint32 compression_threshold = 11;
+  uint32 max_decompressed_size = 12;
+  uint32 selected_encoding = 13;
+  uint64 catalog_generation = 14;
+  uint64 server_time_unix_micros = 15;
+  SecurityMode security = 16;
+}
+
+message PingRequest {
+  bytes payload = 1;
+}
+
+message PingResponse {
+  bytes payload = 1;
+}
+
+message ErrorResponse {
+  string message = 1;
+  bool retryable = 2;
+  uint64 retry_after_millis = 3;
+  uint64 catalog_generation = 4;
+  map<string, string> details = 5;
+}
+
+message GoAway {
+  string message = 1;
+  uint64 retry_after_millis = 2;
+}
+
+message Value {
+  oneof kind {
+    bool bool_value = 1;
+    sint32 i32_value = 2;
+    sint64 i64_value = 3;
+    uint32 u32_value = 4;
+    uint64 u64_value = 5;
+    float f32_value = 6;
+    double f64_value = 7;
+    string string_value = 8;
+    bytes bytes_value = 9;
+    uint64 timestamp_micros = 10;
+    uint64 duration_micros = 11;
+    uint32 enum_value = 12;
+    ListValue list_value = 13;
+    MapValue map_value = 14;
+    RecordValue record_value = 15;
+  }
+}
+
+message ListValue {
+  repeated Value values = 1;
+}
+
+message MapValue {
+  repeated MapEntry entries = 1;
+}
+
+message MapEntry {
+  Value key = 1;
+  Value value = 2;
+}
+
+message RecordValue {
+  repeated FieldValue fields = 1;
+}
+
+message FieldValue {
+  uint32 field_id = 1;
+  Value value = 2;
+}
+
+message FieldSelection {
+  uint32 fragment_id = 1;
+  uint32 field_id = 2;
+}
+
+message FragmentPayload {
+  uint32 fragment_id = 1;
+  bytes subkey = 2;
+  repeated FieldValue fields = 3;
+  optional uint64 if_match = 4;
+}
+
+message FragmentResult {
+  uint32 fragment_id = 1;
+  bytes subkey = 2;
+  uint64 commit_ts = 3;
+  repeated FieldValue fields = 4;
+}
+
+message FragmentVersion {
+  uint32 fragment_id = 1;
+  bytes subkey = 2;
+  uint64 commit_ts = 3;
+}
+
+message DocumentGetRequest {
+  RequestMeta meta = 1;
+  uint64 collection_id = 2;
+  uint32 partition = 3;
+  bytes document_key = 4;
+  repeated uint32 fragments = 5;
+  repeated FieldSelection projection = 6;
+}
+
+message DocumentGetResponse {
+  bytes document_key = 1;
+  repeated FragmentResult fragments = 2;
+}
+
+message DocumentPutRequest {
+  RequestMeta meta = 1;
+  uint64 collection_id = 2;
+  uint32 partition = 3;
+  bytes document_key = 4;
+  repeated FragmentPayload fragments = 5;
+}
+
+message DocumentPutResponse {
+  uint64 commit_ts = 1;
+  repeated FragmentVersion versions = 2;
+}
+
+message NamedParameter {
+  string name = 1;
+  Value value = 2;
+}
+
+message QueryRequest {
+  RequestMeta meta = 1;
+  uint32 partition = 2;
+  string rql = 3;
+  repeated NamedParameter parameters = 4;
+  uint64 limit = 5;
+}
+
+message DocumentResult {
+  bytes document_key = 1;
+  repeated FragmentResult fragments = 2;
+}
+
+message QueryResponse {
+  repeated DocumentResult documents = 1;
+}
