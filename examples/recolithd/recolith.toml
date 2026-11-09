@@ -1,0 +1,10 @@
+[server]
+listen = "127.0.0.1:7420"
+# auth_token = "change-me"
+
+[storage]
+backend = "fjall"
+path = "./data"
+
+[catalog]
+bootstrap = "catalog.toml"

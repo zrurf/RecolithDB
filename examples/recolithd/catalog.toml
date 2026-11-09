@@ -1,0 +1,45 @@
+[[keyspaces]]
+id = 1
+name = "game"
+
+[[schemas]]
+id = 1
+version = 1
+idl = """
+record Profile {
+    name: string @1;
+    level: u32 @2;
+}
+"""
+
+[[buckets]]
+id = 1
+keyspace_id = 1
+name = "player_profile"
+partitions = 16
+policy = "strict"
+schema_id = 1
+schema_version = 1
+
+[[collections]]
+id = 1
+keyspace_id = 1
+name = "player"
+affinity_group = "player"
+
+[[collections.key]]
+name = "player_id"
+type = "u64"
+
+[[collections.fragments]]
+id = 1
+name = "profile"
+bucket_id = 1
+cardinality = "one"
+
+[[indexes]]
+bucket_id = 1
+id = 1
+name = "profile_name"
+kind = "equality"
+fields = [1]

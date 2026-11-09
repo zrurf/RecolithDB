@@ -3,3 +3,4 @@
 /.tmp/
 /.idea/
 *.log
+/examples/recolithd/data/

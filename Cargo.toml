@@ -53,6 +53,7 @@ recolith-cli = { path = "crates/cli", version = "0.1.0" }
 recolith-testkit = { path = "crates/testkit", version = "0.1.0" }
 
 brotli = "9.1.1"
+clap = { version = "4.5.53", features = ["derive", "env"] }
 bytes = { version = "1.12.1", default-features = false }
 chrono = "0.4.45"
 crc32c = "0.6.9"

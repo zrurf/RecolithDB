@@ -5,19 +5,25 @@ mod operations;
 mod session;
 mod tls;
 
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use recolith_backend::StorageBackend;
 use recolith_protocol::messages::SecurityMode;
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 
 use crate::document::DocumentStore;
 
 /// Server version reported during the handshake.
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Time allowed for active sessions to finish during shutdown.
+pub const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// TLS certificate and key paths.
 #[derive(Clone, Debug)]
@@ -101,22 +107,89 @@ pub async fn serve<B: StorageBackend>(
     config: ServerConfig,
     store: Arc<DocumentStore<B>>,
 ) -> io::Result<()> {
+    serve_with_shutdown(listener, config, store, std::future::pending()).await
+}
+
+/// Accepts TCP connections until `shutdown` completes, then drains sessions.
+///
+/// Active sessions receive up to [`SHUTDOWN_DRAIN_TIMEOUT`] to finish before
+/// they are aborted.
+///
+/// # Errors
+///
+/// Returns a listener or TLS configuration I/O error. Per-session errors are
+/// contained by their tasks.
+pub async fn serve_with_shutdown<B: StorageBackend, F>(
+    listener: TcpListener,
+    config: ServerConfig,
+    store: Arc<DocumentStore<B>>,
+    shutdown: F,
+) -> io::Result<()>
+where
+    F: Future<Output = ()> + Send,
+{
     let tls = config.tls.as_ref().map(tls::acceptor).transpose()?;
     let config = Arc::new(config);
+    let mut sessions = JoinSet::new();
+    tokio::pin!(shutdown);
 
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let config = Arc::clone(&config);
-        let store = Arc::clone(&store);
-        let tls = tls.clone();
-        tokio::spawn(async move {
-            if let Some(acceptor) = tls {
-                if let Ok(stream) = acceptor.accept(stream).await {
-                    let _ = session::run(stream, peer, config, store, SecurityMode::Tls13).await;
-                }
-            } else {
-                let _ = session::run(stream, peer, config, store, SecurityMode::None).await;
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
+                let config = Arc::clone(&config);
+                let store = Arc::clone(&store);
+                let tls = tls.clone();
+                sessions.spawn(async move {
+                    if let Some(acceptor) = tls {
+                        match acceptor.accept(stream).await {
+                            Ok(stream) => {
+                                if let Err(error) =
+                                    session::run(stream, peer, config, store, SecurityMode::Tls13).await
+                                {
+                                    tracing::debug!(%peer, %error, "TLS session ended with error");
+                                }
+                            }
+                            Err(error) => {
+                                tracing::debug!(%peer, %error, "TLS handshake failed");
+                            }
+                        }
+                    } else if let Err(error) =
+                        session::run(stream, peer, config, store, SecurityMode::None).await
+                    {
+                        tracing::debug!(%peer, %error, "session ended with error");
+                    }
+                });
             }
-        });
+            () = &mut shutdown => break,
+        }
+    }
+
+    drop(listener);
+    drain_sessions(&mut sessions).await;
+
+    Ok(())
+}
+
+async fn drain_sessions(sessions: &mut JoinSet<()>) {
+    if sessions.is_empty() {
+        return;
+    }
+
+    let drain = tokio::time::sleep(SHUTDOWN_DRAIN_TIMEOUT);
+    tokio::pin!(drain);
+    loop {
+        tokio::select! {
+            _ = sessions.join_next() => {
+                if sessions.is_empty() {
+                    break;
+                }
+            }
+            () = &mut drain => {
+                sessions.abort_all();
+                while sessions.join_next().await.is_some() {}
+                break;
+            }
+        }
     }
 }

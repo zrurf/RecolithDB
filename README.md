@@ -87,16 +87,37 @@ RecolithDB is in early single-node development. Implemented today:
 - Protocol frame layer: fixed 38-byte header, CRC32C, zstd/lz4 compression, BATCH codec, and Protobuf v1 messages.
 - TCP session layer: HELLO/WELCOME negotiation, bearer-token auth, compression selection, PING/PONG, BATCH dispatch, and structured errors.
 - TLS 1.3 transport with rustls and typed Rust client handshake, authentication, document, query, and batch calls.
+- Runnable `recolithd` process with TOML configuration, memory or fjall storage, catalog bootstrap, persisted catalog reload, TLS, bearer auth, logging, and graceful shutdown.
+- `recolith` CLI with `ping` and RQL `query` commands, typed query parameters, and human-readable document output.
 - Protocol document and query operations: DOC_GET, idempotent DOC_PUT with same-transaction deduplication, and RQL QUERY execution.
 - Process-exit crash recovery test and a full restart test covering catalog reload, commit-clock continuity, and persisted documents.
 - Point read/write benchmark example for the fjall adapter.
+- Document write and read benchmark example for the full store path.
 
 Not yet implemented:
 
 - Benchmarks on the target hardware profile and compaction tuning.
 - Additional persistent adapters (RocksDB, redb).
-- Higher-level Rust SDK ergonomics, CLI, and streaming result descriptors.
+- Higher-level Rust SDK ergonomics, CLI write/admin commands, and streaming result descriptors.
+- Server-level query and concurrent-client benchmarks.
 - Distributed placement, replication, and cross-partition workflows.
+
+## Quick Start
+
+Start the example server:
+
+```text
+cargo run -p recolith-server --bin recolithd -- --config examples/recolithd/recolith.toml
+```
+
+In another terminal:
+
+```text
+cargo run -p recolith-cli --bin recolith -- ping
+cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM player WHERE player_id = :id INCLUDE FRAGMENTS profile" --param id=u64:1
+```
+
+The example configuration and catalog are under [`examples/recolithd`](examples/recolithd). The bootstrap catalog is applied only when persistent metadata is empty; later starts reuse the stored catalog.
 
 ## Build
 
