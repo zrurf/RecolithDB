@@ -3,7 +3,7 @@ use std::time::Duration;
 use recolith_client::{Client, ClientConfig};
 use recolith_protocol::messages::{
     CollectionMetadata, DocumentGetRequest, DocumentPutRequest, NamedParameter, QueryRequest,
-    RequestMeta, Value, value,
+    QueryStreamRequest, RequestMeta, Value, value,
 };
 
 use crate::args::{Args, Command, DocCommand, TokenCommand};
@@ -75,22 +75,56 @@ pub async fn run(args: Args) -> Result<(), CliError> {
             partition,
             parameters,
             limit,
+            cursor,
+            stream,
+            chunk_size,
         } => {
             let parameters = parameters
                 .iter()
                 .map(|parameter| parse_parameter(parameter))
                 .collect::<Result<Vec<_>, _>>()?;
-            let request = QueryRequest {
-                meta: None,
-                partition,
-                rql,
-                parameters,
-                limit,
-            };
-            let response = client.query(&request).await?;
-            println!("documents: {}", response.documents.len());
-            for document in &response.documents {
-                print!("{}", format_document(document));
+            if stream {
+                let request = QueryStreamRequest {
+                    meta: None,
+                    partition,
+                    rql,
+                    parameters,
+                    limit,
+                    chunk_size,
+                };
+                let mut total = 0_usize;
+                client
+                    .query_stream(&request, |chunk| {
+                        total += chunk.documents.len();
+                        for document in &chunk.documents {
+                            print!("{}", format_document(document));
+                        }
+                    })
+                    .await?;
+                println!("documents: {total}");
+            } else {
+                let cursor = match cursor {
+                    Some(cursor) => {
+                        crate::hex::decode(&cursor).ok_or(CliError::InvalidKey(cursor))?
+                    }
+                    None => Vec::new(),
+                };
+                let request = QueryRequest {
+                    meta: None,
+                    partition,
+                    rql,
+                    parameters,
+                    limit,
+                    cursor,
+                };
+                let response = client.query(&request).await?;
+                println!("documents: {}", response.documents.len());
+                for document in &response.documents {
+                    print!("{}", format_document(document));
+                }
+                if !response.next_cursor.is_empty() {
+                    println!("next_cursor: {}", crate::hex::encode(&response.next_cursor));
+                }
             }
         }
         Command::Describe {

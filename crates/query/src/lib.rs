@@ -8,7 +8,7 @@ pub mod request;
 pub mod rql;
 pub mod scan;
 
-pub use engine::{QueryEngine, QueryPlan};
+pub use engine::{QueryEngine, QueryPlan, ScanPage, ScanPlan};
 pub use error::{QueryError, Result};
 pub use ir::{DocumentQuery, FieldSelection, Filter, FilterOp};
 pub use request::DocumentReadRequest;

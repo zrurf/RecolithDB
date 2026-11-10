@@ -107,6 +107,9 @@ async fn writes_reads_and_queries_through_the_cli() {
             partition: 0,
             parameters: vec!["id=u64:1".to_owned()],
             limit: 10,
+            cursor: None,
+            stream: false,
+            chunk_size: 100,
         },
     ))
     .await

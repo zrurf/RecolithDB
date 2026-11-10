@@ -18,6 +18,10 @@ pub mod opcode {
     pub const DOC_PUT: u16 = 0x0011;
     /// RQL document query.
     pub const QUERY: u16 = 0x0020;
+    /// Streaming RQL document query.
+    pub const QUERY_STREAM: u16 = 0x0021;
+    /// Streaming query result chunk.
+    pub const QUERY_CHUNK: u16 = 0x0022;
     /// Batched unary requests.
     pub const BATCH: u16 = 0x0030;
     /// Collection metadata lookup.

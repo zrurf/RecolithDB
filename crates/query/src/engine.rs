@@ -368,8 +368,25 @@ impl<B: StorageBackend> QueryEngine<B> {
         plan: &ScanPlan,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, DocumentFragments)>> {
+        Ok(self.execute_scan_page(plan, limit, None)?.documents)
+    }
+
+    /// Executes one scan page after an optional document key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryError`] for backend or storage assembly failures.
+    pub fn execute_scan_page(
+        &self,
+        plan: &ScanPlan,
+        limit: usize,
+        after: Option<&[u8]>,
+    ) -> Result<ScanPage> {
         if limit == 0 {
-            return Ok(Vec::new());
+            return Ok(ScanPage {
+                documents: Vec::new(),
+                has_more: false,
+            });
         }
 
         let snapshot = self.backend.snapshot()?;
@@ -385,10 +402,11 @@ impl<B: StorageBackend> QueryEngine<B> {
             }
         }
 
-        let mut output = Vec::new();
+        let mut documents = Vec::new();
+        let mut has_more = false;
         for key in candidates {
-            if output.len() >= limit {
-                break;
+            if after.is_some_and(|after| key.as_slice() <= after) {
+                continue;
             }
             if !key_matches(&plan.key_schema, &plan.key_filters, &key)? {
                 continue;
@@ -398,11 +416,28 @@ impl<B: StorageBackend> QueryEngine<B> {
             else {
                 continue;
             };
-            output.push((key, fragments));
+            if documents.len() < limit {
+                documents.push((key, fragments));
+            } else {
+                has_more = true;
+                break;
+            }
         }
 
-        Ok(output)
+        Ok(ScanPage {
+            documents,
+            has_more,
+        })
     }
+}
+
+/// One scan result page.
+#[derive(Clone, Debug)]
+pub struct ScanPage {
+    /// Documents in document-key order.
+    pub documents: Vec<(Vec<u8>, DocumentFragments)>,
+    /// Whether another matching document exists after this page.
+    pub has_more: bool,
 }
 
 impl<B: StorageBackend> fmt::Debug for QueryEngine<B> {

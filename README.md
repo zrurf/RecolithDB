@@ -83,7 +83,7 @@ RecolithDB is in early single-node development. Implemented today:
 - Schema-aware field codec, record framing, partition-scoped record and index keys, CRC32C checks.
 - Lazy one/many fragment assembly, equality and range index pushdown including composite leading fields, same-fragment multi-index intersection, and range filters.
 - Local transactions, multi-fragment commits with one timestamp, optimistic `if_match`, unique reservation workflow, persistent commit clock.
-- RQL document-query subset: parser, catalog binder, document key encoding, planner, executor, single-document point reads, and multi-document scans with primary-key ranges, fragment filters, limits, and index pushdown.
+- RQL document-query subset: parser, catalog binder, document key encoding, planner, executor, single-document point reads, multi-document scans with primary-key ranges, fragment filters, limits, index pushdown, cursor pagination, and chunked streaming results.
 - In-process document service: catalog-bound multi-fragment writes, cardinality and partition validation, multi-fragment reads, and automatic index maintenance with sparse and unique indexes.
 - Protocol frame layer: fixed 38-byte header, CRC32C, zstd/lz4 compression, BATCH codec, Protobuf v1 messages, and collection metadata lookup.
 - TCP session layer: HELLO/WELCOME negotiation, bearer-token auth, compression selection, PING/PONG, BATCH dispatch, and structured errors.
@@ -105,7 +105,7 @@ Not yet implemented:
 
 - Benchmarks on the target hardware profile and compaction tuning.
 - Additional persistent adapters (RocksDB, redb).
-- Offline migration for buckets beyond the synchronous limit, cursor pagination and streaming result descriptors, and broader CLI administration.
+- Offline migration for buckets beyond the synchronous limit, streaming flow control, and broader CLI administration.
 - Distributed placement, replication, and cross-partition workflows.
 
 ## Quick Start
@@ -201,7 +201,24 @@ cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM play
 cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM player WHERE player_id >= 2 AND profile.name = 'alex' INCLUDE FRAGMENTS profile"
 ```
 
-Scans prefer an indexable `many`-fragment predicate; otherwise they scan the fragment bucket and post-filter. Primary-key ranges are evaluated after candidate enumeration. `LIMIT` caps returned documents, and results are ordered by document key. A scan considers at most 10,000 candidate documents. Cursor pagination and streaming results are not implemented yet.
+Scans prefer an indexable `many`-fragment predicate; otherwise they scan the fragment bucket and post-filter. Primary-key ranges are evaluated after candidate enumeration. `LIMIT` caps returned documents, and results are ordered by document key. A scan considers at most 10,000 candidate documents.
+
+Paginated queries print an opaque `next_cursor` when more documents match. Pass it back with `--cursor`:
+
+```text
+cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM player WHERE profile.level >= 10 INCLUDE FRAGMENTS profile" --limit 100
+cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM player WHERE profile.level >= 10 INCLUDE FRAGMENTS profile" --limit 100 --cursor 52434c43...
+```
+
+Cursors bind the query shape and catalog generation. Reusing a cursor with a different query returns `INVALID_REQUEST`; catalog changes return `STALE_CATALOG`. Each page uses a fresh snapshot, so concurrent writes may appear between pages.
+
+Large result sets can be streamed in chunks:
+
+```text
+cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM player WHERE profile.level >= 10 INCLUDE FRAGMENTS profile" --stream --chunk-size 100 --limit 1000
+```
+
+Streaming uses `QUERY_STREAM` with `QUERY_CHUNK` responses and a final-chunk marker. Each chunk uses a fresh snapshot; client-side flow control is not implemented.
 
 ## Catalog Changes
 

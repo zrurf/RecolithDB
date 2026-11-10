@@ -177,6 +177,7 @@ async fn worker_load(
                             }),
                         }],
                         limit: 1,
+                        cursor: Vec::new(),
                     })
                     .await
                     .map(|_| ())

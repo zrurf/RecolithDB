@@ -12,8 +12,8 @@ use recolith_protocol::messages::{
     CatalogApplyResponse, CatalogDropRequest, CatalogDropResponse, DescribeCollectionRequest,
     DescribeCollectionResponse, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest,
     DocumentPutResponse, ErrorResponse, GoAway, HelloRequest, PingRequest, PingResponse,
-    QueryRequest, QueryResponse, SecurityMode, WelcomeResponse, compression_bit, encoding_bit,
-    feature, opcode, status,
+    QueryChunk, QueryRequest, QueryResponse, QueryStreamRequest, SecurityMode, WelcomeResponse,
+    compression_bit, encoding_bit, feature, opcode, status,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -378,6 +378,78 @@ impl Client {
         CatalogAlterResponse::decode(body.as_slice()).map_err(|_| {
             ClientError::UnexpectedResponse("malformed CATALOG_ALTER response".to_owned())
         })
+    }
+
+    /// Executes a query and streams result chunks to a callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn query_stream<F>(
+        &mut self,
+        request: &QueryStreamRequest,
+        mut on_chunk: F,
+    ) -> Result<(), ClientError>
+    where
+        F: FnMut(&QueryChunk),
+    {
+        self.require_feature(feature::STREAMING, "streaming queries")?;
+        if self.closed {
+            return Err(ClientError::Closed);
+        }
+
+        let request_id = self.allocate_request_id();
+        let frame = self.codec.encode(
+            &FrameHeader::new(opcode::QUERY_STREAM, request_id),
+            &request.encode_to_vec(),
+        )?;
+        let timeout = self.request_timeout;
+
+        with_timeout(timeout, "streaming query", async {
+            self.stream.write_all(&frame).await?;
+            self.stream.flush().await?;
+            let mut expected_stream = 0_u32;
+            loop {
+                let (header, payload) =
+                    read_frame(&mut self.stream, &self.codec, self.max_frame_size).await?;
+                if header.request_id() != request_id {
+                    return Err(ClientError::UnexpectedResponse(
+                        "stream request id mismatch".to_owned(),
+                    ));
+                }
+                if header.opcode() == opcode::ERROR {
+                    let error = ErrorResponse::decode(payload.as_slice()).map_err(|_| {
+                        ClientError::UnexpectedResponse("malformed ERROR payload".to_owned())
+                    })?;
+                    return Err(ClientError::Server {
+                        status: header.status(),
+                        message: error.message,
+                        retryable: error.retryable,
+                    });
+                }
+                if header.opcode() != opcode::QUERY_CHUNK {
+                    return Err(ClientError::UnexpectedOpcode {
+                        expected: opcode::QUERY_CHUNK,
+                        actual: header.opcode(),
+                    });
+                }
+                if header.stream_id() != expected_stream {
+                    return Err(ClientError::UnexpectedResponse(
+                        "stream chunk is out of order".to_owned(),
+                    ));
+                }
+                let chunk = QueryChunk::decode(payload.as_slice()).map_err(|_| {
+                    ClientError::UnexpectedResponse("malformed QUERY_CHUNK payload".to_owned())
+                })?;
+                let final_chunk = chunk.r#final;
+                on_chunk(&chunk);
+                if final_chunk {
+                    return Ok(());
+                }
+                expected_stream = expected_stream.wrapping_add(1);
+            }
+        })
+        .await
     }
 
     /// Sends unary requests in one batch frame and returns their responses.

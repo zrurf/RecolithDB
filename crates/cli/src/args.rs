@@ -54,6 +54,15 @@ pub enum Command {
         /// Maximum number of documents.
         #[arg(long, default_value_t = 100)]
         limit: u64,
+        /// Pagination cursor as hexadecimal.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Streams result chunks instead of one response.
+        #[arg(long)]
+        stream: bool,
+        /// Documents per streamed chunk.
+        #[arg(long, default_value_t = 100)]
+        chunk_size: u32,
     },
     /// Describes a collection.
     Describe {

@@ -547,6 +547,7 @@ async fn backfills_indexes_for_existing_records() {
                     .to_owned(),
             parameters: Vec::new(),
             limit: 10,
+            cursor: Vec::new(),
         }
         .encode_to_vec(),
     )
@@ -734,6 +735,7 @@ async fn drops_indexes_only_with_purge_and_queries_still_work() {
                     .to_owned(),
             parameters: Vec::new(),
             limit: 10,
+            cursor: Vec::new(),
         }
         .encode_to_vec(),
     )

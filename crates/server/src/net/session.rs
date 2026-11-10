@@ -15,8 +15,8 @@ use recolith_protocol::frame::{
 use recolith_protocol::messages::{
     AuthMethod, AuthResult, CatalogAlterRequest, CatalogApplyRequest, CatalogDropRequest,
     DescribeCollectionRequest, DocumentGetRequest, DocumentPutRequest, ErrorResponse, GoAway,
-    HelloRequest, PingRequest, PingResponse, QueryRequest, SecurityMode, WelcomeResponse,
-    compression_bit, feature, opcode, status,
+    HelloRequest, PingRequest, PingResponse, QueryChunk, QueryRequest, QueryStreamRequest,
+    SecurityMode, WelcomeResponse, compression_bit, feature, opcode, status,
 };
 use recolith_security::{Principal, unix_seconds};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -26,6 +26,9 @@ use crate::metrics::ServerMetrics;
 use crate::net::{SERVER_VERSION, ServerConfig};
 
 use super::operations::{self, OperationError, OperationResponse};
+
+const DEFAULT_STREAM_CHUNK: u32 = 100;
+const MAX_STREAM_CHUNK: u32 = 1_000;
 
 pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
@@ -127,7 +130,8 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             | feature::QUERY
             | feature::IDEMPOTENCY
             | feature::CATALOG_DESCRIBE
-            | feature::CATALOG_WRITE,
+            | feature::CATALOG_WRITE
+            | feature::STREAMING,
         max_frame_size: u32::try_from(max_frame_size).unwrap_or(u32::MAX),
         max_batch_subframes: u32::try_from(max_batch_subframes).unwrap_or(u32::MAX),
         max_batch_bytes: u32::try_from(max_batch_bytes).unwrap_or(u32::MAX),
@@ -243,6 +247,18 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
                 config
                     .metrics
                     .observe_latency(header.opcode(), started.elapsed());
+            }
+            opcode::QUERY_STREAM => {
+                handle_query_stream(
+                    &mut stream,
+                    &codec,
+                    &header,
+                    &body,
+                    Arc::clone(&store),
+                    principal.clone(),
+                    Arc::clone(&config.metrics),
+                )
+                .await?;
             }
             opcode::BATCH => {
                 handle_batch(
@@ -362,6 +378,172 @@ async fn execute<B: StorageBackend>(
     .map_err(|_| OperationError::internal("worker task failed"))?
 }
 
+async fn handle_query_stream<B: StorageBackend, W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    codec: &FrameCodec,
+    header: &FrameHeader,
+    body: &[u8],
+    store: Arc<DocumentStore<B>>,
+    principal: Principal,
+    metrics: Arc<ServerMetrics>,
+) -> Result<(), SessionError> {
+    let request = match QueryStreamRequest::decode(body) {
+        Ok(request) => request,
+        Err(_) => {
+            send_error(
+                writer,
+                codec,
+                &metrics,
+                header.request_id(),
+                status::INVALID_REQUEST,
+                "malformed QUERY_STREAM payload",
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    if let Err(error) = operations::check_meta(&store, request.meta.as_ref()) {
+        send_error(
+            writer,
+            codec,
+            &metrics,
+            header.request_id(),
+            error.status(),
+            error.message(),
+        )
+        .await?;
+        return Ok(());
+    }
+    let total_limit = match operations::query_limit(request.limit, &request.rql) {
+        Ok(limit) => limit,
+        Err(error) => {
+            send_error(
+                writer,
+                codec,
+                &metrics,
+                header.request_id(),
+                error.status(),
+                error.message(),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let chunk_size = if request.chunk_size == 0 {
+        DEFAULT_STREAM_CHUNK
+    } else {
+        request.chunk_size.min(MAX_STREAM_CHUNK)
+    } as usize;
+    let mut sent = 0_usize;
+    let mut cursor = Vec::new();
+    let mut stream_id = 0_u32;
+    loop {
+        let remaining = total_limit.saturating_sub(sent);
+        if remaining == 0 {
+            write_query_chunk(
+                writer,
+                codec,
+                header.request_id(),
+                stream_id,
+                QueryChunk {
+                    documents: Vec::new(),
+                    next_cursor: Vec::new(),
+                    r#final: true,
+                },
+            )
+            .await?;
+            break;
+        }
+
+        let page_limit = remaining.min(chunk_size);
+        let store = Arc::clone(&store);
+        let principal = principal.clone();
+        let partition = request.partition;
+        let rql = request.rql.clone();
+        let parameters = request.parameters.clone();
+        let page_cursor = cursor.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            operations::query_page(
+                &store,
+                &principal,
+                partition,
+                &rql,
+                &parameters,
+                page_limit,
+                &page_cursor,
+            )
+        })
+        .await;
+        let page = match outcome {
+            Ok(Ok(page)) => page,
+            Ok(Err(error)) => {
+                send_error(
+                    writer,
+                    codec,
+                    &metrics,
+                    header.request_id(),
+                    error.status(),
+                    error.message(),
+                )
+                .await?;
+                return Ok(());
+            }
+            Err(_) => {
+                send_error(
+                    writer,
+                    codec,
+                    &metrics,
+                    header.request_id(),
+                    status::INTERNAL,
+                    "query worker task failed",
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+
+        sent = sent.saturating_add(page.documents.len());
+        let final_chunk = page.next_cursor.is_empty() || sent >= total_limit;
+        let next_cursor = if final_chunk {
+            Vec::new()
+        } else {
+            page.next_cursor
+        };
+        write_query_chunk(
+            writer,
+            codec,
+            header.request_id(),
+            stream_id,
+            QueryChunk {
+                documents: page.documents,
+                next_cursor: next_cursor.clone(),
+                r#final: final_chunk,
+            },
+        )
+        .await?;
+        if final_chunk {
+            break;
+        }
+        cursor = next_cursor;
+        stream_id = stream_id.wrapping_add(1);
+    }
+
+    Ok(())
+}
+
+async fn write_query_chunk<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    codec: &FrameCodec,
+    request_id: u64,
+    stream_id: u32,
+    chunk: QueryChunk,
+) -> Result<(), SessionError> {
+    let header = FrameHeader::new(opcode::QUERY_CHUNK, request_id)
+        .as_response(status::OK)
+        .with_stream_id(stream_id);
+    write_frame(writer, codec, &header, &chunk.encode_to_vec()).await
+}
+
 async fn write_operation<W: AsyncWrite + Unpin>(
     writer: &mut W,
     codec: &FrameCodec,
@@ -402,7 +584,10 @@ async fn handle_batch<B: StorageBackend, W: AsyncWrite + Unpin>(
     for subframe in subframes {
         if matches!(
             subframe.opcode(),
-            opcode::CATALOG_APPLY | opcode::CATALOG_DROP | opcode::CATALOG_ALTER
+            opcode::CATALOG_APPLY
+                | opcode::CATALOG_DROP
+                | opcode::CATALOG_ALTER
+                | opcode::QUERY_STREAM
         ) {
             send_error(
                 writer,
@@ -410,7 +595,7 @@ async fn handle_batch<B: StorageBackend, W: AsyncWrite + Unpin>(
                 &metrics,
                 subframe.request_id(),
                 status::INVALID_REQUEST,
-                "catalog changes are not allowed in a batch",
+                "operation is not allowed in a batch",
             )
             .await?;
             continue;

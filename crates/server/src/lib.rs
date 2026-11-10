@@ -8,6 +8,7 @@ pub mod document;
 pub mod metrics;
 pub mod migration;
 pub mod net;
+mod query_cursor;
 
 pub use backup::{BackupError, BackupStats, backup, restore, verify};
 pub use bootstrap::{BootstrapError, load_bootstrap, parse_bootstrap};
