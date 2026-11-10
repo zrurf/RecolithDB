@@ -8,6 +8,8 @@ use recolith_schema::SchemaError;
 pub enum CatalogError {
     /// A metadata object already exists.
     Duplicate(&'static str),
+    /// A metadata object exists with a different definition.
+    Conflict(String),
     /// A referenced metadata object does not exist.
     NotFound(&'static str),
     /// A collection references an unknown bucket or keyspace.
@@ -34,6 +36,7 @@ impl fmt::Display for CatalogError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Duplicate(kind) => write!(formatter, "duplicate {kind}"),
+            Self::Conflict(message) => write!(formatter, "conflict: {message}"),
             Self::NotFound(kind) => write!(formatter, "missing {kind}"),
             Self::InvalidReference(message) => write!(formatter, "invalid reference: {message}"),
             Self::InvalidIndex(message) => write!(formatter, "invalid index: {message}"),

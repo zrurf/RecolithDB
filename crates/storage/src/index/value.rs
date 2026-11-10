@@ -13,6 +13,94 @@ const TAG_TIMESTAMP: u8 = 0x08;
 const TAG_DURATION: u8 = 0x09;
 const TAG_ENUM: u8 = 0x0A;
 
+/// Returns the encoded length of the first index-key component.
+///
+/// # Errors
+///
+/// Returns [`StorageError::InvalidValue`] for truncated or unknown encodings.
+pub fn index_value_len(input: &[u8]) -> Result<usize> {
+    let tag = *input
+        .first()
+        .ok_or_else(|| StorageError::InvalidValue("index value is empty".to_owned()))?;
+    let length = match tag {
+        TAG_BOOL => 2,
+        TAG_I32 | TAG_U32 | TAG_ENUM => 5,
+        TAG_I64 | TAG_U64 | TAG_TIMESTAMP | TAG_DURATION => 9,
+        TAG_STRING | TAG_BYTES => 1 + ordered_len(&input[1..])?,
+        _ => {
+            return Err(StorageError::InvalidValue(format!(
+                "unknown index tag {tag:#x}"
+            )));
+        }
+    };
+    if length > input.len() {
+        return Err(StorageError::InvalidValue(
+            "index value is truncated".to_owned(),
+        ));
+    }
+
+    Ok(length)
+}
+
+/// Returns the number of complete index-key components in `input`.
+///
+/// # Errors
+///
+/// Returns [`StorageError::InvalidValue`] for truncated or unknown encodings.
+pub fn index_values_count(input: &[u8]) -> Result<usize> {
+    let mut offset = 0;
+    let mut count = 0;
+    while offset < input.len() {
+        let length = index_value_len(&input[offset..])?;
+        offset += length;
+        count += 1;
+    }
+
+    Ok(count)
+}
+
+/// Returns the encoded length of `count` index-key components.
+///
+/// # Errors
+///
+/// Returns [`StorageError::InvalidValue`] for truncated or unknown encodings.
+pub fn index_values_len(input: &[u8], count: usize) -> Result<usize> {
+    let mut offset = 0;
+    for _ in 0..count {
+        let length = index_value_len(&input[offset..])?;
+        offset += length;
+    }
+
+    Ok(offset)
+}
+
+fn ordered_len(input: &[u8]) -> Result<usize> {
+    let mut offset = 0;
+    while offset < input.len() {
+        match input[offset] {
+            0 => {
+                let next = input.get(offset + 1).ok_or_else(|| {
+                    StorageError::InvalidValue("index string is truncated".to_owned())
+                })?;
+                match *next {
+                    0 => return Ok(offset + 2),
+                    0xFF => offset += 2,
+                    _ => {
+                        return Err(StorageError::InvalidValue(
+                            "invalid index string escape".to_owned(),
+                        ));
+                    }
+                }
+            }
+            _ => offset += 1,
+        }
+    }
+
+    Err(StorageError::InvalidValue(
+        "index string is not terminated".to_owned(),
+    ))
+}
+
 /// Encodes a scalar value into an ordered index-key component.
 ///
 /// Fixed-width types are stored big-endian with signed values biased by their

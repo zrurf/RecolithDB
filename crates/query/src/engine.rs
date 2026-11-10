@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use recolith_backend::StorageBackend;
 use recolith_catalog::Catalog;
-use recolith_common::{FieldId, FragmentId};
+use recolith_common::{BucketId, FieldId, FragmentId};
 use recolith_model::{Fragment, FragmentCardinality};
 use recolith_storage::{
-    DocumentFragments, FragmentData, FragmentMode, FragmentReader, RecordData, Value,
+    DocumentFragments, FragmentData, FragmentMode, FragmentReader, IndexBound, RecordData, Value,
     encode_index_value, read_document,
 };
 
@@ -98,13 +98,43 @@ impl<B: StorageBackend> QueryEngine<B> {
                 mode,
                 schema.clone(),
             );
-            if mode == FragmentMode::Many
-                && let Some(filter) = query.filters().iter().find(|filter| {
-                    filter.fragment() == fragment.id() && filter.op() == FilterOp::Eq
-                })
-                && let Some(index) = catalog.index_for_field(bucket.id(), filter.field())
-            {
-                reader = reader.with_index(index.id(), encode_index_value(filter.value())?);
+            if mode == FragmentMode::Many {
+                for filter in query
+                    .filters()
+                    .iter()
+                    .filter(|filter| filter.fragment() == fragment.id())
+                {
+                    let Some(index) = leading_field_index(&catalog, bucket.id(), filter.field())
+                    else {
+                        continue;
+                    };
+                    match filter.op() {
+                        FilterOp::Eq => {
+                            reader = reader.with_index_components(
+                                index.id(),
+                                encode_index_value(filter.value())?,
+                                index.fields().len(),
+                            );
+                        }
+                        FilterOp::Lt | FilterOp::Le | FilterOp::Gt | FilterOp::Ge => {
+                            let encoded = encode_index_value(filter.value())?;
+                            let (lower, upper) = match filter.op() {
+                                FilterOp::Lt => (None, Some(IndexBound::new(encoded, false))),
+                                FilterOp::Le => (None, Some(IndexBound::new(encoded, true))),
+                                FilterOp::Gt => (Some(IndexBound::new(encoded, false)), None),
+                                FilterOp::Ge => (Some(IndexBound::new(encoded, true)), None),
+                                FilterOp::Eq | FilterOp::Ne => unreachable!(),
+                            };
+                            reader = reader.with_index_range_components(
+                                index.id(),
+                                lower,
+                                upper,
+                                index.fields().len(),
+                            );
+                        }
+                        FilterOp::Ne => {}
+                    }
+                }
             }
             readers.push(reader);
         }
@@ -156,6 +186,18 @@ impl<B: StorageBackend> fmt::Debug for QueryEngine<B> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("QueryEngine")
     }
+}
+
+fn leading_field_index(
+    catalog: &recolith_catalog::CatalogSnapshot,
+    bucket: BucketId,
+    field: FieldId,
+) -> Option<&recolith_model::IndexDefinition> {
+    catalog
+        .indexes
+        .get(&bucket)?
+        .values()
+        .find(|index| index.leading_field() == Some(field))
 }
 
 fn validate_field(

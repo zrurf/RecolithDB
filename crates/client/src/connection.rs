@@ -8,10 +8,11 @@ use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::error::ProtocolError;
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN, VERSION_MAJOR, VERSION_MINOR};
 use recolith_protocol::messages::{
-    AuthMethod, AuthResult, DescribeCollectionRequest, DescribeCollectionResponse,
-    DocumentGetRequest, DocumentGetResponse, DocumentPutRequest, DocumentPutResponse,
-    ErrorResponse, GoAway, HelloRequest, PingRequest, PingResponse, QueryRequest, QueryResponse,
-    SecurityMode, WelcomeResponse, compression_bit, encoding_bit, feature, opcode, status,
+    AuthMethod, AuthResult, CatalogApplyRequest, CatalogApplyResponse, DescribeCollectionRequest,
+    DescribeCollectionResponse, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest,
+    DocumentPutResponse, ErrorResponse, GoAway, HelloRequest, PingRequest, PingResponse,
+    QueryRequest, QueryResponse, SecurityMode, WelcomeResponse, compression_bit, encoding_bit,
+    feature, opcode, status,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -309,6 +310,28 @@ impl Client {
             .await?;
         DescribeCollectionResponse::decode(body.as_slice()).map_err(|_| {
             ClientError::UnexpectedResponse("malformed DESCRIBE_COLLECTION response".to_owned())
+        })
+    }
+
+    /// Applies additive catalog definitions atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn apply_catalog(
+        &mut self,
+        request: &CatalogApplyRequest,
+    ) -> Result<CatalogApplyResponse, ClientError> {
+        self.require_feature(feature::CATALOG_WRITE, "catalog changes")?;
+        let body = self
+            .request(
+                opcode::CATALOG_APPLY,
+                opcode::CATALOG_APPLY,
+                &request.encode_to_vec(),
+            )
+            .await?;
+        CatalogApplyResponse::decode(body.as_slice()).map_err(|_| {
+            ClientError::UnexpectedResponse("malformed CATALOG_APPLY response".to_owned())
         })
     }
 

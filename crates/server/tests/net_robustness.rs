@@ -12,7 +12,7 @@ use recolith_protocol::messages::{
     AuthMethod, AuthResult, DocumentGetRequest, ErrorResponse, HelloRequest, PingRequest,
     PingResponse, WelcomeResponse, opcode, status,
 };
-use recolith_server::{DocumentStore, ServerConfig, serve};
+use recolith_server::{DocumentStore, ServerConfig, ServerMetrics, serve};
 use recolith_storage::crc32c;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -25,11 +25,31 @@ fn empty_store() -> Arc<DocumentStore<MemoryBackend>> {
 }
 
 async fn start_server() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let address = listener.local_addr().expect("address");
-    tokio::spawn(serve(listener, ServerConfig::new(address), empty_store()));
+    start_server_with_metrics().await.0
+}
 
-    address
+async fn start_server_with_metrics() -> (SocketAddr, Arc<ServerMetrics>) {
+    start_server_with_config(ServerConfig::new("127.0.0.1:0".parse().expect("address"))).await
+}
+
+async fn start_server_with_config(mut config: ServerConfig) -> (SocketAddr, Arc<ServerMetrics>) {
+    let listener = TcpListener::bind(config.listen).await.expect("bind");
+    let address = listener.local_addr().expect("address");
+    config.listen = address;
+    let metrics = config.metrics();
+    tokio::spawn(serve(listener, config, empty_store()));
+
+    (address, metrics)
+}
+
+async fn wait_for_idle(metrics: &ServerMetrics) {
+    for _ in 0..100 {
+        if metrics.snapshot().active_sessions == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("sessions did not drain: {:?}", metrics.snapshot());
 }
 
 fn hello() -> HelloRequest {
@@ -258,4 +278,152 @@ async fn batch_reports_partial_failures_without_closing() {
     assert!(statuses.contains(&(opcode::ERROR, status::NOT_FOUND)));
 
     ping(&mut stream, &codec, 12).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_sessions_are_counted() {
+    let (address, metrics) = start_server_with_metrics().await;
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..16 {
+        tasks.spawn(async move {
+            let (mut stream, codec) = connect_and_handshake(address).await;
+            for request_id in 2..52 {
+                ping(&mut stream, &codec, request_id).await;
+            }
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.expect("client task");
+    }
+    wait_for_idle(&metrics).await;
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.accepted_sessions, 16);
+    assert_eq!(snapshot.active_sessions, 0);
+    assert_eq!(snapshot.pings, 800);
+    assert_eq!(snapshot.requests, 800);
+    assert_eq!(snapshot.ping_latency.count, 800);
+    assert!(snapshot.ping_latency.p99_micros > 0);
+    assert_eq!(snapshot.errors, 0);
+    assert_eq!(snapshot.session_errors, 0);
+}
+
+#[tokio::test]
+async fn connection_churn_is_counted() {
+    let (address, metrics) = start_server_with_metrics().await;
+    for _ in 0..100 {
+        let (stream, _) = connect_and_handshake(address).await;
+        drop(stream);
+    }
+    wait_for_idle(&metrics).await;
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.accepted_sessions, 100);
+    assert_eq!(snapshot.active_sessions, 0);
+    assert_eq!(snapshot.session_errors, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_client_does_not_block_other_sessions() {
+    let (address, metrics) = start_server_with_metrics().await;
+    let mut slow = TcpStream::connect(address).await.expect("slow connect");
+    slow.write_all(b"R").await.expect("partial header");
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        tasks.spawn(async move {
+            let (mut stream, codec) = connect_and_handshake(address).await;
+            for request_id in 2..22 {
+                ping(&mut stream, &codec, request_id).await;
+            }
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        result.expect("client task");
+    }
+
+    let snapshot = metrics.snapshot();
+    assert!(snapshot.active_sessions >= 1);
+    assert_eq!(snapshot.pings, 160);
+    assert_eq!(snapshot.errors, 0);
+
+    drop(slow);
+    wait_for_idle(&metrics).await;
+    assert_eq!(metrics.snapshot().active_sessions, 0);
+}
+
+#[tokio::test]
+async fn malformed_batch_counts_an_error_and_keeps_session() {
+    let (address, metrics) = start_server_with_metrics().await;
+    let (mut stream, codec) = connect_and_handshake(address).await;
+    let frame = codec
+        .encode(&FrameHeader::new(opcode::BATCH, 4), &[2, 0])
+        .expect("batch frame");
+    stream.write_all(&frame).await.expect("write batch");
+    let mut header_bytes = [0_u8; HEADER_LEN];
+    stream
+        .read_exact(&mut header_bytes)
+        .await
+        .expect("error header");
+    let header = FrameHeader::decode(&header_bytes).expect("error header");
+    assert_eq!(header.opcode(), opcode::ERROR);
+    let mut error_payload = vec![0_u8; header.payload_len() as usize];
+    stream
+        .read_exact(&mut error_payload)
+        .await
+        .expect("error payload");
+
+    ping(&mut stream, &codec, 5).await;
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.errors, 1);
+    assert_eq!(snapshot.requests, 1);
+    assert_eq!(snapshot.pings, 1);
+
+    drop(stream);
+    wait_for_idle(&metrics).await;
+}
+
+#[tokio::test]
+async fn corrupt_payload_counts_a_session_error() {
+    let (address, metrics) = start_server_with_metrics().await;
+    let (mut stream, codec) = connect_and_handshake(address).await;
+    let request = PingRequest {
+        payload: b"ping".to_vec(),
+    };
+    let mut frame = codec
+        .encode(&FrameHeader::new(opcode::PING, 2), &request.encode_to_vec())
+        .expect("frame");
+    *frame.last_mut().expect("payload") ^= 0xFF;
+    stream.write_all(&frame).await.expect("write frame");
+    expect_closed(&mut stream).await;
+    wait_for_idle(&metrics).await;
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.active_sessions, 0);
+    assert_eq!(snapshot.session_errors, 1);
+    assert_eq!(snapshot.errors, 0);
+}
+
+#[tokio::test]
+async fn connection_limit_rejects_extra_sessions() {
+    let config = ServerConfig::new("127.0.0.1:0".parse().expect("address")).with_max_connections(2);
+    let (address, metrics) = start_server_with_config(config).await;
+    let (mut first, first_codec) = connect_and_handshake(address).await;
+    let (mut second, second_codec) = connect_and_handshake(address).await;
+
+    let mut rejected = TcpStream::connect(address).await.expect("tcp connect");
+    expect_closed(&mut rejected).await;
+
+    ping(&mut first, &first_codec, 2).await;
+    ping(&mut second, &second_codec, 2).await;
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.accepted_sessions, 2);
+    assert_eq!(snapshot.rejected_connections, 1);
+    assert_eq!(snapshot.active_sessions, 2);
+
+    drop(first);
+    drop(second);
+    wait_for_idle(&metrics).await;
+    assert_eq!(metrics.snapshot().active_sessions, 0);
 }

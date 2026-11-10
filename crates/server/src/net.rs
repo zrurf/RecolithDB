@@ -15,10 +15,13 @@ use std::time::Duration;
 
 use recolith_backend::StorageBackend;
 use recolith_protocol::messages::SecurityMode;
+use recolith_security::Authenticator;
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::document::DocumentStore;
+use crate::metrics::{ServerMetrics, SessionGuard};
 
 /// Server version reported during the handshake.
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -48,6 +51,8 @@ pub struct ServerConfig {
     pub tls: Option<TlsServerConfig>,
     /// Maximum frame payload size.
     pub max_frame_size: usize,
+    /// Maximum concurrent TCP sessions. Zero means unlimited.
+    pub max_connections: usize,
     /// Maximum number of subframes in a batch.
     pub max_batch_subframes: usize,
     /// Maximum batch payload size.
@@ -56,6 +61,10 @@ pub struct ServerConfig {
     pub max_decompressed_size: usize,
     /// Server compression threshold.
     pub compression_threshold: usize,
+    /// Process-local server counters.
+    pub metrics: Arc<ServerMetrics>,
+    /// Optional token and role-based authenticator.
+    pub auth: Option<Arc<Authenticator>>,
 }
 
 impl ServerConfig {
@@ -68,11 +77,34 @@ impl ServerConfig {
             allow_plaintext_remote: false,
             tls: None,
             max_frame_size: 16 * 1024 * 1024,
+            max_connections: 1024,
             max_batch_subframes: 64,
             max_batch_bytes: 1024 * 1024,
             max_decompressed_size: 16 * 1024 * 1024,
             compression_threshold: 512,
+            metrics: Arc::new(ServerMetrics::new()),
+            auth: None,
         }
+    }
+
+    /// Sets the token and role-based authenticator.
+    #[must_use]
+    pub fn with_auth(mut self, authenticator: Authenticator) -> Self {
+        self.auth = Some(Arc::new(authenticator));
+        self
+    }
+
+    /// Returns the shared metrics collector.
+    #[must_use]
+    pub fn metrics(&self) -> Arc<ServerMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// Sets the concurrent session limit. Zero means unlimited.
+    #[must_use]
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections;
+        self
     }
 
     /// Sets the shared bearer token.
@@ -130,6 +162,8 @@ where
     F: Future<Output = ()> + Send,
 {
     let tls = config.tls.as_ref().map(tls::acceptor).transpose()?;
+    let connection_limit =
+        (config.max_connections > 0).then(|| Arc::new(Semaphore::new(config.max_connections)));
     let config = Arc::new(config);
     let mut sessions = JoinSet::new();
     tokio::pin!(shutdown);
@@ -138,26 +172,43 @@ where
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
+                let permit = match &connection_limit {
+                    Some(limit) => match Arc::clone(limit).try_acquire_owned() {
+                        Ok(permit) => Some(permit),
+                        Err(_) => {
+                            config.metrics.connection_rejected();
+                            tracing::debug!(%peer, "connection limit reached");
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 let config = Arc::clone(&config);
                 let store = Arc::clone(&store);
                 let tls = tls.clone();
                 sessions.spawn(async move {
+                    let _permit = permit;
+                    let metrics = Arc::clone(&config.metrics);
+                    let _guard = SessionGuard::new(Arc::clone(&metrics));
                     if let Some(acceptor) = tls {
                         match acceptor.accept(stream).await {
                             Ok(stream) => {
                                 if let Err(error) =
                                     session::run(stream, peer, config, store, SecurityMode::Tls13).await
                                 {
+                                    metrics.session_error();
                                     tracing::debug!(%peer, %error, "TLS session ended with error");
                                 }
                             }
                             Err(error) => {
+                                metrics.session_error();
                                 tracing::debug!(%peer, %error, "TLS handshake failed");
                             }
                         }
                     } else if let Err(error) =
                         session::run(stream, peer, config, store, SecurityMode::None).await
                     {
+                        metrics.session_error();
                         tracing::debug!(%peer, %error, "session ended with error");
                     }
                 });

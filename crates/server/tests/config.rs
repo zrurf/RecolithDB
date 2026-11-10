@@ -21,6 +21,7 @@ fn loads_config_and_resolves_relative_paths() {
 [server]
 listen = "127.0.0.1:7420"
 auth_token = "secret"
+max_connections = 32
 
 [storage]
 backend = "fjall"
@@ -53,8 +54,10 @@ bootstrap = "catalog.toml"
         &dir.join("catalog.toml")
     );
 
+    assert_eq!(config.server.max_connections, 32);
     let server = config.server_config().expect("server config");
     assert_eq!(server.auth_token.as_deref(), Some(b"secret".as_slice()));
+    assert_eq!(server.max_connections, 32);
     assert!(server.tls.is_some());
 
     let _ = fs::remove_dir_all(dir);
@@ -130,6 +133,86 @@ backend = "memory"
 
     let config = Config::load(&config_path).expect("load config");
     assert_eq!(config.server.auth_token.as_deref(), Some("secret"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn loads_token_authentication_configuration() {
+    let dir = temp_dir("auth");
+    let config_path = dir.join("recolith.toml");
+    fs::write(dir.join("secret.hex"), "11".repeat(32)).expect("secret");
+    fs::write(
+        dir.join("roles.toml"),
+        r#"
+[[roles]]
+name = "admin"
+permissions = [{ keyspace = "*", collection = "*", actions = ["admin"] }]
+"#,
+    )
+    .expect("roles");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+listen = "127.0.0.1:7420"
+
+[storage]
+backend = "memory"
+
+[auth]
+secret_file = "secret.hex"
+roles_file = "roles.toml"
+"#,
+    )
+    .expect("write config");
+
+    let config = Config::load(&config_path).expect("load config");
+    assert_eq!(
+        config.auth.as_ref().expect("auth").secret_file,
+        dir.join("secret.hex")
+    );
+    let server = config.server_config().expect("server config");
+    assert!(server.auth.is_some());
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn rejects_auth_token_with_role_authentication() {
+    let dir = temp_dir("auth-conflict");
+    let config_path = dir.join("recolith.toml");
+    fs::write(dir.join("secret.hex"), "11".repeat(32)).expect("secret");
+    fs::write(
+        dir.join("roles.toml"),
+        r#"
+[[roles]]
+name = "admin"
+permissions = [{ keyspace = "*", collection = "*", actions = ["admin"] }]
+"#,
+    )
+    .expect("roles");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+listen = "127.0.0.1:7420"
+auth_token = "legacy"
+
+[storage]
+backend = "memory"
+
+[auth]
+secret_file = "secret.hex"
+roles_file = "roles.toml"
+"#,
+    )
+    .expect("write config");
+
+    assert!(matches!(
+        Config::load(&config_path),
+        Err(ConfigError::Invalid(_))
+    ));
 
     let _ = fs::remove_dir_all(dir);
 }

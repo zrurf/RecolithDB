@@ -16,6 +16,7 @@ members = [
     "crates/transaction",
     "crates/query",
     "crates/distributed",
+    "crates/security",
     "crates/protocol",
     "crates/server",
     "crates/client",
@@ -46,6 +47,7 @@ recolith-storage = { path = "crates/storage", version = "0.1.0" }
 recolith-transaction = { path = "crates/transaction", version = "0.1.0" }
 recolith-query = { path = "crates/query", version = "0.1.0" }
 recolith-distributed = { path = "crates/distributed", version = "0.1.0" }
+recolith-security = { path = "crates/security", version = "0.1.0" }
 recolith-protocol = { path = "crates/protocol", version = "0.1.0" }
 recolith-server = { path = "crates/server", version = "0.1.0" }
 recolith-client = { path = "crates/client", version = "0.1.0" }

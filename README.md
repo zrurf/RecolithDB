@@ -66,6 +66,7 @@ flowchart TB
 | `crates/query` | RQL parser and binder, query IR, planning, indexed execution |
 | `crates/distributed` | Membership, routing, replication, rebalancing, migration |
 | `crates/protocol` | Fixed frame header, batch and compression codecs, Protobuf v1 messages |
+| `crates/security` | Opaque HMAC tokens, role files, collection-scoped permissions |
 | `crates/platform` | OS I/O integration, Unix sockets, named pipes, service hooks |
 | `crates/server` | Composition root, in-process document service, and the `recolithd` binary |
 | `crates/client` | Rust transport client with TLS, negotiation, and typed operations |
@@ -80,26 +81,32 @@ RecolithDB is in early single-node development. Implemented today:
 - Schema types, record IDL parser, compatibility classification, and catalog schema registry.
 - Catalog metadata, index definitions, bucket placement, generations, and atomic persistence.
 - Schema-aware field codec, record framing, partition-scoped record and index keys, CRC32C checks.
-- Lazy one/many fragment assembly, equality-index pushdown, and range filters.
+- Lazy one/many fragment assembly, equality and range index pushdown including composite leading fields, same-fragment multi-index intersection, and range filters.
 - Local transactions, multi-fragment commits with one timestamp, optimistic `if_match`, unique reservation workflow, persistent commit clock.
 - RQL document-query subset: parser, catalog binder, document key encoding, planner, and executor.
 - In-process document service: catalog-bound multi-fragment writes, cardinality and partition validation, multi-fragment reads, and automatic index maintenance with sparse and unique indexes.
 - Protocol frame layer: fixed 38-byte header, CRC32C, zstd/lz4 compression, BATCH codec, Protobuf v1 messages, and collection metadata lookup.
 - TCP session layer: HELLO/WELCOME negotiation, bearer-token auth, compression selection, PING/PONG, BATCH dispatch, and structured errors.
 - TLS 1.3 transport with rustls and typed Rust client handshake, authentication, document, query, batch, and collection-description calls.
-- Runnable `recolithd` process with TOML configuration, memory or fjall storage, catalog bootstrap, persisted catalog reload, TLS, bearer auth, logging, and graceful shutdown.
-- `recolith` CLI with `ping`, RQL `query`, `describe`, and schema-aware `doc get` / `doc put`, including TLS, bearer auth, named keys and fields, and human-readable output.
+- Runnable `recolithd` process with TOML configuration, memory or fjall storage, optional catalog bootstrap, persisted catalog reload, runtime catalog creation, TLS, bearer auth, logging, and graceful shutdown.
+- `recolith` CLI with `ping`, RQL `query`, `describe`, schema-aware `doc get` / `doc put`, runtime `catalog` creation commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
 - Protocol document and query operations: DOC_GET, idempotent DOC_PUT with same-transaction deduplication, and RQL QUERY execution.
 - Process-exit crash recovery test and a full restart test covering catalog reload, commit-clock continuity, and persisted documents.
 - Point read/write benchmark example for the fjall adapter.
 - Batched commit-timestamp allocation, parallel document writes, and document plus concurrent multi-client benchmarks.
 - Network robustness coverage: oversized, truncated, and corrupt frames, malformed batches, TLS rejection, and shutdown draining.
+- Process-local server metrics for sessions, requests, errors, operation counts, and per-operation latency percentiles, logged periodically and at shutdown.
+- Bounded concurrent sessions with connection-limit overload rejection and rejection metrics.
+- HMAC-SHA256 opaque tokens, role-based collection permissions, token expiry, local token inspection and verification, and principal-scoped idempotency.
+- Atomic catalog creation for keyspaces, schema versions, buckets, collections, and indexes, with generation checks and persisted reload.
+- Offline logical backup, verification, and restore with checksums, entry-count validation, and bounded scan batches.
 
 Not yet implemented:
 
 - Benchmarks on the target hardware profile and compaction tuning.
 - Additional persistent adapters (RocksDB, redb).
-- Higher-level Rust SDK ergonomics, CLI admin commands, and streaming result descriptors.
+- Catalog drops, alters, and online index backfill.
+- Higher-level Rust SDK ergonomics, streaming result descriptors, and broader CLI administration.
 - Distributed placement, replication, and cross-partition workflows.
 
 ## Quick Start
@@ -122,6 +129,71 @@ cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM play
 
 The example configuration and catalog are under [`examples/recolithd`](examples/recolithd). The bootstrap catalog is applied only when persistent metadata is empty; later starts reuse the stored catalog.
 
+## Backup and Restore
+
+Stop the server before taking or restoring a backup.
+
+```text
+cargo run -p recolith-server --bin recolith-backup -- backup --data-dir examples/recolithd/data --output game.backup
+cargo run -p recolith-server --bin recolith-backup -- verify --input game.backup
+cargo run -p recolith-server --bin recolith-backup -- restore --data-dir restored-data --input game.backup
+```
+
+Restore requires an empty target directory. Switch the server data path to the restored directory after verifying it.
+
+## Authentication
+
+Authentication is disabled by default for loopback development. To enable token authentication, generate a secret and uncomment the `[auth]` section in the example configuration:
+
+```text
+openssl rand -hex 32 > examples/recolithd/secret.hex
+```
+
+```toml
+[auth]
+secret_file = "secret.hex"
+roles_file = "roles.toml"
+```
+
+Issue a token locally:
+
+```text
+cargo run -p recolith-cli --bin recolith -- token issue --secret-file examples/recolithd/secret.hex --subject admin --role admin --ttl 3600
+```
+
+Inspect claims or verify a token signature locally, without contacting a server:
+
+```text
+cargo run -p recolith-cli --bin recolith -- token inspect --token-file token.txt
+cargo run -p recolith-cli --bin recolith -- token verify --secret-file examples/recolithd/secret.hex --token-file token.txt
+```
+
+`token inspect` decodes claims without checking the signature and is intended for diagnostics. `token verify` checks the signature and expiry; pass `--previous-secret-file` while rotating secrets.
+
+Then pass the token to commands:
+
+```text
+cargo run -p recolith-cli --bin recolith -- --token "$RECOLITH_TOKEN" ping
+```
+
+Roles grant `read`, `write`, `describe`, or `admin` actions over keyspace/collection scopes. Role changes apply after restart. `DOC_GET` and `QUERY` require `read`; `DOC_PUT` requires `write`; `DESCRIBE_COLLECTION` requires `describe`. The example `roles.toml` includes `admin`, `game-reader`, and `game-writer` roles. `CATALOG_APPLY` requires `admin` on every affected scope; schema registration requires global admin on `*/*`.
+
+## Catalog Changes
+
+Without a bootstrap file, the server starts with an empty catalog. Catalog objects can be created at runtime:
+
+```text
+cargo run -p recolith-cli --bin recolith -- catalog create-keyspace --id 1 --name game
+cargo run -p recolith-cli --bin recolith -- catalog register-schema --id 1 --version 1 --idl-file profile.idl
+cargo run -p recolith-cli --bin recolith -- catalog create-bucket --id 1 --keyspace-id 1 --name player_profile --partitions 16 --schema-id 1 --schema-version 1
+cargo run -p recolith-cli --bin recolith -- catalog create-collection --id 1 --keyspace-id 1 --name player --key player_id:u64 --fragment 1:profile:1:one
+cargo run -p recolith-cli --bin recolith -- catalog create-index --bucket-id 1 --id 1 --name by-level --kind range --field 2
+```
+
+Identifiers are assigned by the client. Each command sends one `CATALOG_APPLY` request, which is validated and persisted atomically. Reapplying an identical definition succeeds without changing the catalog; conflicting definitions return `CONFLICT`. Pass `--catalog-generation N` to reject the change when the server has moved past generation `N`.
+
+Indexes can only be created on empty buckets. Catalog drops, alters, and index backfill are not implemented yet.
+
 ## Build
 
 Requires Rust 1.90 or newer (edition 2024). Building the protocol crate requires `protoc`.
@@ -132,6 +204,17 @@ cargo test --workspace --all-targets
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+## Benchmarks
+
+```text
+cargo run --release -p recolith-backend-fjall --example point_bench
+cargo run --release -p recolith-server --example document_bench
+cargo run --release -p recolith-client --example server_bench
+cargo run --release -p recolith-client --example soak
+```
+
+The server benchmark supports `BENCH_CLIENTS`, `BENCH_WRITES`, `BENCH_READS`, `BENCH_QUERIES`, `BENCH_RUNS`, and `BENCH_WARMUP`. The soak benchmark supports `SOAK_SECONDS` and `SOAK_CLIENTS`.
 
 Generate API documentation with `cargo doc --workspace --no-deps --open`.
 

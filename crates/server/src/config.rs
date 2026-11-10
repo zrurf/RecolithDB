@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use recolith_protocol::frame::HEADER_LEN;
+use recolith_security::Authenticator;
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -22,6 +23,9 @@ pub struct Config {
     /// Optional catalog bootstrap settings.
     #[serde(default)]
     pub catalog: CatalogSettings,
+    /// Optional token and role authentication settings.
+    #[serde(default)]
+    pub auth: Option<AuthSettings>,
 }
 
 /// Listener and protocol settings.
@@ -39,6 +43,9 @@ pub struct ServerSettings {
     /// Maximum frame payload size.
     #[serde(default = "default_max_frame_size")]
     pub max_frame_size: usize,
+    /// Maximum concurrent TCP sessions. Zero means unlimited.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
     /// Maximum number of subframes in a batch.
     #[serde(default = "default_max_batch_subframes")]
     pub max_batch_subframes: usize,
@@ -74,6 +81,19 @@ pub struct TlsSettings {
     pub certificate_chain: PathBuf,
     /// PEM private key.
     pub private_key: PathBuf,
+}
+
+/// Token and role authentication settings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthSettings {
+    /// Hexadecimal HMAC secret.
+    pub secret_file: PathBuf,
+    /// Optional previous secret accepted during rotation.
+    #[serde(default)]
+    pub previous_secret_file: Option<PathBuf>,
+    /// Role and permission definitions.
+    pub roles_file: PathBuf,
 }
 
 /// Catalog startup settings.
@@ -160,10 +180,20 @@ impl Config {
             .map(|token| token.as_bytes().to_vec());
         config.allow_plaintext_remote = self.server.allow_plaintext_remote;
         config.max_frame_size = self.server.max_frame_size;
+        config.max_connections = self.server.max_connections;
         config.max_batch_subframes = self.server.max_batch_subframes;
         config.max_batch_bytes = self.server.max_batch_bytes;
         config.max_decompressed_size = self.server.max_decompressed_size;
         config.compression_threshold = self.server.compression_threshold;
+        if let Some(auth) = &self.auth {
+            let authenticator = Authenticator::from_files(
+                &auth.secret_file,
+                auth.previous_secret_file.as_deref(),
+                &auth.roles_file,
+            )
+            .map_err(|error| ConfigError::Invalid(format!("authentication: {error}")))?;
+            config = config.with_auth(authenticator);
+        }
         if let Some(tls) = &self.tls {
             config = config.with_tls(&tls.certificate_chain, &tls.private_key);
         }
@@ -183,6 +213,13 @@ impl Config {
         if let Some(bootstrap) = &mut self.catalog.bootstrap {
             resolve(base, bootstrap);
         }
+        if let Some(auth) = &mut self.auth {
+            resolve(base, &mut auth.secret_file);
+            if let Some(previous) = &mut auth.previous_secret_file {
+                resolve(base, previous);
+            }
+            resolve(base, &mut auth.roles_file);
+        }
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -197,9 +234,15 @@ impl Config {
                 "server.auth_token must not be empty".to_owned(),
             ));
         }
+        if self.auth.is_some() && self.server.auth_token.is_some() {
+            return Err(ConfigError::Invalid(
+                "server.auth_token and [auth] cannot both be configured".to_owned(),
+            ));
+        }
         if self.server.allow_plaintext_remote
             && self.tls.is_none()
             && self.server.auth_token.is_none()
+            && self.auth.is_none()
         {
             return Err(ConfigError::Invalid(
                 "remote plaintext requires TLS or an auth token".to_owned(),
@@ -238,6 +281,10 @@ fn resolve(base: &Path, path: &mut PathBuf) {
 
 const fn default_max_frame_size() -> usize {
     16 * 1024 * 1024
+}
+
+const fn default_max_connections() -> usize {
+    1024
 }
 
 const fn default_max_batch_subframes() -> usize {

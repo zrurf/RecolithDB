@@ -19,6 +19,7 @@ recolith-transaction.workspace = true
 recolith-query.workspace = true
 recolith-distributed.workspace = true
 recolith-protocol.workspace = true
+recolith-security.workspace = true
 prost.workspace = true
 serde.workspace = true
 thiserror.workspace = true

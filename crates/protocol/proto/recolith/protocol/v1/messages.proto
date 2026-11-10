@@ -323,3 +323,73 @@ message DescribeCollectionResponse {
   uint64 catalog_generation = 1;
   CollectionMetadata collection = 2;
 }
+
+enum BucketPolicy {
+  BUCKET_POLICY_UNSPECIFIED = 0;
+  BUCKET_POLICY_STRICT = 1;
+  BUCKET_POLICY_MANAGED = 2;
+  BUCKET_POLICY_RAW = 3;
+}
+
+message KeyspaceDefinition {
+  uint32 id = 1;
+  string name = 2;
+}
+
+message SchemaDefinition {
+  uint64 id = 1;
+  uint32 version = 2;
+  string idl = 3;
+}
+
+message BucketDefinition {
+  uint64 id = 1;
+  uint32 keyspace_id = 2;
+  string name = 3;
+  uint32 partitions = 4;
+  BucketPolicy policy = 5;
+  uint64 schema_id = 6;
+  uint32 schema_version = 7;
+}
+
+message KeyFieldDefinition {
+  string name = 1;
+  KeyFieldType type = 2;
+}
+
+message FragmentDefinition {
+  uint32 id = 1;
+  string name = 2;
+  uint64 bucket_id = 3;
+  FragmentCardinality cardinality = 4;
+}
+
+message CollectionDefinition {
+  uint64 id = 1;
+  uint32 keyspace_id = 2;
+  string name = 3;
+  string affinity_group = 4;
+  repeated KeyFieldDefinition key_fields = 5;
+  repeated FragmentDefinition fragments = 6;
+}
+
+message IndexDefinition {
+  uint64 id = 1;
+  uint64 bucket_id = 2;
+  string name = 3;
+  IndexKind kind = 4;
+  repeated uint32 fields = 5;
+}
+
+message CatalogApplyRequest {
+  RequestMeta meta = 1;
+  repeated KeyspaceDefinition keyspaces = 2;
+  repeated SchemaDefinition schemas = 3;
+  repeated BucketDefinition buckets = 4;
+  repeated CollectionDefinition collections = 5;
+  repeated IndexDefinition indexes = 6;
+}
+
+message CatalogApplyResponse {
+  uint64 catalog_generation = 1;
+}

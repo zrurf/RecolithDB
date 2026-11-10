@@ -2,17 +2,19 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
-use recolith_backend::{StorageBackend, TxnOptions};
-use recolith_catalog::{Catalog, CatalogError, CatalogSnapshot};
-use recolith_common::{CatalogGeneration, CollectionId, CommitTs, FragmentId, PartitionId};
+use recolith_backend::{BackendError, KeyRange, ScanOptions, Snapshot, StorageBackend, TxnOptions};
+use recolith_catalog::{Catalog, CatalogChanges, CatalogError, CatalogSnapshot, save_catalog};
+use recolith_common::{
+    BucketId, CatalogGeneration, CollectionId, CommitTs, FragmentId, PartitionId,
+};
 use recolith_model::{FragmentCardinality, IndexDefinition, IndexKind};
 use recolith_query::{DocumentReadRequest, QueryEngine, QueryError};
 use recolith_schema::RecordSchema;
 use recolith_storage::{
-    DocumentFragments, MAX_DOCUMENT_KEY_LEN, RecordData, StorageError, encode_index_value,
-    encode_record_key,
+    DocumentFragments, MAX_DOCUMENT_KEY_LEN, RecordData, StorageError, encode_bucket_prefix,
+    encode_index_value, encode_record_key,
 };
 use recolith_transaction::{
     BatchedCommitClock, FragmentWrite, IndexUpdate, LocalWritePath, TransactionError,
@@ -197,6 +199,10 @@ pub enum DocumentError {
     IdempotencyConflict,
     /// The stored idempotency record is malformed.
     InvalidIdempotencyRecord,
+    /// A new index targets a bucket that already contains records.
+    IndexRequiresEmptyBucket(BucketId),
+    /// The expected catalog generation no longer matches.
+    StaleCatalog,
 }
 
 impl fmt::Display for DocumentError {
@@ -215,6 +221,11 @@ impl fmt::Display for DocumentError {
             Self::InvalidIdempotencyRecord => {
                 formatter.write_str("stored idempotency record is malformed")
             }
+            Self::IndexRequiresEmptyBucket(id) => write!(
+                formatter,
+                "bucket {id} contains records; indexes can only be created on empty buckets"
+            ),
+            Self::StaleCatalog => formatter.write_str("catalog generation is stale"),
             Self::InvalidRequest(message) => {
                 write!(formatter, "invalid document request: {message}")
             }
@@ -248,11 +259,19 @@ impl From<StorageError> for DocumentError {
     }
 }
 
+impl From<BackendError> for DocumentError {
+    fn from(error: BackendError) -> Self {
+        Self::Catalog(CatalogError::Backend(error))
+    }
+}
+
 /// Document service bound to a local catalog and backend.
 pub struct DocumentStore<B: StorageBackend> {
-    catalog: Arc<Catalog>,
+    catalog: RwLock<Arc<Catalog>>,
     backend: Arc<B>,
     clock: BatchedCommitClock,
+    write_gate: RwLock<()>,
+    ddl_lock: Mutex<()>,
 }
 
 impl<B: StorageBackend> DocumentStore<B> {
@@ -260,16 +279,18 @@ impl<B: StorageBackend> DocumentStore<B> {
     #[must_use]
     pub fn new(catalog: Arc<Catalog>, backend: Arc<B>) -> Self {
         Self {
-            catalog,
+            catalog: RwLock::new(catalog),
             backend,
             clock: BatchedCommitClock::with_default_key(),
+            write_gate: RwLock::new(()),
+            ddl_lock: Mutex::new(()),
         }
     }
 
     /// Returns the current catalog generation.
     #[must_use]
     pub fn catalog_generation(&self) -> CatalogGeneration {
-        self.catalog.generation()
+        self.catalog().generation()
     }
 
     /// Returns an immutable catalog snapshot.
@@ -278,13 +299,55 @@ impl<B: StorageBackend> DocumentStore<B> {
     ///
     /// Returns [`DocumentError`] if an internal catalog lock is poisoned.
     pub fn catalog_snapshot(&self) -> Result<CatalogSnapshot, DocumentError> {
-        Ok(self.catalog.snapshot()?)
+        Ok(self.catalog().snapshot()?)
     }
 
     /// Creates a query engine sharing this store's catalog and backend.
     #[must_use]
     pub fn query_engine(&self) -> QueryEngine<B> {
-        QueryEngine::new(self.catalog.clone(), self.backend.clone())
+        QueryEngine::new(self.catalog(), self.backend.clone())
+    }
+
+    /// Applies additive catalog definitions atomically.
+    ///
+    /// The updated catalog is persisted before it replaces the in-memory
+    /// snapshot. Writes are excluded while indexes are added so the
+    /// empty-bucket check cannot race with document creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] for conflicting definitions, missing
+    /// references, invalid indexes, non-empty indexed buckets, or backend
+    /// failures.
+    pub fn apply_catalog(
+        &self,
+        changes: &CatalogChanges,
+        expected: Option<CatalogGeneration>,
+    ) -> Result<CatalogGeneration, DocumentError> {
+        let _ddl = self.ddl_lock.lock().map_err(|_| lock_error())?;
+        let _gate = self.write_gate.write().map_err(|_| lock_error())?;
+        let current = self.catalog();
+        let snapshot = current.snapshot()?;
+        if expected.is_some_and(|generation| generation != snapshot.generation) {
+            return Err(DocumentError::StaleCatalog);
+        }
+        check_indexed_buckets_empty(self.backend.as_ref(), &snapshot, changes)?;
+
+        let Some(candidate) = current.apply_changes(changes)? else {
+            return Ok(snapshot.generation);
+        };
+        save_catalog(self.backend.as_ref(), &candidate)?;
+        let generation = candidate.generation();
+        *self.catalog.write().map_err(|_| lock_error())? = Arc::new(candidate);
+
+        Ok(generation)
+    }
+
+    fn catalog(&self) -> Arc<Catalog> {
+        self.catalog
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Writes all requested fragments with one commit timestamp.
@@ -294,7 +357,8 @@ impl<B: StorageBackend> DocumentStore<B> {
     /// Returns [`DocumentError`] for unknown metadata, invalid fragment targets,
     /// optimistic conflicts, schema errors, or backend failures.
     pub fn write(&self, request: &DocumentWrite) -> Result<CommitTs, DocumentError> {
-        let snapshot = self.catalog.snapshot()?;
+        let _gate = self.write_gate.read().map_err(|_| lock_error())?;
+        let snapshot = self.catalog().snapshot()?;
         let collection = snapshot
             .collections
             .get(&request.collection)
@@ -443,7 +507,7 @@ impl<B: StorageBackend> DocumentStore<B> {
     ///
     /// Returns [`DocumentError`] for binding or execution failures.
     pub fn read(&self, request: &DocumentReadRequest) -> Result<DocumentFragments, DocumentError> {
-        let engine = QueryEngine::new(self.catalog.clone(), self.backend.clone());
+        let engine = QueryEngine::new(self.catalog(), self.backend.clone());
 
         Ok(engine.read_document(request)?)
     }
@@ -451,6 +515,40 @@ impl<B: StorageBackend> DocumentStore<B> {
 
 const IDEMPOTENCY_RECORD_VERSION: u8 = 1;
 const IDEMPOTENCY_RECORD_LEN: usize = 1 + 32 + 8;
+
+fn lock_error() -> DocumentError {
+    DocumentError::Catalog(CatalogError::LockPoisoned)
+}
+
+fn check_indexed_buckets_empty<B: StorageBackend>(
+    backend: &B,
+    snapshot: &CatalogSnapshot,
+    changes: &CatalogChanges,
+) -> Result<(), DocumentError> {
+    let storage = backend.snapshot()?;
+    for (bucket_id, index) in &changes.indexes {
+        let existing = snapshot
+            .indexes
+            .get(bucket_id)
+            .and_then(|indexes| indexes.get(&index.id()));
+        if existing.is_some() {
+            continue;
+        }
+        let prefix = encode_bucket_prefix(*bucket_id);
+        let records = storage.scan(
+            &KeyRange::prefix(&prefix),
+            ScanOptions {
+                limit: Some(1),
+                reverse: false,
+            },
+        )?;
+        if !records.is_empty() {
+            return Err(DocumentError::IndexRequiresEmptyBucket(*bucket_id));
+        }
+    }
+
+    Ok(())
+}
 
 fn encode_idempotency(hash: [u8; 32], commit_ts: CommitTs) -> Vec<u8> {
     let mut value = Vec::with_capacity(IDEMPOTENCY_RECORD_LEN);

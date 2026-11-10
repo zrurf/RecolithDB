@@ -8,3 +8,7 @@ path = "./data"
 
 [catalog]
 bootstrap = "catalog.toml"
+
+# [auth]
+# secret_file = "secret.hex"
+# roles_file = "roles.toml"
