@@ -8,7 +8,7 @@ use recolith_backend::StorageBackend;
 use recolith_catalog::{Catalog, CatalogError, load_catalog, save_catalog};
 use recolith_server::{
     BootstrapError, Config, ConfigError, DocumentStore, MetricsSnapshot, ServerConfig,
-    ServerMetrics, StorageSettings, load_bootstrap, serve_with_shutdown,
+    ServerMetrics, StorageSettings, load_bootstrap, migration_in_progress, serve_with_shutdown,
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -74,6 +74,11 @@ async fn run_backend<B: StorageBackend>(
     server_config: ServerConfig,
     backend: Arc<B>,
 ) -> Result<(), RuntimeError> {
+    if migration_in_progress(backend.as_ref())? {
+        return Err(RuntimeError::Message(
+            "offline migration is in progress; run recolith-migrate to completion".to_owned(),
+        ));
+    }
     let catalog = load_catalog(backend.as_ref())?;
     let catalog = if catalog_is_empty(&catalog)? {
         match config.catalog.bootstrap.as_ref() {
