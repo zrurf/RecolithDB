@@ -10,10 +10,10 @@ use recolith_protocol::batch::{BatchLimits, SubFrame, encode_batch};
 use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN};
 use recolith_protocol::messages::{
-    AuthMethod, AuthResult, CatalogApplyRequest, DescribeCollectionRequest, DocumentGetRequest,
-    DocumentPutRequest, ErrorResponse, FieldValue, FragmentPayload, HelloRequest,
-    KeyspaceDefinition, PingRequest, RequestMeta, Value, WelcomeResponse,
-    describe_collection_request, opcode, status, value,
+    AuthMethod, AuthResult, CatalogApplyRequest, CatalogDropRequest, DescribeCollectionRequest,
+    DocumentGetRequest, DocumentPutRequest, ErrorResponse, FieldValue, FragmentPayload,
+    HelloRequest, KeyspaceDefinition, PingRequest, RequestMeta, Value, WelcomeResponse,
+    catalog_drop_request, describe_collection_request, opcode, status, value,
 };
 use recolith_security::{Authenticator, TokenClaims, TokenIssuer, unix_seconds};
 use recolith_server::{DocumentStore, ServerConfig, serve};
@@ -383,9 +383,10 @@ async fn rejects_invalid_and_expired_tokens_and_honors_expiry_per_request() {
     )
     .await;
 
-    let expiring = fixture.issue("short", "reader", now, now + 1);
+    let now = unix_seconds();
+    let expiring = fixture.issue("short", "reader", now, now + 3);
     let (mut stream, codec) = connect(address, &expiring).await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
     write_frame(
         &mut stream,
         &codec,
@@ -440,6 +441,33 @@ async fn catalog_changes_require_admin_on_affected_scopes() {
     .await;
     let (header, _) = read_frame(&mut admin, &admin_codec).await;
     assert_eq!(header.opcode(), opcode::CATALOG_APPLY);
+    assert_eq!(header.status(), status::OK);
+
+    let drop = CatalogDropRequest {
+        meta: None,
+        purge: false,
+        target: Some(catalog_drop_request::Target::CollectionId(1)),
+    };
+    write_frame(
+        &mut reader,
+        &reader_codec,
+        &FrameHeader::new(opcode::CATALOG_DROP, 4),
+        &drop.encode_to_vec(),
+    )
+    .await;
+    let (header, _) = read_frame(&mut reader, &reader_codec).await;
+    assert_eq!(header.opcode(), opcode::ERROR);
+    assert_eq!(header.status(), status::PERMISSION_DENIED);
+
+    write_frame(
+        &mut admin,
+        &admin_codec,
+        &FrameHeader::new(opcode::CATALOG_DROP, 5),
+        &drop.encode_to_vec(),
+    )
+    .await;
+    let (header, _) = read_frame(&mut admin, &admin_codec).await;
+    assert_eq!(header.opcode(), opcode::CATALOG_DROP);
     assert_eq!(header.status(), status::OK);
 }
 

@@ -17,11 +17,13 @@ use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN};
 use recolith_protocol::messages::{
     AuthMethod, AuthResult, BucketDefinition, BucketPolicy, CatalogApplyRequest,
-    CatalogApplyResponse, CollectionDefinition, DescribeCollectionRequest,
-    DescribeCollectionResponse, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest,
-    FieldValue, FragmentDefinition, FragmentPayload, HelloRequest, IndexDefinition, IndexKind,
-    KeyFieldDefinition, KeyFieldType, KeyspaceDefinition, RequestMeta, SchemaDefinition, Value,
-    WelcomeResponse, describe_collection_request, opcode, status, value,
+    CatalogApplyResponse, CatalogDropRequest, CatalogDropResponse, CatalogIndexTarget,
+    CollectionDefinition, DescribeCollectionRequest, DescribeCollectionResponse,
+    DocumentGetRequest, DocumentGetResponse, DocumentPutRequest, ErrorResponse, FieldValue,
+    FragmentDefinition, FragmentPayload, HelloRequest, IndexDefinition, IndexKind,
+    KeyFieldDefinition, KeyFieldType, KeyspaceDefinition, QueryRequest, QueryResponse, RequestMeta,
+    SchemaDefinition, Value, WelcomeResponse, catalog_drop_request, describe_collection_request,
+    opcode, status, value,
 };
 use recolith_schema::{Field, RecordSchema, Type};
 use recolith_server::{DocumentStore, ServerConfig, serve};
@@ -195,6 +197,84 @@ async fn apply(
     };
 
     (header, response)
+}
+
+fn drop_target(target: catalog_drop_request::Target, purge: bool) -> CatalogDropRequest {
+    CatalogDropRequest {
+        meta: Some(RequestMeta::default()),
+        purge,
+        target: Some(target),
+    }
+}
+
+async fn drop_catalog(
+    stream: &mut TcpStream,
+    codec: &FrameCodec,
+    request_id: u64,
+    request: &CatalogDropRequest,
+) -> (FrameHeader, CatalogDropResponse) {
+    write_frame(
+        stream,
+        codec,
+        &FrameHeader::new(opcode::CATALOG_DROP, request_id),
+        &request.encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(stream, codec).await;
+    let response = if header.status() == status::OK {
+        CatalogDropResponse::decode(payload.as_slice()).expect("drop response")
+    } else {
+        CatalogDropResponse::default()
+    };
+
+    (header, response)
+}
+
+async fn put_document(
+    stream: &mut TcpStream,
+    codec: &FrameCodec,
+    request_id: u64,
+    key: Vec<u8>,
+    idempotency: &[u8],
+    name: &str,
+    level: u32,
+) -> FrameHeader {
+    write_frame(
+        stream,
+        codec,
+        &FrameHeader::new(opcode::DOC_PUT, request_id),
+        &DocumentPutRequest {
+            meta: Some(RequestMeta {
+                idempotency_key: idempotency.to_vec(),
+                ..Default::default()
+            }),
+            collection_id: 1,
+            partition: 0,
+            document_key: key,
+            fragments: vec![FragmentPayload {
+                fragment_id: 1,
+                subkey: Vec::new(),
+                fields: vec![
+                    FieldValue {
+                        field_id: 1,
+                        value: Some(Value {
+                            kind: Some(value::Kind::StringValue(name.to_owned())),
+                        }),
+                    },
+                    FieldValue {
+                        field_id: 2,
+                        value: Some(Value {
+                            kind: Some(value::Kind::U32Value(level)),
+                        }),
+                    },
+                ],
+                if_match: None,
+            }],
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    read_frame(stream, codec).await.0
 }
 
 fn document_key(player: u64) -> Vec<u8> {
@@ -408,7 +488,7 @@ async fn applies_catalog_atomically_and_serves_new_collection() {
 }
 
 #[tokio::test]
-async fn rejects_indexes_on_non_empty_buckets() {
+async fn backfills_indexes_for_existing_records() {
     let store = store();
     let address = start_server(Arc::clone(&store)).await;
     let (mut stream, codec) = connect(address).await;
@@ -416,48 +496,232 @@ async fn rejects_indexes_on_non_empty_buckets() {
     let (header, _) = apply(&mut stream, &codec, 2, &base_request()).await;
     assert_eq!(header.status(), status::OK);
 
-    let key = document_key(7);
+    let header = put_document(
+        &mut stream,
+        &codec,
+        3,
+        document_key(7),
+        b"backfill",
+        "alex",
+        5,
+    )
+    .await;
+    assert_eq!(header.status(), status::OK);
+
+    let (header, response) = apply(&mut stream, &codec, 4, &index_request()).await;
+    assert_eq!(header.status(), status::OK);
+    assert_eq!(response.catalog_generation, 5);
+
     write_frame(
         &mut stream,
         &codec,
-        &FrameHeader::new(opcode::DOC_PUT, 3),
-        &DocumentPutRequest {
-            meta: Some(RequestMeta {
-                idempotency_key: b"non-empty".to_vec(),
-                ..Default::default()
-            }),
-            collection_id: 1,
+        &FrameHeader::new(opcode::QUERY, 5),
+        &QueryRequest {
+            meta: None,
             partition: 0,
-            document_key: key,
-            fragments: vec![FragmentPayload {
-                fragment_id: 1,
-                subkey: Vec::new(),
-                fields: vec![
-                    FieldValue {
-                        field_id: 1,
-                        value: Some(Value {
-                            kind: Some(value::Kind::StringValue("alex".to_owned())),
-                        }),
-                    },
-                    FieldValue {
-                        field_id: 2,
-                        value: Some(Value {
-                            kind: Some(value::Kind::U32Value(5)),
-                        }),
-                    },
-                ],
-                if_match: None,
-            }],
+            rql:
+                "SELECT profile.name FROM player WHERE player_id = 7 AND profile.level = 5 INCLUDE FRAGMENTS profile"
+                    .to_owned(),
+            parameters: Vec::new(),
+            limit: 10,
         }
         .encode_to_vec(),
     )
     .await;
-    let (header, _) = read_frame(&mut stream, &codec).await;
-    assert_eq!(header.status(), status::OK);
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    if header.status() != status::OK {
+        let error = ErrorResponse::decode(payload.as_slice()).expect("error");
+        panic!("query failed with {}: {}", header.status(), error.message);
+    }
+    let response = QueryResponse::decode(payload.as_slice()).expect("query");
+    assert_eq!(response.documents.len(), 1);
+    assert_eq!(response.documents[0].fragments.len(), 1);
+}
 
-    let (header, _) = apply(&mut stream, &codec, 4, &index_request()).await;
+#[tokio::test]
+async fn rejects_unique_index_backfill_with_duplicate_values() {
+    let store = store();
+    let address = start_server(Arc::clone(&store)).await;
+    let (mut stream, codec) = connect(address).await;
+
+    let (header, _) = apply(&mut stream, &codec, 2, &base_request()).await;
+    assert_eq!(header.status(), status::OK);
+    assert_eq!(
+        put_document(&mut stream, &codec, 3, document_key(1), b"dup-1", "alex", 1)
+            .await
+            .status(),
+        status::OK
+    );
+    assert_eq!(
+        put_document(&mut stream, &codec, 4, document_key(2), b"dup-2", "alex", 2)
+            .await
+            .status(),
+        status::OK
+    );
+
+    let unique = CatalogApplyRequest {
+        meta: Some(RequestMeta::default()),
+        indexes: vec![IndexDefinition {
+            id: 1,
+            bucket_id: 1,
+            name: "by-name".to_owned(),
+            kind: IndexKind::Unique as i32,
+            fields: vec![1],
+        }],
+        ..Default::default()
+    };
+    let (header, _) = apply(&mut stream, &codec, 5, &unique).await;
+    assert_eq!(header.opcode(), opcode::ERROR);
+    assert_eq!(header.status(), status::CONFLICT);
+    assert!(
+        !store
+            .catalog_snapshot()
+            .expect("snapshot")
+            .indexes
+            .contains_key(&BucketId::new(1))
+    );
+}
+
+#[tokio::test]
+async fn drops_collections_only_with_purge() {
+    let store = store();
+    let address = start_server(Arc::clone(&store)).await;
+    let (mut stream, codec) = connect(address).await;
+
+    let (header, _) = apply(&mut stream, &codec, 2, &base_request()).await;
+    assert_eq!(header.status(), status::OK);
+    let key = document_key(9);
+    assert_eq!(
+        put_document(
+            &mut stream,
+            &codec,
+            3,
+            key.clone(),
+            b"drop-collection",
+            "alex",
+            9
+        )
+        .await
+        .status(),
+        status::OK
+    );
+
+    let request = drop_target(catalog_drop_request::Target::CollectionId(1), false);
+    let (header, _) = drop_catalog(&mut stream, &codec, 4, &request).await;
     assert_eq!(header.opcode(), opcode::ERROR);
     assert_eq!(header.status(), status::FAILED_PRECONDITION);
+
+    let (header, response) = drop_catalog(
+        &mut stream,
+        &codec,
+        5,
+        &drop_target(catalog_drop_request::Target::CollectionId(1), true),
+    )
+    .await;
+    assert_eq!(header.status(), status::OK);
+    assert_eq!(response.catalog_generation, 5);
+    assert!(
+        store
+            .catalog_snapshot()
+            .expect("snapshot")
+            .collections
+            .is_empty()
+    );
+
+    let (header, _) = apply(&mut stream, &codec, 6, &base_request()).await;
+    assert_eq!(header.status(), status::OK);
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::DOC_GET, 7),
+        &DocumentGetRequest {
+            meta: None,
+            collection_id: 1,
+            partition: 0,
+            document_key: key,
+            fragments: vec![1],
+            projection: Vec::new(),
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.status(), status::OK);
+    let read = DocumentGetResponse::decode(payload.as_slice()).expect("read");
+    assert!(read.fragments.is_empty(), "purged records must not return");
+}
+
+#[tokio::test]
+async fn drops_indexes_only_with_purge_and_queries_still_work() {
+    let store = store();
+    let address = start_server(Arc::clone(&store)).await;
+    let (mut stream, codec) = connect(address).await;
+
+    let (header, _) = apply(&mut stream, &codec, 2, &base_request()).await;
+    assert_eq!(header.status(), status::OK);
+    assert_eq!(
+        put_document(
+            &mut stream,
+            &codec,
+            3,
+            document_key(3),
+            b"drop-index",
+            "sam",
+            3
+        )
+        .await
+        .status(),
+        status::OK
+    );
+    let (header, _) = apply(&mut stream, &codec, 4, &index_request()).await;
+    assert_eq!(header.status(), status::OK);
+
+    let target = catalog_drop_request::Target::Index(CatalogIndexTarget {
+        bucket_id: 1,
+        index_id: 1,
+    });
+    let (header, _) = drop_catalog(&mut stream, &codec, 5, &drop_target(target, false)).await;
+    assert_eq!(header.opcode(), opcode::ERROR);
+    assert_eq!(header.status(), status::FAILED_PRECONDITION);
+
+    let target = catalog_drop_request::Target::Index(CatalogIndexTarget {
+        bucket_id: 1,
+        index_id: 1,
+    });
+    let (header, response) = drop_catalog(&mut stream, &codec, 6, &drop_target(target, true)).await;
+    assert_eq!(header.status(), status::OK);
+    assert_eq!(response.catalog_generation, 6);
+    assert!(
+        !store
+            .catalog_snapshot()
+            .expect("snapshot")
+            .indexes
+            .contains_key(&BucketId::new(1))
+    );
+
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::QUERY, 7),
+        &QueryRequest {
+            meta: None,
+            partition: 0,
+            rql:
+                "SELECT profile.name FROM player WHERE player_id = 3 AND profile.level = 3 INCLUDE FRAGMENTS profile"
+                    .to_owned(),
+            parameters: Vec::new(),
+            limit: 10,
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    if header.status() != status::OK {
+        let error = ErrorResponse::decode(payload.as_slice()).expect("error");
+        panic!("query failed with {}: {}", header.status(), error.message);
+    }
+    let response = QueryResponse::decode(payload.as_slice()).expect("query");
+    assert_eq!(response.documents.len(), 1);
 }
 
 #[tokio::test]

@@ -863,6 +863,9 @@ dependencies = [
  "recolith-common",
  "recolith-model",
  "recolith-schema",
+ "serde",
+ "thiserror",
+ "toml",
 ]
 
 [[package]]

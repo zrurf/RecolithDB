@@ -89,7 +89,7 @@ RecolithDB is in early single-node development. Implemented today:
 - TCP session layer: HELLO/WELCOME negotiation, bearer-token auth, compression selection, PING/PONG, BATCH dispatch, and structured errors.
 - TLS 1.3 transport with rustls and typed Rust client handshake, authentication, document, query, batch, and collection-description calls.
 - Runnable `recolithd` process with TOML configuration, memory or fjall storage, optional catalog bootstrap, persisted catalog reload, runtime catalog creation, TLS, bearer auth, logging, and graceful shutdown.
-- `recolith` CLI with `ping`, RQL `query`, `describe`, schema-aware `doc get` / `doc put`, runtime `catalog` creation commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
+- `recolith` CLI with `ping`, RQL `query`, `describe`, schema-aware `doc get` / `doc put`, runtime `catalog` creation, file-based catalog apply, and drop commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
 - Protocol document and query operations: DOC_GET, idempotent DOC_PUT with same-transaction deduplication, and RQL QUERY execution.
 - Process-exit crash recovery test and a full restart test covering catalog reload, commit-clock continuity, and persisted documents.
 - Point read/write benchmark example for the fjall adapter.
@@ -98,14 +98,14 @@ RecolithDB is in early single-node development. Implemented today:
 - Process-local server metrics for sessions, requests, errors, operation counts, and per-operation latency percentiles, logged periodically and at shutdown.
 - Bounded concurrent sessions with connection-limit overload rejection and rejection metrics.
 - HMAC-SHA256 opaque tokens, role-based collection permissions, token expiry, local token inspection and verification, and principal-scoped idempotency.
-- Atomic catalog creation for keyspaces, schema versions, buckets, collections, and indexes, with generation checks and persisted reload.
+- Atomic catalog creation and removal for keyspaces, schema versions, buckets, collections, and indexes, with generation checks, purge controls, synchronous index backfill, and persisted reload.
 - Offline logical backup, verification, and restore with checksums, entry-count validation, and bounded scan batches.
 
 Not yet implemented:
 
 - Benchmarks on the target hardware profile and compaction tuning.
 - Additional persistent adapters (RocksDB, redb).
-- Catalog drops, alters, and online index backfill.
+- Catalog alters, online backfill for very large buckets, and schema migration.
 - Higher-level Rust SDK ergonomics, streaming result descriptors, and broader CLI administration.
 - Distributed placement, replication, and cross-partition workflows.
 
@@ -180,7 +180,15 @@ Roles grant `read`, `write`, `describe`, or `admin` actions over keyspace/collec
 
 ## Catalog Changes
 
-Without a bootstrap file, the server starts with an empty catalog. Catalog objects can be created at runtime:
+Without a bootstrap file, the server starts with an empty catalog. A complete catalog definition file can be applied atomically:
+
+```text
+cargo run -p recolith-cli --bin recolith -- catalog apply --file examples/recolithd/catalog.toml
+```
+
+The file uses the same format as `catalog.bootstrap`. Every object is validated before anything is persisted; identical objects are idempotent and conflicting definitions return `CONFLICT`.
+
+Individual objects can also be created at runtime:
 
 ```text
 cargo run -p recolith-cli --bin recolith -- catalog create-keyspace --id 1 --name game
@@ -192,7 +200,20 @@ cargo run -p recolith-cli --bin recolith -- catalog create-index --bucket-id 1 -
 
 Identifiers are assigned by the client. Each command sends one `CATALOG_APPLY` request, which is validated and persisted atomically. Reapplying an identical definition succeeds without changing the catalog; conflicting definitions return `CONFLICT`. Pass `--catalog-generation N` to reject the change when the server has moved past generation `N`.
 
-Indexes can only be created on empty buckets. Catalog drops, alters, and index backfill are not implemented yet.
+New indexes backfill existing records in the same transaction that persists the catalog. Backfill is limited to 100,000 records or 64 MiB; larger buckets return `FAILED_PRECONDITION`.
+
+Catalog objects are removed with `catalog drop-*`:
+
+```text
+cargo run -p recolith-cli --bin recolith -- catalog drop-index --bucket-id 1 --index-id 1 --purge
+cargo run -p recolith-cli --bin recolith -- catalog drop-collection --id 1 --purge
+cargo run -p recolith-cli --bin recolith -- catalog drop-bucket --id 1 --purge
+cargo run -p recolith-cli --bin recolith -- catalog drop-keyspace --id 1 --purge
+```
+
+Non-empty targets require `--purge`; without it they return `FAILED_PRECONDITION`. Purge deletes records and index entries in bounded batches before the catalog snapshot is committed. A crash during purge leaves the object visible, so the drop can be retried. Dropping a collection or keyspace is rejected while its buckets are shared with another collection. Keyspace drops cascade their collections, buckets, indexes, and placements; schemas remain because they are shared.
+
+Catalog alters are not implemented yet.
 
 ## Build
 

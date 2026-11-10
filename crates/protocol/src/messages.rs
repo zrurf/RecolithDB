@@ -24,6 +24,8 @@ pub mod opcode {
     pub const DESCRIBE_COLLECTION: u16 = 0x0050;
     /// Atomic catalog definition application.
     pub const CATALOG_APPLY: u16 = 0x0060;
+    /// Catalog object removal.
+    pub const CATALOG_DROP: u16 = 0x0061;
     /// Structured error response.
     pub const ERROR: u16 = 0x0040;
     /// Session shutdown notice.

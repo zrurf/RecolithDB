@@ -8,11 +8,11 @@ use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::error::ProtocolError;
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN, VERSION_MAJOR, VERSION_MINOR};
 use recolith_protocol::messages::{
-    AuthMethod, AuthResult, CatalogApplyRequest, CatalogApplyResponse, DescribeCollectionRequest,
-    DescribeCollectionResponse, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest,
-    DocumentPutResponse, ErrorResponse, GoAway, HelloRequest, PingRequest, PingResponse,
-    QueryRequest, QueryResponse, SecurityMode, WelcomeResponse, compression_bit, encoding_bit,
-    feature, opcode, status,
+    AuthMethod, AuthResult, CatalogApplyRequest, CatalogApplyResponse, CatalogDropRequest,
+    CatalogDropResponse, DescribeCollectionRequest, DescribeCollectionResponse, DocumentGetRequest,
+    DocumentGetResponse, DocumentPutRequest, DocumentPutResponse, ErrorResponse, GoAway,
+    HelloRequest, PingRequest, PingResponse, QueryRequest, QueryResponse, SecurityMode,
+    WelcomeResponse, compression_bit, encoding_bit, feature, opcode, status,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -332,6 +332,28 @@ impl Client {
             .await?;
         CatalogApplyResponse::decode(body.as_slice()).map_err(|_| {
             ClientError::UnexpectedResponse("malformed CATALOG_APPLY response".to_owned())
+        })
+    }
+
+    /// Removes one catalog object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn drop_catalog(
+        &mut self,
+        request: &CatalogDropRequest,
+    ) -> Result<CatalogDropResponse, ClientError> {
+        self.require_feature(feature::CATALOG_WRITE, "catalog changes")?;
+        let body = self
+            .request(
+                opcode::CATALOG_DROP,
+                opcode::CATALOG_DROP,
+                &request.encode_to_vec(),
+            )
+            .await?;
+        CatalogDropResponse::decode(body.as_slice()).map_err(|_| {
+            ClientError::UnexpectedResponse("malformed CATALOG_DROP response".to_owned())
         })
     }
 

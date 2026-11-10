@@ -123,6 +123,46 @@ pub fn load_catalog<B: StorageBackend>(backend: &B) -> Result<Catalog> {
     Catalog::restore(catalog)
 }
 
+/// Prepared catalog writes for atomic staging with other backend changes.
+#[derive(Debug)]
+pub struct CatalogWrite {
+    desired: BTreeMap<Vec<u8>, Vec<u8>>,
+    existing: Vec<Vec<u8>>,
+}
+
+impl CatalogWrite {
+    /// Captures the desired catalog snapshot and the currently stored keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError`] if the snapshot is inconsistent or the backend
+    /// cannot be read.
+    pub fn prepare<B: StorageBackend>(backend: &B, catalog: &Catalog) -> Result<Self> {
+        let snapshot = catalog.snapshot()?;
+        let desired = encode_snapshot(&snapshot)?;
+        let existing = backend
+            .snapshot()?
+            .scan(&KeyRange::prefix(CATALOG_PREFIX), ScanOptions::default())?
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+
+        Ok(Self { desired, existing })
+    }
+
+    /// Stages catalog deletions and writes in a transaction.
+    pub fn stage<T: Transaction>(&self, transaction: &mut T) {
+        for key in &self.existing {
+            if !self.desired.contains_key(key) {
+                transaction.delete(key);
+            }
+        }
+        for (key, value) in &self.desired {
+            transaction.put(key, value.clone());
+        }
+    }
+}
+
 /// Saves the complete catalog snapshot atomically.
 ///
 /// Existing metadata keys that are not part of the snapshot are removed.
@@ -131,20 +171,9 @@ pub fn load_catalog<B: StorageBackend>(backend: &B) -> Result<Catalog> {
 ///
 /// Returns [`CatalogError`] if the snapshot is inconsistent or backend access fails.
 pub fn save_catalog<B: StorageBackend>(backend: &B, catalog: &Catalog) -> Result<()> {
-    let snapshot = catalog.snapshot()?;
-    let desired = encode_snapshot(&snapshot)?;
-    let existing = backend.snapshot()?;
-    let keys = existing.scan(&KeyRange::prefix(CATALOG_PREFIX), ScanOptions::default())?;
+    let write = CatalogWrite::prepare(backend, catalog)?;
     let mut transaction = backend.begin(TxnOptions::default())?;
-
-    for (key, _) in keys {
-        if !desired.contains_key(&key) {
-            transaction.delete(&key);
-        }
-    }
-    for (key, value) in desired {
-        transaction.put(&key, value);
-    }
+    write.stage(&mut transaction);
     transaction.commit()?;
 
     Ok(())

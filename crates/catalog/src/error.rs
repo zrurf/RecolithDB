@@ -10,6 +10,8 @@ pub enum CatalogError {
     Duplicate(&'static str),
     /// A metadata object exists with a different definition.
     Conflict(String),
+    /// A metadata object is still referenced by another object.
+    Referenced(String),
     /// A referenced metadata object does not exist.
     NotFound(&'static str),
     /// A collection references an unknown bucket or keyspace.
@@ -37,6 +39,7 @@ impl fmt::Display for CatalogError {
         match self {
             Self::Duplicate(kind) => write!(formatter, "duplicate {kind}"),
             Self::Conflict(message) => write!(formatter, "conflict: {message}"),
+            Self::Referenced(message) => write!(formatter, "object is still referenced: {message}"),
             Self::NotFound(kind) => write!(formatter, "missing {kind}"),
             Self::InvalidReference(message) => write!(formatter, "invalid reference: {message}"),
             Self::InvalidIndex(message) => write!(formatter, "invalid index: {message}"),

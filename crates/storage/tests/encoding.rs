@@ -1,7 +1,8 @@
 mod record_key {
     use recolith_common::{BucketId, FragmentId, PartitionId};
     use recolith_storage::{
-        decode_record_key_head, encode_bucket_prefix, encode_document_prefix, encode_record_key,
+        decode_record_key, decode_record_key_head, encode_bucket_prefix, encode_document_prefix,
+        encode_index_key, encode_record_key,
     };
 
     #[test]
@@ -32,6 +33,34 @@ mod record_key {
         assert_eq!(head.bucket(), BucketId::new(7));
         assert_eq!(head.partition(), PartitionId::new(3));
         assert!(decode_record_key_head(b"short").is_err());
+    }
+
+    #[test]
+    fn decodes_complete_record_keys_and_rejects_index_keys() {
+        let key = encode_record_key(
+            BucketId::new(7),
+            PartitionId::new(3),
+            b"alex",
+            FragmentId::new(2),
+            b"slot-1",
+        );
+        let decoded = decode_record_key(&key).expect("record key");
+
+        assert_eq!(decoded.head().bucket(), BucketId::new(7));
+        assert_eq!(decoded.head().partition(), PartitionId::new(3));
+        assert_eq!(decoded.document_key(), b"alex");
+        assert_eq!(decoded.fragment(), FragmentId::new(2));
+        assert_eq!(decoded.subkey(), b"slot-1");
+
+        let index = encode_index_key(
+            BucketId::new(7),
+            PartitionId::new(3),
+            recolith_common::IndexId::new(4),
+            b"level:10",
+            &key,
+        );
+        assert!(decode_record_key(&index).is_err());
+        assert!(decode_record_key(&key[..key.len() - 1]).is_err());
     }
 
     #[test]

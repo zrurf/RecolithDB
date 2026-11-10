@@ -1,12 +1,13 @@
 use prost::Message;
 use recolith_protocol::messages::{
-    AuthMethod, BucketDefinition, BucketPolicy, CatalogApplyRequest, CollectionDefinition,
-    CollectionMetadata, DescribeCollectionRequest, DescribeCollectionResponse, DocumentPutRequest,
-    FieldValue, FragmentDefinition, FragmentMetadata, FragmentPayload, HelloRequest,
-    IndexDefinition, IndexKind, KeyFieldDefinition, KeyFieldMetadata, KeyFieldType,
-    KeyspaceDefinition, NamedParameter, QueryRequest, RequestMeta, SchemaDefinition, SchemaField,
-    SchemaList, SchemaScalarType, SchemaType, Value, compression_bit, describe_collection_request,
-    feature, schema_type, value,
+    AuthMethod, BucketDefinition, BucketPolicy, CatalogApplyRequest, CatalogDropRequest,
+    CatalogIndexTarget, CollectionDefinition, CollectionMetadata, DescribeCollectionRequest,
+    DescribeCollectionResponse, DocumentPutRequest, FieldValue, FragmentDefinition,
+    FragmentMetadata, FragmentPayload, HelloRequest, IndexDefinition, IndexKind,
+    KeyFieldDefinition, KeyFieldMetadata, KeyFieldType, KeyspaceDefinition, NamedParameter,
+    QueryRequest, RequestMeta, SchemaDefinition, SchemaField, SchemaList, SchemaScalarType,
+    SchemaType, Value, catalog_drop_request, compression_bit, describe_collection_request, feature,
+    schema_type, value,
 };
 
 #[test]
@@ -193,6 +194,26 @@ fn roundtrips_catalog_apply_request() {
 
     let encoded = request.encode_to_vec();
     let decoded = CatalogApplyRequest::decode(encoded.as_slice()).expect("decode");
+
+    assert_eq!(decoded, request);
+}
+
+#[test]
+fn roundtrips_catalog_drop_request() {
+    let request = CatalogDropRequest {
+        meta: Some(RequestMeta {
+            catalog_generation: 9,
+            ..Default::default()
+        }),
+        purge: true,
+        target: Some(catalog_drop_request::Target::Index(CatalogIndexTarget {
+            bucket_id: 1,
+            index_id: 2,
+        })),
+    };
+
+    let encoded = request.encode_to_vec();
+    let decoded = CatalogDropRequest::decode(encoded.as_slice()).expect("decode");
 
     assert_eq!(decoded, request);
 }

@@ -1,17 +1,87 @@
 use std::fs;
 
+use recolith_catalog::CatalogDefinition;
+use recolith_model::{
+    BucketPolicy as ModelBucketPolicy, FragmentCardinality as ModelCardinality,
+    IndexKind as ModelIndexKind, KeyType as ModelKeyType,
+};
 use recolith_protocol::messages::{
-    BucketDefinition, BucketPolicy, CatalogApplyRequest, CollectionDefinition, FragmentCardinality,
-    FragmentDefinition, IndexDefinition, IndexKind, KeyFieldDefinition, KeyFieldType,
-    KeyspaceDefinition, RequestMeta, SchemaDefinition,
+    BucketDefinition, BucketPolicy, CatalogApplyRequest, CatalogDropRequest, CatalogIndexTarget,
+    CollectionDefinition, FragmentCardinality, FragmentDefinition, IndexDefinition, IndexKind,
+    KeyFieldDefinition, KeyFieldType, KeyspaceDefinition, RequestMeta, SchemaDefinition,
+    catalog_drop_request,
 };
 
 use crate::args::CatalogCommand;
 use crate::error::CliError;
 
-pub(crate) fn request(command: CatalogCommand) -> Result<CatalogApplyRequest, CliError> {
+pub(crate) enum CatalogRequest {
+    Apply(CatalogApplyRequest),
+    Drop(CatalogDropRequest),
+}
+
+pub(crate) fn request(command: CatalogCommand) -> Result<CatalogRequest, CliError> {
     let mut request = CatalogApplyRequest::default();
     match command {
+        CatalogCommand::Apply {
+            file,
+            catalog_generation,
+        } => {
+            let definition = CatalogDefinition::load(&file)
+                .map_err(|error| CliError::InvalidCatalog(error.to_string()))?;
+            return Ok(CatalogRequest::Apply(definition_request(
+                definition,
+                catalog_generation,
+            )));
+        }
+        CatalogCommand::DropIndex {
+            bucket_id,
+            index_id,
+            purge,
+            catalog_generation,
+        } => {
+            return Ok(CatalogRequest::Drop(CatalogDropRequest {
+                meta: meta(catalog_generation),
+                purge,
+                target: Some(catalog_drop_request::Target::Index(CatalogIndexTarget {
+                    bucket_id,
+                    index_id,
+                })),
+            }));
+        }
+        CatalogCommand::DropCollection {
+            id,
+            purge,
+            catalog_generation,
+        } => {
+            return Ok(CatalogRequest::Drop(CatalogDropRequest {
+                meta: meta(catalog_generation),
+                purge,
+                target: Some(catalog_drop_request::Target::CollectionId(id)),
+            }));
+        }
+        CatalogCommand::DropBucket {
+            id,
+            purge,
+            catalog_generation,
+        } => {
+            return Ok(CatalogRequest::Drop(CatalogDropRequest {
+                meta: meta(catalog_generation),
+                purge,
+                target: Some(catalog_drop_request::Target::BucketId(id)),
+            }));
+        }
+        CatalogCommand::DropKeyspace {
+            id,
+            purge,
+            catalog_generation,
+        } => {
+            return Ok(CatalogRequest::Drop(CatalogDropRequest {
+                meta: meta(catalog_generation),
+                purge,
+                target: Some(catalog_drop_request::Target::KeyspaceId(id)),
+            }));
+        }
         CatalogCommand::CreateKeyspace {
             id,
             name,
@@ -96,7 +166,110 @@ pub(crate) fn request(command: CatalogCommand) -> Result<CatalogApplyRequest, Cl
         }
     }
 
-    Ok(request)
+    Ok(CatalogRequest::Apply(request))
+}
+
+fn definition_request(definition: CatalogDefinition, generation: u64) -> CatalogApplyRequest {
+    let mut request = CatalogApplyRequest {
+        meta: meta(generation),
+        ..Default::default()
+    };
+    for keyspace in definition.keyspaces {
+        request.keyspaces.push(KeyspaceDefinition {
+            id: keyspace.id().get(),
+            name: keyspace.name().to_owned(),
+        });
+    }
+    for schema in definition.schemas {
+        request.schemas.push(SchemaDefinition {
+            id: schema.id,
+            version: schema.version,
+            idl: schema.idl,
+        });
+    }
+    for (keyspace_id, bucket) in definition.buckets {
+        request.buckets.push(BucketDefinition {
+            id: bucket.id().get(),
+            keyspace_id: keyspace_id.get(),
+            name: bucket.name().to_owned(),
+            partitions: bucket.partition_count(),
+            policy: model_policy(bucket.policy()) as i32,
+            schema_id: bucket.schema_id().get(),
+            schema_version: bucket.schema_version().get(),
+        });
+    }
+    for collection in definition.collections {
+        request.collections.push(CollectionDefinition {
+            id: collection.id().get(),
+            keyspace_id: collection.keyspace_id().get(),
+            name: collection.name().to_owned(),
+            affinity_group: collection.affinity_group().to_owned(),
+            key_fields: collection
+                .key_schema()
+                .fields()
+                .iter()
+                .map(|field| KeyFieldDefinition {
+                    name: field.name().to_owned(),
+                    r#type: model_key_type(field.ty()) as i32,
+                })
+                .collect(),
+            fragments: collection
+                .fragments()
+                .iter()
+                .map(|fragment| FragmentDefinition {
+                    id: fragment.id().get(),
+                    name: fragment.name().to_owned(),
+                    bucket_id: fragment.bucket_id().get(),
+                    cardinality: model_cardinality(fragment.cardinality()) as i32,
+                })
+                .collect(),
+        });
+    }
+    for (bucket_id, index) in definition.indexes {
+        request.indexes.push(IndexDefinition {
+            id: index.id().get(),
+            bucket_id: bucket_id.get(),
+            name: index.name().to_owned(),
+            kind: model_index_kind(index.kind()) as i32,
+            fields: index.fields().iter().map(|field| field.get()).collect(),
+        });
+    }
+
+    request
+}
+
+fn model_policy(policy: ModelBucketPolicy) -> BucketPolicy {
+    match policy {
+        ModelBucketPolicy::Strict => BucketPolicy::Strict,
+        ModelBucketPolicy::Managed => BucketPolicy::Managed,
+        ModelBucketPolicy::Raw => BucketPolicy::Raw,
+    }
+}
+
+fn model_key_type(ty: ModelKeyType) -> KeyFieldType {
+    match ty {
+        ModelKeyType::U64 => KeyFieldType::U64,
+        ModelKeyType::I64 => KeyFieldType::I64,
+        ModelKeyType::String => KeyFieldType::String,
+        ModelKeyType::Bytes => KeyFieldType::Bytes,
+        ModelKeyType::Uuid => KeyFieldType::Uuid,
+    }
+}
+
+fn model_cardinality(cardinality: ModelCardinality) -> FragmentCardinality {
+    match cardinality {
+        ModelCardinality::One => FragmentCardinality::One,
+        ModelCardinality::Many => FragmentCardinality::Many,
+    }
+}
+
+fn model_index_kind(kind: ModelIndexKind) -> IndexKind {
+    match kind {
+        ModelIndexKind::Equality => IndexKind::Equality,
+        ModelIndexKind::Range => IndexKind::Range,
+        ModelIndexKind::Composite => IndexKind::Composite,
+        ModelIndexKind::Unique => IndexKind::Unique,
+    }
 }
 
 fn meta(generation: u64) -> Option<RequestMeta> {

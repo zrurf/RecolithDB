@@ -19,8 +19,8 @@ pub use document::{
 };
 pub use encoding::document_key::{MAX_DOCUMENT_KEY_LEN, encode_document_key};
 pub use encoding::key::{
-    RecordKeyHead, decode_record_key_head, encode_bucket_prefix, encode_document_prefix,
-    encode_partition_prefix, encode_record_key,
+    DecodedRecordKey, RecordKeyHead, decode_record_key, decode_record_key_head,
+    encode_bucket_prefix, encode_document_prefix, encode_partition_prefix, encode_record_key,
 };
 pub use error::{Result, StorageError};
 pub use index::{
