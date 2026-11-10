@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use recolith_backend::StorageBackend;
-use recolith_catalog::{CatalogChanges, CatalogDrop, CatalogError, CatalogSnapshot};
+use recolith_catalog::{CatalogAlter, CatalogChanges, CatalogDrop, CatalogError, CatalogSnapshot};
 use recolith_common::{
     BucketId, CatalogGeneration, CollectionId, CommitTs, FieldId, FragmentId, IndexId, KeyspaceId,
     PartitionId, SchemaId, SchemaVersion,
@@ -14,15 +14,16 @@ use recolith_model::{
     IndexDefinition, IndexKind, KeyField, KeyType, Keyspace,
 };
 use recolith_protocol::messages::{
-    self, BucketDefinition, CatalogApplyRequest, CatalogApplyResponse, CatalogDropRequest,
-    CatalogDropResponse, DescribeCollectionRequest, DescribeCollectionResponse, DocumentGetRequest,
-    DocumentGetResponse, DocumentPutRequest, DocumentPutResponse, DocumentResult, FragmentVersion,
-    QueryRequest, QueryResponse, RequestMeta, describe_collection_request, opcode, status, value,
+    self, BucketDefinition, CatalogAlterRequest, CatalogAlterResponse, CatalogApplyRequest,
+    CatalogApplyResponse, CatalogDropRequest, CatalogDropResponse, DescribeCollectionRequest,
+    DescribeCollectionResponse, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest,
+    DocumentPutResponse, DocumentResult, FragmentVersion, QueryRequest, QueryResponse, RequestMeta,
+    describe_collection_request, opcode, status, value,
 };
 use recolith_query::error::QueryError;
 use recolith_query::{
-    BindParameters, DocumentQuery, FieldSelection, RqlBindError, RqlError, RqlLiteral,
-    bind_document_query, parse_document_query,
+    BindParameters, BoundQuery, DocumentQuery, FieldSelection, RqlBindError, RqlError, RqlLiteral,
+    bind_query, parse_document_query,
 };
 use recolith_schema::parse_record;
 use recolith_security::{Action, AuthTarget, Principal};
@@ -33,6 +34,7 @@ use sha2::{Digest, Sha256};
 use crate::document::{
     DocumentError, DocumentStore, DocumentWrite, FragmentWriteRequest, Idempotency,
 };
+use crate::migration::{FieldMapping, MigrationConversion, MigrationSource, SchemaMigration};
 
 use super::convert;
 
@@ -206,6 +208,118 @@ pub(crate) fn catalog_drop<B: StorageBackend>(
         opcode: opcode::CATALOG_DROP,
         payload: response.encode_to_vec(),
     })
+}
+
+pub(crate) fn catalog_alter<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    request: CatalogAlterRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    let expected = request
+        .meta
+        .as_ref()
+        .filter(|meta| meta.catalog_generation != 0)
+        .map(|meta| CatalogGeneration::new(meta.catalog_generation));
+    let snapshot = store.catalog_snapshot().map_err(map_document)?;
+    let (alter, migration) = alter_change(&request)?;
+    authorize_catalog_alter(&snapshot, principal, &alter)?;
+    let generation = store
+        .alter_catalog(alter, migration.as_ref(), expected)
+        .map_err(map_document)?;
+    let response = CatalogAlterResponse {
+        catalog_generation: generation.get(),
+    };
+
+    Ok(OperationResponse {
+        opcode: opcode::CATALOG_ALTER,
+        payload: response.encode_to_vec(),
+    })
+}
+
+fn alter_change(
+    request: &CatalogAlterRequest,
+) -> Result<(CatalogAlter, Option<SchemaMigration>), OperationError> {
+    match request.change.as_ref() {
+        Some(messages::catalog_alter_request::Change::BucketSchema(change)) => {
+            let alter = CatalogAlter::BucketSchema {
+                bucket: BucketId::new(change.bucket_id),
+                version: SchemaVersion::new(change.schema_version),
+            };
+            let migration = change
+                .migration
+                .as_ref()
+                .map(schema_migration)
+                .transpose()?;
+
+            Ok((alter, migration))
+        }
+        Some(messages::catalog_alter_request::Change::Index(change)) => Ok((
+            CatalogAlter::Index {
+                bucket: BucketId::new(change.bucket_id),
+                index: IndexId::new(change.index_id),
+                definition: IndexDefinition::new(
+                    IndexId::new(change.index_id),
+                    change.name.clone(),
+                    index_kind(change.kind)?,
+                    change
+                        .fields
+                        .iter()
+                        .map(|field| FieldId::new(*field))
+                        .collect(),
+                ),
+            },
+            None,
+        )),
+        None => Err(OperationError::invalid("catalog alter change is required")),
+    }
+}
+
+fn schema_migration(
+    migration: &messages::SchemaMigration,
+) -> Result<SchemaMigration, OperationError> {
+    let mut mappings = Vec::with_capacity(migration.mappings.len());
+    for mapping in &migration.mappings {
+        let source = match mapping.source.as_ref() {
+            Some(messages::field_mapping::Source::FromField(field)) => {
+                MigrationSource::Field(FieldId::new(*field))
+            }
+            Some(messages::field_mapping::Source::DefaultValue(value)) => {
+                MigrationSource::Default(convert::value_from_wire(value).map_err(|error| {
+                    OperationError::invalid(format!("invalid migration default: {error}"))
+                })?)
+            }
+            None => return Err(OperationError::invalid("field mapping source is required")),
+        };
+        let conversion = match messages::FieldConversion::try_from(mapping.conversion) {
+            Ok(messages::FieldConversion::Unspecified | messages::FieldConversion::None) => {
+                MigrationConversion::None
+            }
+            Ok(messages::FieldConversion::I32ToI64) => MigrationConversion::I32ToI64,
+            Ok(messages::FieldConversion::U32ToU64) => MigrationConversion::U32ToU64,
+            Ok(messages::FieldConversion::U32ToI64) => MigrationConversion::U32ToI64,
+            Err(_) => return Err(OperationError::invalid("unknown field conversion")),
+        };
+        mappings.push(FieldMapping {
+            to: FieldId::new(mapping.to_field),
+            source,
+            conversion,
+        });
+    }
+
+    Ok(SchemaMigration { mappings })
+}
+
+fn authorize_catalog_alter(
+    snapshot: &CatalogSnapshot,
+    principal: &Principal,
+    alter: &CatalogAlter,
+) -> Result<(), OperationError> {
+    match alter {
+        CatalogAlter::BucketSchema { bucket, .. } | CatalogAlter::Index { bucket, .. } => {
+            require_admin(principal, keyspace_for_bucket(snapshot, *bucket)?, "*")
+        }
+    }
 }
 
 fn drop_target(request: &CatalogDropRequest) -> Result<CatalogDrop, OperationError> {
@@ -667,7 +781,7 @@ pub(crate) fn query<B: StorageBackend>(
     }
 
     let snapshot = store.catalog_snapshot().map_err(map_document)?;
-    let query = bind_document_query(
+    let query = bind_query(
         &snapshot,
         &parsed,
         PartitionId::new(request.partition),
@@ -683,18 +797,34 @@ pub(crate) fn query<B: StorageBackend>(
     .min(MAX_QUERY_LIMIT) as usize;
 
     let engine = store.query_engine();
-    let plan = engine.plan(&query).map_err(map_query)?;
-    let mut fragments = engine.execute(&plan).map_err(map_query)?;
-    for records in fragments.values_mut() {
-        records.truncate(limit);
-    }
-    let documents = if fragments.is_empty() {
-        Vec::new()
-    } else {
-        vec![DocumentResult {
-            document_key: query.document_key().to_vec(),
-            fragments: convert::fragments_to_wire(&fragments),
-        }]
+    let documents = match query {
+        BoundQuery::Document(query) => {
+            let plan = engine.plan(&query).map_err(map_query)?;
+            let mut fragments = engine.execute(&plan).map_err(map_query)?;
+            for records in fragments.values_mut() {
+                records.truncate(limit);
+            }
+            if fragments.is_empty() {
+                Vec::new()
+            } else {
+                vec![DocumentResult {
+                    document_key: query.document_key().to_vec(),
+                    fragments: convert::fragments_to_wire(&fragments),
+                }]
+            }
+        }
+        BoundQuery::Scan(query) => {
+            let plan = engine.plan_scan(&query).map_err(map_query)?;
+            engine
+                .execute_scan(&plan, limit)
+                .map_err(map_query)?
+                .into_iter()
+                .map(|(document_key, fragments)| DocumentResult {
+                    document_key,
+                    fragments: convert::fragments_to_wire(&fragments),
+                })
+                .collect()
+        }
     };
     let response = QueryResponse { documents };
 
@@ -820,6 +950,9 @@ fn map_document(error: DocumentError) -> OperationError {
         DocumentError::TargetNotEmpty(_) | DocumentError::BackfillTooLarge { .. } => {
             OperationError::new(status::FAILED_PRECONDITION, error.to_string())
         }
+        DocumentError::MigrationRequired | DocumentError::Migration(_) => {
+            OperationError::new(status::FAILED_PRECONDITION, error.to_string())
+        }
         DocumentError::StaleCatalog => {
             OperationError::new(status::STALE_CATALOG, error.to_string())
         }
@@ -879,6 +1012,7 @@ fn map_bind(error: RqlBindError) -> OperationError {
         RqlBindError::UnknownField { .. }
         | RqlBindError::MissingKeyField(_)
         | RqlBindError::DuplicateKeyField(_)
+        | RqlBindError::NotPointQuery
         | RqlBindError::MissingParameter(_)
         | RqlBindError::InvalidLiteral { .. }
         | RqlBindError::UnqualifiedPath(_)

@@ -472,7 +472,7 @@ impl Default for Catalog {
     }
 }
 
-fn validate_index(schema: &RecordSchema, index: &IndexDefinition) -> Result<()> {
+pub(crate) fn validate_index(schema: &RecordSchema, index: &IndexDefinition) -> Result<()> {
     let expected_fields = if index.kind() == IndexKind::Composite {
         2
     } else {

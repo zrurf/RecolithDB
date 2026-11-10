@@ -20,6 +20,42 @@ pub fn put_uvarint(mut value: u64, output: &mut Vec<u8>) {
     output.push(value as u8);
 }
 
+/// Reads a self-terminating ordered byte component.
+///
+/// Returns the decoded bytes and the number of input bytes consumed.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidInput`] when the component is truncated or contains
+/// an invalid escape sequence.
+pub fn get_ordered_bytes(input: &[u8]) -> Result<(Vec<u8>, usize)> {
+    let mut output = Vec::new();
+    let mut offset = 0;
+    loop {
+        let byte = *input
+            .get(offset)
+            .ok_or_else(|| Error::InvalidInput("truncated ordered bytes".to_owned()))?;
+        offset += 1;
+        if byte != 0 {
+            output.push(byte);
+            continue;
+        }
+        let escape = *input
+            .get(offset)
+            .ok_or_else(|| Error::InvalidInput("truncated ordered bytes".to_owned()))?;
+        offset += 1;
+        match escape {
+            0 => return Ok((output, offset)),
+            0xFF => output.push(0),
+            _ => {
+                return Err(Error::InvalidInput(
+                    "invalid ordered byte escape".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
 /// Reads an unsigned LEB128 varint and returns the value and consumed length.
 ///
 /// # Errors

@@ -10,12 +10,15 @@ use recolith_protocol::batch::{BatchLimits, SubFrame, encode_batch};
 use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN};
 use recolith_protocol::messages::{
-    AuthMethod, AuthResult, CatalogApplyRequest, CatalogDropRequest, DescribeCollectionRequest,
-    DocumentGetRequest, DocumentPutRequest, ErrorResponse, FieldValue, FragmentPayload,
-    HelloRequest, KeyspaceDefinition, PingRequest, RequestMeta, Value, WelcomeResponse,
-    catalog_drop_request, describe_collection_request, opcode, status, value,
+    AuthMethod, AuthResult, CatalogAlterRequest, CatalogApplyRequest, CatalogDropRequest,
+    DescribeCollectionRequest, DocumentGetRequest, DocumentPutRequest, ErrorResponse, FieldValue,
+    FragmentPayload, HelloRequest, KeyspaceDefinition, PingRequest, RequestMeta, SetBucketSchema,
+    Value, WelcomeResponse, catalog_alter_request, catalog_drop_request,
+    describe_collection_request, opcode, status, value,
 };
-use recolith_security::{Authenticator, TokenClaims, TokenIssuer, unix_seconds};
+use recolith_security::{
+    Authenticator, TokenClaims, TokenIssuer, fingerprint_hex, token_fingerprint, unix_seconds,
+};
 use recolith_server::{DocumentStore, ServerConfig, serve};
 use recolith_storage::encode_document_key;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -39,6 +42,7 @@ struct Fixture {
     dir: PathBuf,
     secret: PathBuf,
     roles: PathBuf,
+    revocations: PathBuf,
     issuer: TokenIssuer,
 }
 
@@ -50,14 +54,17 @@ impl Fixture {
         fs::create_dir_all(&dir).expect("temp dir");
         let secret = dir.join("secret.hex");
         let roles = dir.join("roles.toml");
+        let revocations = dir.join("revoked.toml");
         fs::write(&secret, "11".repeat(32)).expect("secret");
         fs::write(&roles, ROLES).expect("roles");
+        fs::write(&revocations, "hashes = []\n").expect("revocations");
         let issuer = TokenIssuer::from_secret_file(&secret).expect("issuer");
 
         Self {
             dir,
             secret,
             roles,
+            revocations,
             issuer,
         }
     }
@@ -79,9 +86,20 @@ impl Fixture {
     }
 
     fn server_config(&self, address: SocketAddr) -> ServerConfig {
-        let authenticator = Authenticator::from_files(&self.secret, None::<&PathBuf>, &self.roles)
-            .expect("authenticator");
+        let authenticator = Authenticator::from_files_with_revocations(
+            &self.secret,
+            None::<&PathBuf>,
+            &self.roles,
+            Some(&self.revocations),
+        )
+        .expect("authenticator");
         ServerConfig::new(address).with_auth(authenticator)
+    }
+
+    fn revoke(&self, token: &str) {
+        let fingerprint = fingerprint_hex(&token_fingerprint(token));
+        fs::write(&self.revocations, format!("hashes = [\"{fingerprint}\"]\n"))
+            .expect("revocations");
     }
 }
 
@@ -469,6 +487,38 @@ async fn catalog_changes_require_admin_on_affected_scopes() {
     let (header, _) = read_frame(&mut admin, &admin_codec).await;
     assert_eq!(header.opcode(), opcode::CATALOG_DROP);
     assert_eq!(header.status(), status::OK);
+
+    let alter = CatalogAlterRequest {
+        meta: None,
+        change: Some(catalog_alter_request::Change::BucketSchema(
+            SetBucketSchema {
+                bucket_id: 1,
+                schema_version: 1,
+                migration: None,
+            },
+        )),
+    };
+    write_frame(
+        &mut reader,
+        &reader_codec,
+        &FrameHeader::new(opcode::CATALOG_ALTER, 6),
+        &alter.encode_to_vec(),
+    )
+    .await;
+    let (header, _) = read_frame(&mut reader, &reader_codec).await;
+    assert_eq!(header.opcode(), opcode::ERROR);
+    assert_eq!(header.status(), status::PERMISSION_DENIED);
+
+    write_frame(
+        &mut admin,
+        &admin_codec,
+        &FrameHeader::new(opcode::CATALOG_ALTER, 7),
+        &alter.encode_to_vec(),
+    )
+    .await;
+    let (header, _) = read_frame(&mut admin, &admin_codec).await;
+    assert_eq!(header.opcode(), opcode::CATALOG_ALTER);
+    assert_eq!(header.status(), status::OK);
 }
 
 #[tokio::test]
@@ -502,4 +552,37 @@ async fn idempotency_is_scoped_by_principal() {
     let (header, _) = read_frame(&mut second, &second_codec).await;
     assert_eq!(header.opcode(), opcode::DOC_PUT);
     assert_eq!(header.status(), status::OK);
+}
+
+#[tokio::test]
+async fn revoked_tokens_are_rejected_at_handshake_and_mid_session() {
+    let fixture = Fixture::new("revoked");
+    let address = start_server(
+        fixture.server_config("127.0.0.1:0".parse().expect("addr")),
+        store(),
+    )
+    .await;
+
+    let token = fixture.token("reader", "reader");
+    let (mut stream, codec) = connect(address, &token).await;
+    fixture.revoke(&token);
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::PING, 20),
+        &PingRequest {
+            payload: Vec::new(),
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, _) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.opcode(), opcode::ERROR);
+    assert_eq!(header.status(), status::AUTH_FAILED);
+
+    let other = fixture.token("other", "reader");
+    fixture.revoke(&other);
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    rejected(address, &other).await;
 }

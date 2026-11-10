@@ -3,7 +3,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-use recolith_security::{TokenVerifier, unix_seconds};
+use recolith_security::{TokenVerifier, fingerprint_hex, token_fingerprint, unix_seconds};
 
 struct Fixture {
     dir: PathBuf,
@@ -176,4 +176,21 @@ fn rejects_invalid_signatures_and_malformed_input() {
         .expect("run inspect");
     assert!(!inspected.status.success());
     assert!(String::from_utf8_lossy(&inspected.stderr).contains("empty"));
+}
+
+#[test]
+fn prints_fingerprints_for_revocation() {
+    let fixture = Fixture::new("hash");
+    let secret = fixture.secret("secret.hex", "11");
+    let token = issue(&secret);
+    let token_file = fixture.token("token.txt", &token);
+
+    let output = recolith()
+        .args(["token", "hash", "--token-file"])
+        .arg(&token_file)
+        .output()
+        .expect("run hash");
+    assert!(output.status.success(), "hash failed: {output:?}");
+    let printed = String::from_utf8(output.stdout).expect("utf8");
+    assert_eq!(printed.trim(), fingerprint_hex(&token_fingerprint(&token)));
 }

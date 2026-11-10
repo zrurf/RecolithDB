@@ -8,11 +8,12 @@ use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::error::ProtocolError;
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN, VERSION_MAJOR, VERSION_MINOR};
 use recolith_protocol::messages::{
-    AuthMethod, AuthResult, CatalogApplyRequest, CatalogApplyResponse, CatalogDropRequest,
-    CatalogDropResponse, DescribeCollectionRequest, DescribeCollectionResponse, DocumentGetRequest,
-    DocumentGetResponse, DocumentPutRequest, DocumentPutResponse, ErrorResponse, GoAway,
-    HelloRequest, PingRequest, PingResponse, QueryRequest, QueryResponse, SecurityMode,
-    WelcomeResponse, compression_bit, encoding_bit, feature, opcode, status,
+    AuthMethod, AuthResult, CatalogAlterRequest, CatalogAlterResponse, CatalogApplyRequest,
+    CatalogApplyResponse, CatalogDropRequest, CatalogDropResponse, DescribeCollectionRequest,
+    DescribeCollectionResponse, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest,
+    DocumentPutResponse, ErrorResponse, GoAway, HelloRequest, PingRequest, PingResponse,
+    QueryRequest, QueryResponse, SecurityMode, WelcomeResponse, compression_bit, encoding_bit,
+    feature, opcode, status,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -354,6 +355,28 @@ impl Client {
             .await?;
         CatalogDropResponse::decode(body.as_slice()).map_err(|_| {
             ClientError::UnexpectedResponse("malformed CATALOG_DROP response".to_owned())
+        })
+    }
+
+    /// Alters one catalog object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn alter_catalog(
+        &mut self,
+        request: &CatalogAlterRequest,
+    ) -> Result<CatalogAlterResponse, ClientError> {
+        self.require_feature(feature::CATALOG_WRITE, "catalog changes")?;
+        let body = self
+            .request(
+                opcode::CATALOG_ALTER,
+                opcode::CATALOG_ALTER,
+                &request.encode_to_vec(),
+            )
+            .await?;
+        CatalogAlterResponse::decode(body.as_slice()).map_err(|_| {
+            ClientError::UnexpectedResponse("malformed CATALOG_ALTER response".to_owned())
         })
     }
 

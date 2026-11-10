@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::base64url;
@@ -218,6 +219,29 @@ pub fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
+}
+
+/// Returns the SHA-256 fingerprint of a complete token.
+#[must_use]
+pub fn token_fingerprint(token: &str) -> [u8; 32] {
+    let digest = Sha256::digest(token.as_bytes());
+    let mut fingerprint = [0_u8; 32];
+    fingerprint.copy_from_slice(&digest);
+
+    fingerprint
+}
+
+/// Formats a token fingerprint as lowercase hexadecimal.
+#[must_use]
+pub fn fingerprint_hex(fingerprint: &[u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in fingerprint {
+        output.push(HEX[usize::from(byte >> 4)] as char);
+        output.push(HEX[usize::from(byte & 0x0F)] as char);
+    }
+
+    output
 }
 
 fn split_token(token: &str) -> Result<(&str, &str, &str), TokenError> {

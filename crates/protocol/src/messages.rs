@@ -26,6 +26,8 @@ pub mod opcode {
     pub const CATALOG_APPLY: u16 = 0x0060;
     /// Catalog object removal.
     pub const CATALOG_DROP: u16 = 0x0061;
+    /// Catalog object alteration.
+    pub const CATALOG_ALTER: u16 = 0x0062;
     /// Structured error response.
     pub const ERROR: u16 = 0x0040;
     /// Session shutdown notice.

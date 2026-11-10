@@ -2,7 +2,9 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-use recolith_security::{TokenClaims, TokenIssuer, TokenVerifier, unix_seconds};
+use recolith_security::{
+    TokenClaims, TokenIssuer, TokenVerifier, fingerprint_hex, token_fingerprint, unix_seconds,
+};
 
 use crate::error::CliError;
 
@@ -40,6 +42,12 @@ pub(crate) fn verify(
     let verifier = TokenVerifier::from_secret_files(secret_file, previous_secret_file)?;
 
     Ok(verifier.verify(&token, unix_seconds())?)
+}
+
+pub(crate) fn hash(token_file: Option<&Path>) -> Result<String, CliError> {
+    let token = read_token(token_file)?;
+
+    Ok(fingerprint_hex(&token_fingerprint(&token)))
 }
 
 pub(crate) fn format_claims(claims: &TokenClaims, verified: bool) -> String {

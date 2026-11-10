@@ -134,7 +134,7 @@ fn registers_compatible_schema_versions() {
 }
 
 #[test]
-fn rejects_migration_requiring_schema_change() {
+fn allows_migration_requiring_schema_registration() {
     let catalog = Catalog::new();
     catalog
         .register_schema(schema(
@@ -161,8 +161,8 @@ fn rejects_migration_requiring_schema_change() {
         ],
     ));
 
-    assert!(matches!(result, Err(CatalogError::SchemaRequiresMigration)));
-    assert_eq!(catalog.generation(), before);
+    assert_eq!(result.expect("schema v3"), SchemaVersion::new(3));
+    assert_eq!(catalog.generation().get(), before.get() + 1);
 }
 
 #[test]

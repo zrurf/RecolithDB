@@ -195,6 +195,48 @@ pub enum CatalogCommand {
         #[arg(long, default_value_t = 0)]
         catalog_generation: u64,
     },
+    /// Switches a bucket's schema version, optionally migrating records.
+    AlterBucketSchema {
+        /// Bucket identifier.
+        #[arg(long)]
+        bucket_id: u64,
+        /// New schema version.
+        #[arg(long)]
+        schema_version: u32,
+        /// Copies a field in `to=from` form.
+        #[arg(long = "mapping")]
+        mappings: Vec<String>,
+        /// Converts a field in `to=from:conversion` form.
+        #[arg(long = "convert")]
+        conversions: Vec<String>,
+        /// Sets a field in `to=type:value` form.
+        #[arg(long = "default")]
+        defaults: Vec<String>,
+        /// Expected catalog generation; zero disables the check.
+        #[arg(long, default_value_t = 0)]
+        catalog_generation: u64,
+    },
+    /// Redefines an index on a bucket.
+    AlterIndex {
+        /// Bucket identifier.
+        #[arg(long)]
+        bucket_id: u64,
+        /// Index identifier.
+        #[arg(long)]
+        index_id: u64,
+        /// New index name.
+        #[arg(long)]
+        name: String,
+        /// Index kind: equality, range, composite, or unique.
+        #[arg(long, default_value = "equality")]
+        kind: String,
+        /// Indexed field identifier.
+        #[arg(long = "field", required = true)]
+        fields: Vec<u32>,
+        /// Expected catalog generation; zero disables the check.
+        #[arg(long, default_value_t = 0)]
+        catalog_generation: u64,
+    },
     /// Drops an index and optionally its entries.
     DropIndex {
         /// Bucket identifier.
@@ -280,6 +322,12 @@ pub enum TokenCommand {
         /// Optional previous secret accepted during rotation.
         #[arg(long)]
         previous_secret_file: Option<PathBuf>,
+        /// File containing the token. Reads stdin when omitted.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
+    /// Prints the SHA-256 fingerprint used by the revocation list.
+    Hash {
         /// File containing the token. Reads stdin when omitted.
         #[arg(long)]
         token_file: Option<PathBuf>,

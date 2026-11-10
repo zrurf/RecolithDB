@@ -94,6 +94,9 @@ pub struct AuthSettings {
     pub previous_secret_file: Option<PathBuf>,
     /// Role and permission definitions.
     pub roles_file: PathBuf,
+    /// Optional revoked token fingerprint list.
+    #[serde(default)]
+    pub revoked_tokens_file: Option<PathBuf>,
 }
 
 /// Catalog startup settings.
@@ -186,10 +189,11 @@ impl Config {
         config.max_decompressed_size = self.server.max_decompressed_size;
         config.compression_threshold = self.server.compression_threshold;
         if let Some(auth) = &self.auth {
-            let authenticator = Authenticator::from_files(
+            let authenticator = Authenticator::from_files_with_revocations(
                 &auth.secret_file,
                 auth.previous_secret_file.as_deref(),
                 &auth.roles_file,
+                auth.revoked_tokens_file.as_deref(),
             )
             .map_err(|error| ConfigError::Invalid(format!("authentication: {error}")))?;
             config = config.with_auth(authenticator);
@@ -219,6 +223,9 @@ impl Config {
                 resolve(base, previous);
             }
             resolve(base, &mut auth.roles_file);
+            if let Some(revoked) = &mut auth.revoked_tokens_file {
+                resolve(base, revoked);
+            }
         }
     }
 

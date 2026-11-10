@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use recolith_backend::{KeyRange, ScanOptions, Snapshot};
 use recolith_common::bytes::get_uvarint;
-use recolith_common::{BucketId, FieldId, FragmentId, IndexId, PartitionId};
+use recolith_common::{BucketId, FieldId, FragmentId, IndexId, PartitionId, SchemaVersion};
 use recolith_schema::RecordSchema;
 
 use crate::codec::decode_fields;
@@ -10,7 +10,6 @@ use crate::encoding::key::{encode_document_prefix, encode_record_key};
 use crate::error::{Result, StorageError};
 use crate::record::{RecordHeader, decode_record};
 use crate::store::index::{scan_index, scan_index_components, scan_index_range};
-use crate::store::record::ensure_schema;
 use crate::value::RecordData;
 
 /// Fragment cardinality for document assembly.
@@ -145,6 +144,14 @@ impl IndexFilter {
             Self::Range { lower, upper, .. } => Some((lower.as_ref(), upper.as_ref())),
         }
     }
+
+    /// Returns the number of index components before the record key.
+    #[must_use]
+    pub const fn components(&self) -> usize {
+        match self {
+            Self::Equality { components, .. } | Self::Range { components, .. } => *components,
+        }
+    }
 }
 
 /// Fragment read descriptor.
@@ -155,6 +162,7 @@ pub struct FragmentReader {
     fragment: FragmentId,
     mode: FragmentMode,
     schema: RecordSchema,
+    schemas: BTreeMap<SchemaVersion, RecordSchema>,
     indexes: Vec<IndexFilter>,
 }
 
@@ -168,14 +176,31 @@ impl FragmentReader {
         mode: FragmentMode,
         schema: RecordSchema,
     ) -> Self {
+        let mut schemas = BTreeMap::new();
+        schemas.insert(schema.version(), schema.clone());
         Self {
             bucket,
             partition,
             fragment,
             mode,
             schema,
+            schemas,
             indexes: Vec::new(),
         }
+    }
+
+    /// Adds historical schema versions accepted for existing records.
+    #[must_use]
+    pub fn with_schema_versions(
+        mut self,
+        versions: impl IntoIterator<Item = RecordSchema>,
+    ) -> Self {
+        for schema in versions {
+            self.schemas.insert(schema.version(), schema);
+        }
+        self.schemas
+            .insert(self.schema.version(), self.schema.clone());
+        self
     }
 
     /// Reads a `many` fragment through an index equality lookup.
@@ -248,6 +273,15 @@ impl FragmentReader {
     #[must_use]
     pub fn index_filters(&self) -> &[IndexFilter] {
         &self.indexes
+    }
+
+    fn schema_for(&self, header: &RecordHeader) -> Result<&RecordSchema> {
+        if header.schema_id() != self.schema.id() {
+            return Err(schema_mismatch(header, &self.schema));
+        }
+        self.schemas
+            .get(&header.schema_version())
+            .ok_or_else(|| schema_mismatch(header, &self.schema))
     }
 }
 
@@ -365,8 +399,8 @@ fn read_one<S: Snapshot>(
         return Ok(Vec::new());
     };
     let decoded = decode_record(&frame)?;
-    ensure_schema(decoded.header(), &fragment.schema)?;
-    let data = decode_fields(&fragment.schema, decoded.payload())?;
+    let schema = fragment.schema_for(decoded.header())?;
+    let data = decode_fields(schema, decoded.payload())?;
 
     Ok(vec![FragmentData {
         subkey: Vec::new(),
@@ -388,8 +422,8 @@ fn read_many<S: Snapshot>(
     for (key, frame) in entries {
         let subkey = decode_subkey(&key, prefix.len())?;
         let decoded = decode_record(&frame)?;
-        ensure_schema(decoded.header(), &fragment.schema)?;
-        let data = decode_fields(&fragment.schema, decoded.payload())?;
+        let schema = fragment.schema_for(decoded.header())?;
+        let data = decode_fields(schema, decoded.payload())?;
         records.push(FragmentData {
             subkey,
             header: decoded.header().clone(),
@@ -503,8 +537,8 @@ fn read_many_by_record_keys<S: Snapshot>(
         };
         let subkey = decode_subkey(&record_key, prefix.len())?;
         let decoded = decode_record(&frame)?;
-        ensure_schema(decoded.header(), &fragment.schema)?;
-        let data = decode_fields(&fragment.schema, decoded.payload())?;
+        let schema = fragment.schema_for(decoded.header())?;
+        let data = decode_fields(schema, decoded.payload())?;
         records.push(FragmentData {
             subkey,
             header: decoded.header().clone(),
@@ -519,6 +553,15 @@ fn fragment_prefix(fragment: &FragmentReader, document_key: &[u8]) -> Vec<u8> {
     let mut prefix = encode_document_prefix(fragment.bucket, fragment.partition, document_key);
     prefix.extend_from_slice(&fragment.fragment.get().to_be_bytes());
     prefix
+}
+
+fn schema_mismatch(header: &RecordHeader, expected: &RecordSchema) -> StorageError {
+    StorageError::SchemaMismatch {
+        record_schema: header.schema_id(),
+        record_version: header.schema_version(),
+        expected_schema: expected.id(),
+        expected_version: expected.version(),
+    }
 }
 
 fn decode_subkey(key: &[u8], offset: usize) -> Result<Vec<u8>> {

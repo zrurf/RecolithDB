@@ -1,11 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
+use std::time::SystemTime;
 
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::token::{TokenError, TokenVerifier};
+use crate::revocation::RevocationList;
+use crate::token::{TokenError, TokenVerifier, token_fingerprint};
 
 /// Authorization action.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -48,6 +51,7 @@ pub struct Principal {
     id: String,
     permissions: Vec<Permission>,
     expires_at: u64,
+    fingerprint: Option<[u8; 32]>,
 }
 
 impl Principal {
@@ -68,6 +72,7 @@ impl Principal {
                 actions: vec![Action::Admin],
             }],
             expires_at: u64::MAX,
+            fingerprint: None,
         }
     }
 
@@ -81,6 +86,17 @@ impl Principal {
     #[must_use]
     pub const fn expires_at(&self) -> u64 {
         self.expires_at
+    }
+
+    /// Returns the token fingerprint, or `None` for non-token principals.
+    #[must_use]
+    pub const fn fingerprint(&self) -> Option<[u8; 32]> {
+        self.fingerprint
+    }
+
+    pub(crate) fn with_fingerprint(mut self, fingerprint: [u8; 32]) -> Self {
+        self.fingerprint = Some(fingerprint);
+        self
     }
 
     /// Returns whether the principal has expired.
@@ -120,6 +136,34 @@ pub enum SecurityError {
         /// I/O failure.
         source: std::io::Error,
     },
+    /// Revocation list could not be read.
+    #[error("failed to read token revocations {path}: {source}")]
+    RevocationRead {
+        /// Revocation path.
+        path: PathBuf,
+        /// I/O failure.
+        source: std::io::Error,
+    },
+    /// Revocation list is not valid TOML.
+    #[error("invalid token revocations: {0}")]
+    RevocationParse(toml::de::Error),
+    /// A revoked fingerprint is malformed.
+    #[error("invalid token fingerprint `{0}`")]
+    InvalidRevocation(String),
+    /// The presented token has been revoked.
+    #[error("token has been revoked")]
+    RevokedToken,
+    /// Authentication file metadata could not be read.
+    #[error("failed to read authentication metadata {path}: {source}")]
+    Metadata {
+        /// File path.
+        path: PathBuf,
+        /// I/O failure.
+        source: std::io::Error,
+    },
+    /// An internal authentication lock was poisoned.
+    #[error("authentication lock poisoned")]
+    LockPoisoned,
     /// Roles file is not valid TOML.
     #[error("invalid roles file: {0}")]
     RolesParse(#[from] toml::de::Error),
@@ -211,6 +255,7 @@ impl RoleSet {
             id: id.into(),
             permissions,
             expires_at,
+            fingerprint: None,
         }
     }
 }
@@ -255,11 +300,27 @@ fn validate_role(role: &RoleDefinition) -> Result<(), SecurityError> {
     Ok(())
 }
 
-/// Token verifier and role registry.
+/// Token verifier, role registry, and revocation list.
 #[derive(Debug)]
 pub struct Authenticator {
     verifier: TokenVerifier,
+    roles_path: PathBuf,
+    revoked_path: Option<PathBuf>,
+    state: RwLock<AuthState>,
+}
+
+#[derive(Debug)]
+struct AuthState {
     roles: RoleSet,
+    revoked: RevocationList,
+    roles_stamp: FileStamp,
+    revoked_stamp: Option<FileStamp>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
 }
 
 impl Authenticator {
@@ -273,9 +334,43 @@ impl Authenticator {
         previous: Option<impl AsRef<Path>>,
         roles: impl AsRef<Path>,
     ) -> Result<Self, SecurityError> {
+        Self::from_files_with_revocations(secret, previous, roles, None::<&Path>)
+    }
+
+    /// Loads secrets, roles, and an optional revocation list.
+    ///
+    /// Roles and revocations are reloaded when their files change.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecurityError`] for secret, roles, revocation, or token
+    /// configuration failures.
+    pub fn from_files_with_revocations(
+        secret: impl AsRef<Path>,
+        previous: Option<impl AsRef<Path>>,
+        roles: impl AsRef<Path>,
+        revocations: Option<impl AsRef<Path>>,
+    ) -> Result<Self, SecurityError> {
+        let verifier = TokenVerifier::from_secret_files(secret, previous)?;
+        let roles_path = roles.as_ref().to_path_buf();
+        let roles_value = RoleSet::load(&roles_path)?;
+        let roles_stamp = file_stamp(&roles_path)?;
+        let revoked_path = revocations.map(|path| path.as_ref().to_path_buf());
+        let (revoked, revoked_stamp) = match &revoked_path {
+            Some(path) => (RevocationList::load(path)?, Some(file_stamp(path)?)),
+            None => (RevocationList::default(), None),
+        };
+
         Ok(Self {
-            verifier: TokenVerifier::from_secret_files(secret, previous)?,
-            roles: RoleSet::load(roles)?,
+            verifier,
+            roles_path,
+            revoked_path,
+            state: RwLock::new(AuthState {
+                roles: roles_value,
+                revoked,
+                roles_stamp,
+                revoked_stamp,
+            }),
         })
     }
 
@@ -283,12 +378,79 @@ impl Authenticator {
     ///
     /// # Errors
     ///
-    /// Returns [`SecurityError`] for invalid, expired, or malformed tokens.
+    /// Returns [`SecurityError`] for invalid, expired, malformed, or revoked
+    /// tokens.
     pub fn authenticate(&self, token: &str, now: u64) -> Result<Principal, SecurityError> {
+        self.reload_if_changed()?;
         let claims = self.verifier.verify(token, now)?;
+        let fingerprint = token_fingerprint(token);
+        let state = self.state.read().map_err(|_| SecurityError::LockPoisoned)?;
+        if state.revoked.contains(&fingerprint) {
+            return Err(SecurityError::RevokedToken);
+        }
 
-        Ok(self
+        Ok(state
             .roles
-            .principal(claims.subject, &claims.roles, claims.expires_at))
+            .principal(claims.subject, &claims.roles, claims.expires_at)
+            .with_fingerprint(fingerprint))
     }
+
+    /// Returns whether a token fingerprint is revoked.
+    ///
+    /// Reload failures fail closed.
+    #[must_use]
+    pub fn is_revoked(&self, fingerprint: [u8; 32]) -> bool {
+        if self.reload_if_changed().is_err() {
+            return true;
+        }
+
+        self.state
+            .read()
+            .map(|state| state.revoked.contains(&fingerprint))
+            .unwrap_or(true)
+    }
+
+    fn reload_if_changed(&self) -> Result<(), SecurityError> {
+        let roles_stamp = file_stamp(&self.roles_path)?;
+        let revoked_stamp = match &self.revoked_path {
+            Some(path) => Some(file_stamp(path)?),
+            None => None,
+        };
+        {
+            let state = self.state.read().map_err(|_| SecurityError::LockPoisoned)?;
+            if state.roles_stamp == roles_stamp && state.revoked_stamp == revoked_stamp {
+                return Ok(());
+            }
+        }
+
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| SecurityError::LockPoisoned)?;
+        if state.roles_stamp != roles_stamp {
+            state.roles = RoleSet::load(&self.roles_path)?;
+            state.roles_stamp = roles_stamp;
+        }
+        if state.revoked_stamp != revoked_stamp {
+            state.revoked = match &self.revoked_path {
+                Some(path) => RevocationList::load(path)?,
+                None => RevocationList::default(),
+            };
+            state.revoked_stamp = revoked_stamp;
+        }
+
+        Ok(())
+    }
+}
+
+fn file_stamp(path: &Path) -> Result<FileStamp, SecurityError> {
+    let metadata = fs::metadata(path).map_err(|source| SecurityError::Metadata {
+        path: path.to_path_buf(),
+        source,
+    })?;
+
+    Ok(FileStamp {
+        modified: metadata.modified().ok(),
+        len: metadata.len(),
+    })
 }

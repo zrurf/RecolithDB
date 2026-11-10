@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use recolith_common::{SchemaId, SchemaVersion};
-use recolith_schema::{Compatibility, RecordSchema, check_compatibility};
+use recolith_schema::RecordSchema;
 
 use crate::error::{CatalogError, Result};
 
@@ -21,7 +21,7 @@ struct State {
     latest: BTreeMap<SchemaId, SchemaVersion>,
 }
 
-/// Versioned schema registry with compatibility enforcement.
+/// Versioned schema registry with monotonic version tracking.
 #[derive(Debug, Default)]
 pub struct SchemaRegistry {
     state: RwLock<State>,
@@ -36,10 +36,12 @@ impl SchemaRegistry {
 
     /// Registers a new schema version.
     ///
+    /// Migration-requiring versions are stored so they can be activated later
+    /// through an explicit alter. Version numbers must still increase.
+    ///
     /// # Errors
     ///
-    /// Returns [`CatalogError`] for invalid schemas, non-monotonic versions, or
-    /// schema changes that require a layout migration.
+    /// Returns [`CatalogError`] for invalid schemas or non-monotonic versions.
     pub fn register(&self, schema: RecordSchema) -> Result<SchemaVersion> {
         schema.validate()?;
 
@@ -47,18 +49,10 @@ impl SchemaRegistry {
         let version = schema.version();
         let mut state = self.write()?;
 
-        if let Some(latest_version) = state.latest.get(&id) {
-            if version.get() <= latest_version.get() {
-                return Err(CatalogError::SchemaVersionConflict);
-            }
-
-            let previous = state
-                .schemas
-                .get(&(id, *latest_version))
-                .ok_or(CatalogError::NotFound("schema"))?;
-            if check_compatibility(previous, &schema)? == Compatibility::RequiresMigration {
-                return Err(CatalogError::SchemaRequiresMigration);
-            }
+        if let Some(latest_version) = state.latest.get(&id)
+            && version.get() <= latest_version.get()
+        {
+            return Err(CatalogError::SchemaVersionConflict);
         }
 
         state.schemas.insert((id, version), schema);
