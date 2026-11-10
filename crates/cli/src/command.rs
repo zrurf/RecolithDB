@@ -98,11 +98,16 @@ pub async fn run(args: Args) -> Result<(), CliError> {
             print!("{}", format_collection(&collection));
         }
         Command::Token { .. } => {}
-        Command::Catalog { command } => {
-            let request = crate::catalog::request(command)?;
-            let response = client.apply_catalog(&request).await?;
-            println!("catalog generation: {}", response.catalog_generation);
-        }
+        Command::Catalog { command } => match crate::catalog::request(command)? {
+            crate::catalog::CatalogRequest::Apply(request) => {
+                let response = client.apply_catalog(&request).await?;
+                println!("catalog generation: {}", response.catalog_generation);
+            }
+            crate::catalog::CatalogRequest::Drop(request) => {
+                let response = client.drop_catalog(&request).await?;
+                println!("catalog generation: {}", response.catalog_generation);
+            }
+        },
         Command::Doc { command } => match command {
             DocCommand::Get {
                 collection,

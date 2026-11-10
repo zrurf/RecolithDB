@@ -13,9 +13,10 @@ use recolith_protocol::frame::{
     FrameCodec, FrameHeader, HEADER_LEN, PayloadEncoding, VERSION_MAJOR, VERSION_MINOR,
 };
 use recolith_protocol::messages::{
-    AuthMethod, AuthResult, CatalogApplyRequest, DescribeCollectionRequest, DocumentGetRequest,
-    DocumentPutRequest, ErrorResponse, GoAway, HelloRequest, PingRequest, PingResponse,
-    QueryRequest, SecurityMode, WelcomeResponse, compression_bit, feature, opcode, status,
+    AuthMethod, AuthResult, CatalogApplyRequest, CatalogDropRequest, DescribeCollectionRequest,
+    DocumentGetRequest, DocumentPutRequest, ErrorResponse, GoAway, HelloRequest, PingRequest,
+    PingResponse, QueryRequest, SecurityMode, WelcomeResponse, compression_bit, feature, opcode,
+    status,
 };
 use recolith_security::{Principal, unix_seconds};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -203,7 +204,8 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             | opcode::DOC_PUT
             | opcode::QUERY
             | opcode::DESCRIBE_COLLECTION
-            | opcode::CATALOG_APPLY => {
+            | opcode::CATALOG_APPLY
+            | opcode::CATALOG_DROP => {
                 let started = Instant::now();
                 let outcome =
                     execute(header.opcode(), body, Arc::clone(&store), principal.clone()).await;
@@ -329,6 +331,11 @@ async fn execute<B: StorageBackend>(
                 .map_err(|_| OperationError::invalid("malformed CATALOG_APPLY payload"))?;
             operations::catalog_apply(&store, &principal, request)
         }
+        opcode::CATALOG_DROP => {
+            let request = CatalogDropRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed CATALOG_DROP payload"))?;
+            operations::catalog_drop(&store, &principal, request)
+        }
         _ => Err(OperationError::internal("unsupported operation")),
     })
     .await
@@ -373,14 +380,17 @@ async fn handle_batch<B: StorageBackend, W: AsyncWrite + Unpin>(
     };
 
     for subframe in subframes {
-        if subframe.opcode() == opcode::CATALOG_APPLY {
+        if matches!(
+            subframe.opcode(),
+            opcode::CATALOG_APPLY | opcode::CATALOG_DROP
+        ) {
             send_error(
                 writer,
                 codec,
                 &metrics,
                 subframe.request_id(),
                 status::INVALID_REQUEST,
-                "CATALOG_APPLY is not allowed in a batch",
+                "catalog changes are not allowed in a batch",
             )
             .await?;
             continue;

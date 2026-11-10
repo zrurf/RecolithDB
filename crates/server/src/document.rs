@@ -1,20 +1,26 @@
 //! In-process document operations over catalog metadata and a backend.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::ops::Bound;
 use std::sync::{Arc, Mutex, RwLock};
 
-use recolith_backend::{BackendError, KeyRange, ScanOptions, Snapshot, StorageBackend, TxnOptions};
-use recolith_catalog::{Catalog, CatalogChanges, CatalogError, CatalogSnapshot, save_catalog};
+use recolith_backend::{
+    BackendError, KeyRange, ScanOptions, Snapshot, StorageBackend, Transaction, TxnOptions,
+};
+use recolith_catalog::{
+    Catalog, CatalogChanges, CatalogDrop, CatalogError, CatalogSnapshot, CatalogWrite, save_catalog,
+};
 use recolith_common::{
-    BucketId, CatalogGeneration, CollectionId, CommitTs, FragmentId, PartitionId,
+    BucketId, CatalogGeneration, CollectionId, CommitTs, FragmentId, IndexId, PartitionId,
 };
 use recolith_model::{FragmentCardinality, IndexDefinition, IndexKind};
 use recolith_query::{DocumentReadRequest, QueryEngine, QueryError};
 use recolith_schema::RecordSchema;
 use recolith_storage::{
-    DocumentFragments, MAX_DOCUMENT_KEY_LEN, RecordData, StorageError, encode_bucket_prefix,
-    encode_index_value, encode_record_key,
+    DocumentFragments, MAX_DOCUMENT_KEY_LEN, RecordData, StorageError, decode_fields,
+    decode_record, decode_record_key, encode_bucket_prefix, encode_index_prefix,
+    encode_index_value, encode_record_key, put_index_entry, put_unique_index_entry,
 };
 use recolith_transaction::{
     BatchedCommitClock, FragmentWrite, IndexUpdate, LocalWritePath, TransactionError,
@@ -199,8 +205,15 @@ pub enum DocumentError {
     IdempotencyConflict,
     /// The stored idempotency record is malformed.
     InvalidIdempotencyRecord,
-    /// A new index targets a bucket that already contains records.
-    IndexRequiresEmptyBucket(BucketId),
+    /// A drop target still contains data and purge was not requested.
+    TargetNotEmpty(String),
+    /// An index backfill exceeds the configured entry or byte limit.
+    BackfillTooLarge {
+        /// Records examined.
+        entries: usize,
+        /// Record bytes examined.
+        bytes: usize,
+    },
     /// The expected catalog generation no longer matches.
     StaleCatalog,
 }
@@ -221,9 +234,12 @@ impl fmt::Display for DocumentError {
             Self::InvalidIdempotencyRecord => {
                 formatter.write_str("stored idempotency record is malformed")
             }
-            Self::IndexRequiresEmptyBucket(id) => write!(
+            Self::TargetNotEmpty(object) => {
+                write!(formatter, "{object} contains data; pass purge to delete it")
+            }
+            Self::BackfillTooLarge { entries, bytes } => write!(
                 formatter,
-                "bucket {id} contains records; indexes can only be created on empty buckets"
+                "index backfill exceeds limits: {entries} entries, {bytes} bytes"
             ),
             Self::StaleCatalog => formatter.write_str("catalog generation is stale"),
             Self::InvalidRequest(message) => {
@@ -270,7 +286,7 @@ pub struct DocumentStore<B: StorageBackend> {
     catalog: RwLock<Arc<Catalog>>,
     backend: Arc<B>,
     clock: BatchedCommitClock,
-    write_gate: RwLock<()>,
+    data_gate: RwLock<()>,
     ddl_lock: Mutex<()>,
 }
 
@@ -282,7 +298,7 @@ impl<B: StorageBackend> DocumentStore<B> {
             catalog: RwLock::new(catalog),
             backend,
             clock: BatchedCommitClock::with_default_key(),
-            write_gate: RwLock::new(()),
+            data_gate: RwLock::new(()),
             ddl_lock: Mutex::new(()),
         }
     }
@@ -308,35 +324,95 @@ impl<B: StorageBackend> DocumentStore<B> {
         QueryEngine::new(self.catalog(), self.backend.clone())
     }
 
+    /// Acquires a shared data gate for reads and query execution.
+    ///
+    /// Catalog changes hold the gate exclusively while purging data or
+    /// backfilling indexes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] if the gate lock is poisoned.
+    pub fn read_guard(&self) -> Result<std::sync::RwLockReadGuard<'_, ()>, DocumentError> {
+        self.data_gate.read().map_err(|_| lock_error())
+    }
+
     /// Applies additive catalog definitions atomically.
     ///
-    /// The updated catalog is persisted before it replaces the in-memory
-    /// snapshot. Writes are excluded while indexes are added so the
-    /// empty-bucket check cannot race with document creation.
+    /// New indexes are backfilled from existing records in the same backend
+    /// transaction that persists the catalog. Writes are excluded for the
+    /// duration so the backfill cannot miss concurrent documents.
     ///
     /// # Errors
     ///
     /// Returns [`DocumentError`] for conflicting definitions, missing
-    /// references, invalid indexes, non-empty indexed buckets, or backend
-    /// failures.
+    /// references, invalid indexes, oversized backfills, or backend failures.
     pub fn apply_catalog(
         &self,
         changes: &CatalogChanges,
         expected: Option<CatalogGeneration>,
     ) -> Result<CatalogGeneration, DocumentError> {
         let _ddl = self.ddl_lock.lock().map_err(|_| lock_error())?;
-        let _gate = self.write_gate.write().map_err(|_| lock_error())?;
+        let _gate = self.data_gate.write().map_err(|_| lock_error())?;
         let current = self.catalog();
         let snapshot = current.snapshot()?;
         if expected.is_some_and(|generation| generation != snapshot.generation) {
             return Err(DocumentError::StaleCatalog);
         }
-        check_indexed_buckets_empty(self.backend.as_ref(), &snapshot, changes)?;
 
         let Some(candidate) = current.apply_changes(changes)? else {
             return Ok(snapshot.generation);
         };
+        let pending = pending_indexes(&snapshot, changes);
+        let candidate_snapshot = candidate.snapshot()?;
+        let backfill = collect_backfill(self.backend.as_ref(), &candidate_snapshot, pending)?;
+        let catalog_write = CatalogWrite::prepare(self.backend.as_ref(), &candidate)?;
+        let mut transaction = self.backend.begin(TxnOptions::default())?;
+        if let Err(error) = write_backfill(&mut transaction, &backfill) {
+            transaction.rollback();
+            return Err(error);
+        }
+        catalog_write.stage(&mut transaction);
+        transaction.commit()?;
+
+        let generation = candidate.generation();
+        *self.catalog.write().map_err(|_| lock_error())? = Arc::new(candidate);
+
+        Ok(generation)
+    }
+
+    /// Removes one catalog object and optionally purges its data.
+    ///
+    /// Data is deleted in bounded batches before the catalog snapshot is
+    /// persisted. A crash during purge leaves the object visible, so the drop
+    /// can be retried safely.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] for missing or referenced objects, non-empty
+    /// targets without `purge`, or backend failures.
+    pub fn drop_catalog(
+        &self,
+        target: CatalogDrop,
+        purge: bool,
+        expected: Option<CatalogGeneration>,
+    ) -> Result<CatalogGeneration, DocumentError> {
+        let _ddl = self.ddl_lock.lock().map_err(|_| lock_error())?;
+        let _gate = self.data_gate.write().map_err(|_| lock_error())?;
+        let current = self.catalog();
+        let snapshot = current.snapshot()?;
+        if expected.is_some_and(|generation| generation != snapshot.generation) {
+            return Err(DocumentError::StaleCatalog);
+        }
+
+        let candidate = current.drop_object(target)?;
+        let scope = DropScope::resolve(&snapshot, target)?;
+        if purge {
+            scope.purge(self.backend.as_ref())?;
+        } else {
+            scope.ensure_empty(self.backend.as_ref())?;
+        }
         save_catalog(self.backend.as_ref(), &candidate)?;
+
         let generation = candidate.generation();
         *self.catalog.write().map_err(|_| lock_error())? = Arc::new(candidate);
 
@@ -357,7 +433,7 @@ impl<B: StorageBackend> DocumentStore<B> {
     /// Returns [`DocumentError`] for unknown metadata, invalid fragment targets,
     /// optimistic conflicts, schema errors, or backend failures.
     pub fn write(&self, request: &DocumentWrite) -> Result<CommitTs, DocumentError> {
-        let _gate = self.write_gate.read().map_err(|_| lock_error())?;
+        let _gate = self.data_gate.read().map_err(|_| lock_error())?;
         let snapshot = self.catalog().snapshot()?;
         let collection = snapshot
             .collections
@@ -507,6 +583,7 @@ impl<B: StorageBackend> DocumentStore<B> {
     ///
     /// Returns [`DocumentError`] for binding or execution failures.
     pub fn read(&self, request: &DocumentReadRequest) -> Result<DocumentFragments, DocumentError> {
+        let _gate = self.read_guard()?;
         let engine = QueryEngine::new(self.catalog(), self.backend.clone());
 
         Ok(engine.read_document(request)?)
@@ -515,39 +592,296 @@ impl<B: StorageBackend> DocumentStore<B> {
 
 const IDEMPOTENCY_RECORD_VERSION: u8 = 1;
 const IDEMPOTENCY_RECORD_LEN: usize = 1 + 32 + 8;
+const BACKFILL_SCAN_ENTRIES: usize = 1_024;
+const MAX_BACKFILL_ENTRIES: usize = 100_000;
+const MAX_BACKFILL_BYTES: usize = 64 * 1024 * 1024;
+const PURGE_BATCH_ENTRIES: usize = 1_024;
 
 fn lock_error() -> DocumentError {
     DocumentError::Catalog(CatalogError::LockPoisoned)
 }
 
-fn check_indexed_buckets_empty<B: StorageBackend>(
-    backend: &B,
+struct BackfillBucket {
+    bucket: BucketId,
+    indexes: Vec<IndexDefinition>,
+    records: Vec<BackfillRecord>,
+}
+
+struct BackfillRecord {
+    key: Vec<u8>,
+    partition: PartitionId,
+    data: RecordData,
+}
+
+fn pending_indexes(
     snapshot: &CatalogSnapshot,
     changes: &CatalogChanges,
-) -> Result<(), DocumentError> {
-    let storage = backend.snapshot()?;
+) -> BTreeMap<BucketId, Vec<IndexDefinition>> {
+    let mut pending: BTreeMap<BucketId, Vec<IndexDefinition>> = BTreeMap::new();
     for (bucket_id, index) in &changes.indexes {
-        let existing = snapshot
+        let exists = snapshot
             .indexes
             .get(bucket_id)
-            .and_then(|indexes| indexes.get(&index.id()));
-        if existing.is_some() {
-            continue;
+            .and_then(|indexes| indexes.get(&index.id()))
+            .is_some();
+        if !exists {
+            pending.entry(*bucket_id).or_default().push(index.clone());
         }
-        let prefix = encode_bucket_prefix(*bucket_id);
-        let records = storage.scan(
-            &KeyRange::prefix(&prefix),
-            ScanOptions {
-                limit: Some(1),
-                reverse: false,
-            },
-        )?;
-        if !records.is_empty() {
-            return Err(DocumentError::IndexRequiresEmptyBucket(*bucket_id));
+    }
+
+    pending
+}
+
+fn collect_backfill<B: StorageBackend>(
+    backend: &B,
+    snapshot: &CatalogSnapshot,
+    pending: BTreeMap<BucketId, Vec<IndexDefinition>>,
+) -> Result<Vec<BackfillBucket>, DocumentError> {
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let storage = backend.snapshot()?;
+    let mut output = Vec::with_capacity(pending.len());
+    let mut checked_entries = 0_usize;
+    let mut checked_bytes = 0_usize;
+    for (bucket_id, indexes) in pending {
+        let bucket = snapshot
+            .buckets
+            .get(&bucket_id)
+            .ok_or(DocumentError::MissingMetadata("bucket"))?;
+        let schema = snapshot
+            .schemas
+            .schemas
+            .get(&(bucket.schema_id(), bucket.schema_version()))
+            .ok_or(DocumentError::MissingMetadata("schema"))?
+            .clone();
+        let prefix = encode_bucket_prefix(bucket_id);
+        let end = KeyRange::prefix(&prefix).end_bound().clone();
+        let mut range = KeyRange::prefix(&prefix);
+        let mut records = Vec::new();
+        loop {
+            let entries = storage.scan(
+                &range,
+                ScanOptions {
+                    limit: Some(BACKFILL_SCAN_ENTRIES),
+                    reverse: false,
+                },
+            )?;
+            if entries.is_empty() {
+                break;
+            }
+            let last = entries.last().expect("non-empty scan").0.clone();
+            for (key, value) in entries {
+                let Ok(decoded) = decode_record_key(&key) else {
+                    continue;
+                };
+                checked_entries += 1;
+                checked_bytes = checked_bytes.saturating_add(key.len() + value.len());
+                if checked_entries > MAX_BACKFILL_ENTRIES || checked_bytes > MAX_BACKFILL_BYTES {
+                    return Err(DocumentError::BackfillTooLarge {
+                        entries: checked_entries,
+                        bytes: checked_bytes,
+                    });
+                }
+                let record = decode_record(&value)?;
+                if record.header().schema_id() != schema.id()
+                    || record.header().schema_version() != schema.version()
+                {
+                    return Err(DocumentError::Storage(StorageError::SchemaMismatch {
+                        record_schema: record.header().schema_id(),
+                        record_version: record.header().schema_version(),
+                        expected_schema: schema.id(),
+                        expected_version: schema.version(),
+                    }));
+                }
+                let data = decode_fields(&schema, record.payload())?;
+                records.push(BackfillRecord {
+                    key,
+                    partition: decoded.head().partition(),
+                    data,
+                });
+            }
+            range = KeyRange::new(Bound::Excluded(last), end.clone());
+        }
+        output.push(BackfillBucket {
+            bucket: bucket_id,
+            indexes,
+            records,
+        });
+    }
+
+    Ok(output)
+}
+
+fn write_backfill<T: Transaction>(
+    transaction: &mut T,
+    backfill: &[BackfillBucket],
+) -> Result<(), DocumentError> {
+    for bucket in backfill {
+        for record in &bucket.records {
+            for index in &bucket.indexes {
+                let Some(values) = encoded_index_values(index, &record.data)? else {
+                    continue;
+                };
+                if index.kind() == IndexKind::Unique {
+                    put_unique_index_entry(
+                        transaction,
+                        bucket.bucket,
+                        record.partition,
+                        index.id(),
+                        &values,
+                        &record.key,
+                    )?;
+                } else {
+                    put_index_entry(
+                        transaction,
+                        bucket.bucket,
+                        record.partition,
+                        index.id(),
+                        &values,
+                        &record.key,
+                    );
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+enum DropScope {
+    Index {
+        bucket: BucketId,
+        index: IndexId,
+        partitions: u32,
+    },
+    Buckets(Vec<BucketId>),
+}
+
+impl DropScope {
+    fn resolve(snapshot: &CatalogSnapshot, target: CatalogDrop) -> Result<Self, DocumentError> {
+        match target {
+            CatalogDrop::Index { bucket, index } => {
+                let bucket_meta = snapshot
+                    .buckets
+                    .get(&bucket)
+                    .ok_or(DocumentError::MissingMetadata("bucket"))?;
+                Ok(Self::Index {
+                    bucket,
+                    index,
+                    partitions: bucket_meta.partition_count(),
+                })
+            }
+            CatalogDrop::Collection(id) => {
+                let collection = snapshot
+                    .collections
+                    .get(&id)
+                    .ok_or(DocumentError::UnknownCollection(id))?;
+                let buckets: BTreeSet<BucketId> = collection
+                    .fragments()
+                    .iter()
+                    .map(|fragment| fragment.bucket_id())
+                    .collect();
+                Ok(Self::Buckets(buckets.into_iter().collect()))
+            }
+            CatalogDrop::Bucket(id) => Ok(Self::Buckets(vec![id])),
+            CatalogDrop::Keyspace(id) => {
+                let buckets = snapshot
+                    .bucket_keyspaces
+                    .iter()
+                    .filter(|(_, keyspace_id)| **keyspace_id == id)
+                    .map(|(bucket_id, _)| *bucket_id)
+                    .collect();
+                Ok(Self::Buckets(buckets))
+            }
+        }
+    }
+
+    fn ensure_empty<B: StorageBackend>(&self, backend: &B) -> Result<(), DocumentError> {
+        match self {
+            Self::Index {
+                bucket,
+                index,
+                partitions,
+            } => {
+                for partition in 0..*partitions {
+                    let prefix = encode_index_prefix(*bucket, PartitionId::new(partition), *index);
+                    if prefix_has_entries(backend, &prefix)? {
+                        return Err(DocumentError::TargetNotEmpty(format!(
+                            "index {index} in bucket {bucket}"
+                        )));
+                    }
+                }
+            }
+            Self::Buckets(buckets) => {
+                for bucket in buckets {
+                    if prefix_has_entries(backend, &encode_bucket_prefix(*bucket))? {
+                        return Err(DocumentError::TargetNotEmpty(format!("bucket {bucket}")));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn purge<B: StorageBackend>(&self, backend: &B) -> Result<(), DocumentError> {
+        match self {
+            Self::Index {
+                bucket,
+                index,
+                partitions,
+            } => {
+                for partition in 0..*partitions {
+                    let prefix = encode_index_prefix(*bucket, PartitionId::new(partition), *index);
+                    purge_prefix(backend, &prefix)?;
+                }
+            }
+            Self::Buckets(buckets) => {
+                for bucket in buckets {
+                    purge_prefix(backend, &encode_bucket_prefix(*bucket))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn prefix_has_entries<B: StorageBackend>(
+    backend: &B,
+    prefix: &[u8],
+) -> Result<bool, DocumentError> {
+    let entries = backend.snapshot()?.scan(
+        &KeyRange::prefix(prefix),
+        ScanOptions {
+            limit: Some(1),
+            reverse: false,
+        },
+    )?;
+
+    Ok(!entries.is_empty())
+}
+
+fn purge_prefix<B: StorageBackend>(backend: &B, prefix: &[u8]) -> Result<(), DocumentError> {
+    loop {
+        let entries = backend.snapshot()?.scan(
+            &KeyRange::prefix(prefix),
+            ScanOptions {
+                limit: Some(PURGE_BATCH_ENTRIES),
+                reverse: false,
+            },
+        )?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = backend.begin(TxnOptions::default())?;
+        for (key, _) in &entries {
+            transaction.delete(key);
+        }
+        transaction.commit()?;
+    }
 }
 
 fn encode_idempotency(hash: [u8; 32], commit_ts: CommitTs) -> Vec<u8> {

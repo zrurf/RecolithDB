@@ -87,6 +87,15 @@ pub enum Command {
 /// Catalog definition commands.
 #[derive(Debug, Subcommand)]
 pub enum CatalogCommand {
+    /// Applies a catalog definition TOML file atomically.
+    Apply {
+        /// Catalog definition file.
+        #[arg(long)]
+        file: PathBuf,
+        /// Expected catalog generation; zero disables the check.
+        #[arg(long, default_value_t = 0)]
+        catalog_generation: u64,
+    },
     /// Creates a keyspace.
     CreateKeyspace {
         /// Keyspace identifier.
@@ -182,6 +191,57 @@ pub enum CatalogCommand {
         /// Indexed field identifier.
         #[arg(long = "field", required = true)]
         fields: Vec<u32>,
+        /// Expected catalog generation; zero disables the check.
+        #[arg(long, default_value_t = 0)]
+        catalog_generation: u64,
+    },
+    /// Drops an index and optionally its entries.
+    DropIndex {
+        /// Bucket identifier.
+        #[arg(long)]
+        bucket_id: u64,
+        /// Index identifier.
+        #[arg(long)]
+        index_id: u64,
+        /// Delete existing index entries.
+        #[arg(long)]
+        purge: bool,
+        /// Expected catalog generation; zero disables the check.
+        #[arg(long, default_value_t = 0)]
+        catalog_generation: u64,
+    },
+    /// Drops a collection and optionally its records.
+    DropCollection {
+        /// Collection identifier.
+        #[arg(long)]
+        id: u64,
+        /// Delete existing records and index entries.
+        #[arg(long)]
+        purge: bool,
+        /// Expected catalog generation; zero disables the check.
+        #[arg(long, default_value_t = 0)]
+        catalog_generation: u64,
+    },
+    /// Drops a bucket and optionally its records.
+    DropBucket {
+        /// Bucket identifier.
+        #[arg(long)]
+        id: u64,
+        /// Delete existing records and index entries.
+        #[arg(long)]
+        purge: bool,
+        /// Expected catalog generation; zero disables the check.
+        #[arg(long, default_value_t = 0)]
+        catalog_generation: u64,
+    },
+    /// Drops a keyspace and optionally its data.
+    DropKeyspace {
+        /// Keyspace identifier.
+        #[arg(long)]
+        id: u32,
+        /// Delete existing records and index entries.
+        #[arg(long)]
+        purge: bool,
         /// Expected catalog generation; zero disables the check.
         #[arg(long, default_value_t = 0)]
         catalog_generation: u64,

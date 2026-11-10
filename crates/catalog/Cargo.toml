@@ -11,6 +11,9 @@ recolith-common.workspace = true
 recolith-model.workspace = true
 recolith-schema.workspace = true
 recolith-backend.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 recolith-backend-memory.workspace = true

@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use recolith_backend::StorageBackend;
-use recolith_catalog::{CatalogChanges, CatalogError, CatalogSnapshot};
+use recolith_catalog::{CatalogChanges, CatalogDrop, CatalogError, CatalogSnapshot};
 use recolith_common::{
     BucketId, CatalogGeneration, CollectionId, CommitTs, FieldId, FragmentId, IndexId, KeyspaceId,
     PartitionId, SchemaId, SchemaVersion,
@@ -14,10 +14,10 @@ use recolith_model::{
     IndexDefinition, IndexKind, KeyField, KeyType, Keyspace,
 };
 use recolith_protocol::messages::{
-    self, BucketDefinition, CatalogApplyRequest, CatalogApplyResponse, DescribeCollectionRequest,
-    DescribeCollectionResponse, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest,
-    DocumentPutResponse, DocumentResult, FragmentVersion, QueryRequest, QueryResponse, RequestMeta,
-    describe_collection_request, opcode, status, value,
+    self, BucketDefinition, CatalogApplyRequest, CatalogApplyResponse, CatalogDropRequest,
+    CatalogDropResponse, DescribeCollectionRequest, DescribeCollectionResponse, DocumentGetRequest,
+    DocumentGetResponse, DocumentPutRequest, DocumentPutResponse, DocumentResult, FragmentVersion,
+    QueryRequest, QueryResponse, RequestMeta, describe_collection_request, opcode, status, value,
 };
 use recolith_query::error::QueryError;
 use recolith_query::{
@@ -93,6 +93,7 @@ pub(crate) fn document_get<B: StorageBackend>(
     request: DocumentGetRequest,
 ) -> Result<OperationResponse, OperationError> {
     check_meta(store, request.meta.as_ref())?;
+    let _read = store.read_guard().map_err(map_document)?;
     let snapshot = store.catalog_snapshot().map_err(map_document)?;
     authorize_collection(
         &snapshot,
@@ -178,6 +179,102 @@ pub(crate) fn catalog_apply<B: StorageBackend>(
         opcode: opcode::CATALOG_APPLY,
         payload: response.encode_to_vec(),
     })
+}
+
+pub(crate) fn catalog_drop<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    request: CatalogDropRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    let expected = request
+        .meta
+        .as_ref()
+        .filter(|meta| meta.catalog_generation != 0)
+        .map(|meta| CatalogGeneration::new(meta.catalog_generation));
+    let snapshot = store.catalog_snapshot().map_err(map_document)?;
+    let target = drop_target(&request)?;
+    authorize_catalog_drop(&snapshot, principal, target)?;
+    let generation = store
+        .drop_catalog(target, request.purge, expected)
+        .map_err(map_document)?;
+    let response = CatalogDropResponse {
+        catalog_generation: generation.get(),
+    };
+
+    Ok(OperationResponse {
+        opcode: opcode::CATALOG_DROP,
+        payload: response.encode_to_vec(),
+    })
+}
+
+fn drop_target(request: &CatalogDropRequest) -> Result<CatalogDrop, OperationError> {
+    match request.target.as_ref() {
+        Some(messages::catalog_drop_request::Target::Index(index)) => Ok(CatalogDrop::Index {
+            bucket: BucketId::new(index.bucket_id),
+            index: IndexId::new(index.index_id),
+        }),
+        Some(messages::catalog_drop_request::Target::CollectionId(id)) => {
+            Ok(CatalogDrop::Collection(CollectionId::new(*id)))
+        }
+        Some(messages::catalog_drop_request::Target::BucketId(id)) => {
+            Ok(CatalogDrop::Bucket(BucketId::new(*id)))
+        }
+        Some(messages::catalog_drop_request::Target::KeyspaceId(id)) => {
+            Ok(CatalogDrop::Keyspace(KeyspaceId::new(*id)))
+        }
+        None => Err(OperationError::invalid("catalog drop target is required")),
+    }
+}
+
+fn authorize_catalog_drop(
+    snapshot: &CatalogSnapshot,
+    principal: &Principal,
+    target: CatalogDrop,
+) -> Result<(), OperationError> {
+    match target {
+        CatalogDrop::Index { bucket, .. } => {
+            require_admin(principal, keyspace_for_bucket(snapshot, bucket)?, "*")
+        }
+        CatalogDrop::Collection(id) => {
+            let collection = snapshot.collections.get(&id).ok_or_else(|| {
+                OperationError::new(status::NOT_FOUND, "collection was not found")
+            })?;
+            let keyspace = snapshot
+                .keyspaces
+                .get(&collection.keyspace_id())
+                .ok_or_else(|| {
+                    OperationError::internal("collection references missing keyspace")
+                })?;
+            require_admin(principal, keyspace.name(), collection.name())
+        }
+        CatalogDrop::Bucket(id) => {
+            require_admin(principal, keyspace_for_bucket(snapshot, id)?, "*")
+        }
+        CatalogDrop::Keyspace(id) => {
+            let keyspace = snapshot
+                .keyspaces
+                .get(&id)
+                .ok_or_else(|| OperationError::new(status::NOT_FOUND, "keyspace was not found"))?;
+            require_admin(principal, keyspace.name(), "*")
+        }
+    }
+}
+
+fn keyspace_for_bucket(
+    snapshot: &CatalogSnapshot,
+    bucket: BucketId,
+) -> Result<&str, OperationError> {
+    let keyspace_id = snapshot
+        .bucket_keyspaces
+        .get(&bucket)
+        .copied()
+        .ok_or_else(|| OperationError::new(status::NOT_FOUND, "bucket was not found"))?;
+    snapshot
+        .keyspaces
+        .get(&keyspace_id)
+        .map(recolith_model::Keyspace::name)
+        .ok_or_else(|| OperationError::internal("bucket references missing keyspace"))
 }
 
 fn catalog_changes(request: CatalogApplyRequest) -> Result<CatalogChanges, OperationError> {
@@ -551,6 +648,7 @@ pub(crate) fn query<B: StorageBackend>(
     request: QueryRequest,
 ) -> Result<OperationResponse, OperationError> {
     check_meta(store, request.meta.as_ref())?;
+    let _read = store.read_guard().map_err(map_document)?;
 
     let parsed = parse_document_query(&request.rql).map_err(map_rql)?;
     let mut parameters = BindParameters::new();
@@ -719,7 +817,7 @@ fn map_document(error: DocumentError) -> OperationError {
         DocumentError::InvalidIdempotencyRecord => {
             OperationError::new(status::INTERNAL, error.to_string())
         }
-        DocumentError::IndexRequiresEmptyBucket(_) => {
+        DocumentError::TargetNotEmpty(_) | DocumentError::BackfillTooLarge { .. } => {
             OperationError::new(status::FAILED_PRECONDITION, error.to_string())
         }
         DocumentError::StaleCatalog => {
@@ -727,6 +825,9 @@ fn map_document(error: DocumentError) -> OperationError {
         }
         DocumentError::Catalog(CatalogError::Conflict(_) | CatalogError::Duplicate(_)) => {
             OperationError::new(status::CONFLICT, error.to_string())
+        }
+        DocumentError::Catalog(CatalogError::Referenced(_)) => {
+            OperationError::new(status::FAILED_PRECONDITION, error.to_string())
         }
         DocumentError::Catalog(CatalogError::NotFound(_)) => {
             OperationError::new(status::NOT_FOUND, error.to_string())
@@ -743,7 +844,10 @@ fn map_document(error: DocumentError) -> OperationError {
         }
         DocumentError::Transaction(TransactionError::Storage(StorageError::UniqueViolation {
             ..
-        })) => OperationError::new(status::CONFLICT, error.to_string()),
+        }))
+        | DocumentError::Storage(StorageError::UniqueViolation { .. }) => {
+            OperationError::new(status::CONFLICT, error.to_string())
+        }
         DocumentError::Transaction(TransactionError::Storage(StorageError::SchemaMismatch {
             ..
         }))
