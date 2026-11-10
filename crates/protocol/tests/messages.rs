@@ -5,10 +5,10 @@ use recolith_protocol::messages::{
     DescribeCollectionRequest, DescribeCollectionResponse, DocumentPutRequest, FieldConversion,
     FieldMapping, FieldValue, FragmentDefinition, FragmentMetadata, FragmentPayload, HelloRequest,
     IndexDefinition, IndexKind, KeyFieldDefinition, KeyFieldMetadata, KeyFieldType,
-    KeyspaceDefinition, NamedParameter, QueryRequest, RequestMeta, SchemaDefinition, SchemaField,
-    SchemaList, SchemaMigration, SchemaScalarType, SchemaType, SetBucketSchema, Value,
-    catalog_alter_request, catalog_drop_request, compression_bit, describe_collection_request,
-    feature, field_mapping, schema_type, value,
+    KeyspaceDefinition, NamedParameter, QueryRequest, QueryStreamRequest, RequestMeta,
+    SchemaDefinition, SchemaField, SchemaList, SchemaMigration, SchemaScalarType, SchemaType,
+    SetBucketSchema, Value, catalog_alter_request, catalog_drop_request, compression_bit,
+    describe_collection_request, feature, field_mapping, schema_type, value,
 };
 
 #[test]
@@ -82,12 +82,32 @@ fn roundtrips_query_parameters() {
             }),
         }],
         limit: 10,
+        cursor: b"next-page".to_vec(),
     };
 
     let encoded = query.encode_to_vec();
     let decoded = QueryRequest::decode(encoded.as_slice()).expect("decode");
 
     assert_eq!(decoded, query);
+}
+
+#[test]
+fn roundtrips_query_stream_request() {
+    let request = QueryStreamRequest {
+        meta: Some(RequestMeta::default()),
+        partition: 2,
+        rql: "SELECT profile.name FROM player WHERE profile.level >= 10 \
+              INCLUDE FRAGMENTS profile"
+            .to_owned(),
+        parameters: Vec::new(),
+        limit: 100,
+        chunk_size: 10,
+    };
+
+    let encoded = request.encode_to_vec();
+    let decoded = QueryStreamRequest::decode(encoded.as_slice()).expect("decode");
+
+    assert_eq!(decoded, request);
 }
 
 #[test]

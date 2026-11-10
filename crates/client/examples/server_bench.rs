@@ -152,6 +152,7 @@ async fn workload(
                 }),
             }],
             limit: 1,
+            cursor: Vec::new(),
         };
         let started = Instant::now();
         client.query(&request).await?;

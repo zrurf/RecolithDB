@@ -191,6 +191,22 @@ message QueryRequest {
   string rql = 3;
   repeated NamedParameter parameters = 4;
   uint64 limit = 5;
+  bytes cursor = 6;
+}
+
+message QueryStreamRequest {
+  RequestMeta meta = 1;
+  uint32 partition = 2;
+  string rql = 3;
+  repeated NamedParameter parameters = 4;
+  uint64 limit = 5;
+  uint32 chunk_size = 6;
+}
+
+message QueryChunk {
+  repeated DocumentResult documents = 1;
+  bytes next_cursor = 2;
+  bool final = 3;
 }
 
 message DocumentResult {
@@ -200,6 +216,7 @@ message DocumentResult {
 
 message QueryResponse {
   repeated DocumentResult documents = 1;
+  bytes next_cursor = 2;
 }
 
 enum KeyFieldType {

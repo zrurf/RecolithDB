@@ -5,8 +5,8 @@ use recolith_client::{BatchOperation, Client, ClientConfig, ClientError};
 use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::messages::{
     DescribeCollectionRequest, DocumentGetRequest, DocumentGetResponse, FieldSelection,
-    NamedParameter, QueryRequest, SecurityMode, Value, describe_collection_request, feature,
-    opcode, status, value,
+    NamedParameter, QueryRequest, QueryStreamRequest, SecurityMode, Value,
+    describe_collection_request, feature, opcode, status, value,
 };
 use recolith_server::ServerConfig;
 
@@ -104,10 +104,71 @@ async fn writes_reads_and_queries_documents() {
             }),
         }],
         limit: 10,
+        cursor: Vec::new(),
     };
     let response = client.query(&query).await.expect("query");
     assert_eq!(response.documents.len(), 1);
     assert_eq!(response.documents[0].document_key, key);
+
+    for (id, idempotency) in [(43_u64, b"idem-2"), (44, b"idem-3")] {
+        client
+            .document_put(&support::profile_put(
+                &support::document_key(id),
+                "ben",
+                idempotency,
+            ))
+            .await
+            .expect("put scan document");
+    }
+    let scan = |cursor: Vec<u8>, limit: u64| QueryRequest {
+        meta: None,
+        partition: 0,
+        rql: "SELECT profile.name FROM player WHERE profile.level >= 0 \
+              INCLUDE FRAGMENTS profile"
+            .to_owned(),
+        parameters: Vec::new(),
+        limit,
+        cursor,
+    };
+    let first = client
+        .query(&scan(Vec::new(), 2))
+        .await
+        .expect("first page");
+    assert_eq!(first.documents.len(), 2);
+    assert!(!first.next_cursor.is_empty());
+    let second = client
+        .query(&scan(first.next_cursor, 2))
+        .await
+        .expect("second page");
+    assert_eq!(second.documents.len(), 1);
+    assert!(second.next_cursor.is_empty());
+
+    let mut chunks = Vec::new();
+    client
+        .query_stream(
+            &QueryStreamRequest {
+                meta: None,
+                partition: 0,
+                rql: "SELECT profile.name FROM player WHERE profile.level >= 0 \
+                      INCLUDE FRAGMENTS profile"
+                    .to_owned(),
+                parameters: Vec::new(),
+                limit: 10,
+                chunk_size: 2,
+            },
+            |chunk| chunks.push(chunk.clone()),
+        )
+        .await
+        .expect("stream");
+    assert!(chunks.len() >= 2);
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|chunk| chunk.documents.len())
+            .sum::<usize>(),
+        3
+    );
+    assert!(chunks.last().expect("chunks").r#final);
 }
 
 #[tokio::test]

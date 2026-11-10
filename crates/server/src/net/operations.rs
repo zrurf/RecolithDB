@@ -35,6 +35,7 @@ use crate::document::{
     DocumentError, DocumentStore, DocumentWrite, FragmentWriteRequest, Idempotency,
 };
 use crate::migration::{FieldMapping, MigrationConversion, MigrationSource, SchemaMigration};
+use crate::query_cursor;
 
 use super::convert;
 
@@ -756,17 +757,51 @@ pub(crate) fn document_put<B: StorageBackend>(
     })
 }
 
+pub(crate) struct QueryPage {
+    pub(crate) documents: Vec<DocumentResult>,
+    pub(crate) next_cursor: Vec<u8>,
+}
+
 pub(crate) fn query<B: StorageBackend>(
     store: &DocumentStore<B>,
     principal: &Principal,
     request: QueryRequest,
 ) -> Result<OperationResponse, OperationError> {
     check_meta(store, request.meta.as_ref())?;
-    let _read = store.read_guard().map_err(map_document)?;
+    let limit = query_limit(request.limit, &request.rql)?;
+    let page = query_page(
+        store,
+        principal,
+        request.partition,
+        &request.rql,
+        &request.parameters,
+        limit,
+        &request.cursor,
+    )?;
+    let response = QueryResponse {
+        documents: page.documents,
+        next_cursor: page.next_cursor,
+    };
 
-    let parsed = parse_document_query(&request.rql).map_err(map_rql)?;
+    Ok(OperationResponse {
+        opcode: opcode::QUERY,
+        payload: response.encode_to_vec(),
+    })
+}
+
+pub(crate) fn query_page<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    partition: u32,
+    rql: &str,
+    wire_parameters: &[messages::NamedParameter],
+    limit: usize,
+    cursor: &[u8],
+) -> Result<QueryPage, OperationError> {
+    let _read = store.read_guard().map_err(map_document)?;
+    let parsed = parse_document_query(rql).map_err(map_rql)?;
     let mut parameters = BindParameters::new();
-    for parameter in &request.parameters {
+    for parameter in wire_parameters {
         let value = parameter.value.as_ref().ok_or_else(|| {
             OperationError::new(
                 status::INVALID_REQUEST,
@@ -781,57 +816,110 @@ pub(crate) fn query<B: StorageBackend>(
     }
 
     let snapshot = store.catalog_snapshot().map_err(map_document)?;
-    let query = bind_query(
-        &snapshot,
-        &parsed,
-        PartitionId::new(request.partition),
-        &parameters,
-    )
-    .map_err(map_bind)?;
+    let query = bind_query(&snapshot, &parsed, PartitionId::new(partition), &parameters)
+        .map_err(map_bind)?;
     authorize_collection(&snapshot, principal, query.collection_id(), Action::Read)?;
-    let limit = if request.limit > 0 {
-        request.limit
+    let query_hash = query_cursor::query_hash(partition, rql, wire_parameters);
+    let cursor = if cursor.is_empty() {
+        None
     } else {
-        parsed.limit().unwrap_or(DEFAULT_QUERY_LIMIT)
-    }
-    .min(MAX_QUERY_LIMIT) as usize;
+        let cursor = query_cursor::decode(cursor).map_err(map_cursor)?;
+        if cursor.query_hash != query_hash {
+            return Err(map_cursor(query_cursor::CursorError::QueryMismatch));
+        }
+        if cursor.catalog_generation != snapshot.generation.get() {
+            return Err(map_cursor(query_cursor::CursorError::StaleCatalog));
+        }
+        Some(cursor)
+    };
 
     let engine = store.query_engine();
-    let documents = match query {
+    let (documents, next_cursor) = match query {
         BoundQuery::Document(query) => {
+            if cursor.is_some() {
+                return Err(OperationError::invalid(
+                    "cursor is not valid for a point query",
+                ));
+            }
             let plan = engine.plan(&query).map_err(map_query)?;
             let mut fragments = engine.execute(&plan).map_err(map_query)?;
             for records in fragments.values_mut() {
                 records.truncate(limit);
             }
-            if fragments.is_empty() {
+            let documents = if fragments.is_empty() {
                 Vec::new()
             } else {
                 vec![DocumentResult {
                     document_key: query.document_key().to_vec(),
                     fragments: convert::fragments_to_wire(&fragments),
                 }]
-            }
+            };
+            (documents, Vec::new())
         }
         BoundQuery::Scan(query) => {
             let plan = engine.plan_scan(&query).map_err(map_query)?;
-            engine
-                .execute_scan(&plan, limit)
-                .map_err(map_query)?
+            let page = engine
+                .execute_scan_page(
+                    &plan,
+                    limit,
+                    cursor.as_ref().map(|cursor| cursor.last_key.as_slice()),
+                )
+                .map_err(map_query)?;
+            let documents = page
+                .documents
                 .into_iter()
                 .map(|(document_key, fragments)| DocumentResult {
                     document_key,
                     fragments: convert::fragments_to_wire(&fragments),
                 })
-                .collect()
+                .collect::<Vec<_>>();
+            let next_cursor = if page.has_more {
+                let last_key = documents
+                    .last()
+                    .expect("has_more implies a non-empty page")
+                    .document_key
+                    .clone();
+                query_cursor::encode(&query_cursor::QueryCursor {
+                    last_key,
+                    catalog_generation: snapshot.generation.get(),
+                    query_hash,
+                })
+            } else {
+                Vec::new()
+            };
+            (documents, next_cursor)
         }
     };
-    let response = QueryResponse { documents };
 
-    Ok(OperationResponse {
-        opcode: opcode::QUERY,
-        payload: response.encode_to_vec(),
+    Ok(QueryPage {
+        documents,
+        next_cursor,
     })
+}
+
+pub(crate) fn query_limit(request_limit: u64, rql: &str) -> Result<usize, OperationError> {
+    if request_limit > 0 {
+        return Ok(request_limit.min(MAX_QUERY_LIMIT) as usize);
+    }
+    let parsed = parse_document_query(rql).map_err(map_rql)?;
+
+    Ok(parsed
+        .limit()
+        .unwrap_or(DEFAULT_QUERY_LIMIT)
+        .min(MAX_QUERY_LIMIT) as usize)
+}
+
+fn map_cursor(error: query_cursor::CursorError) -> OperationError {
+    match error {
+        query_cursor::CursorError::StaleCatalog => {
+            OperationError::new(status::STALE_CATALOG, "cursor catalog generation is stale")
+        }
+        query_cursor::CursorError::Malformed
+        | query_cursor::CursorError::UnsupportedVersion
+        | query_cursor::CursorError::QueryMismatch => {
+            OperationError::invalid("query cursor is invalid")
+        }
+    }
 }
 
 pub(crate) fn now_micros() -> u64 {
@@ -842,7 +930,7 @@ pub(crate) fn now_micros() -> u64 {
         })
 }
 
-fn check_meta<B: StorageBackend>(
+pub(crate) fn check_meta<B: StorageBackend>(
     store: &DocumentStore<B>,
     meta: Option<&RequestMeta>,
 ) -> Result<(), OperationError> {
