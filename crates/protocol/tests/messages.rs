@@ -1,8 +1,10 @@
 use prost::Message;
 use recolith_protocol::messages::{
-    AuthMethod, CollectionMetadata, DescribeCollectionRequest, DescribeCollectionResponse,
-    DocumentPutRequest, FieldValue, FragmentMetadata, FragmentPayload, HelloRequest,
-    KeyFieldMetadata, KeyFieldType, NamedParameter, QueryRequest, RequestMeta, SchemaField,
+    AuthMethod, BucketDefinition, BucketPolicy, CatalogApplyRequest, CollectionDefinition,
+    CollectionMetadata, DescribeCollectionRequest, DescribeCollectionResponse, DocumentPutRequest,
+    FieldValue, FragmentDefinition, FragmentMetadata, FragmentPayload, HelloRequest,
+    IndexDefinition, IndexKind, KeyFieldDefinition, KeyFieldMetadata, KeyFieldType,
+    KeyspaceDefinition, NamedParameter, QueryRequest, RequestMeta, SchemaDefinition, SchemaField,
     SchemaList, SchemaScalarType, SchemaType, Value, compression_bit, describe_collection_request,
     feature, schema_type, value,
 };
@@ -137,6 +139,62 @@ fn roundtrips_collection_metadata() {
     let decoded = DescribeCollectionResponse::decode(encoded.as_slice()).expect("decode");
 
     assert_eq!(decoded, response);
+}
+
+#[test]
+fn roundtrips_catalog_apply_request() {
+    let request = CatalogApplyRequest {
+        meta: Some(RequestMeta {
+            catalog_generation: 7,
+            ..Default::default()
+        }),
+        keyspaces: vec![KeyspaceDefinition {
+            id: 1,
+            name: "game".to_owned(),
+        }],
+        schemas: vec![SchemaDefinition {
+            id: 1,
+            version: 1,
+            idl: "record profile { 1: name: string; }".to_owned(),
+        }],
+        buckets: vec![BucketDefinition {
+            id: 1,
+            keyspace_id: 1,
+            name: "player_profile".to_owned(),
+            partitions: 16,
+            policy: BucketPolicy::Strict as i32,
+            schema_id: 1,
+            schema_version: 1,
+        }],
+        collections: vec![CollectionDefinition {
+            id: 1,
+            keyspace_id: 1,
+            name: "player".to_owned(),
+            affinity_group: "player".to_owned(),
+            key_fields: vec![KeyFieldDefinition {
+                name: "player_id".to_owned(),
+                r#type: KeyFieldType::U64 as i32,
+            }],
+            fragments: vec![FragmentDefinition {
+                id: 1,
+                name: "profile".to_owned(),
+                bucket_id: 1,
+                cardinality: recolith_protocol::messages::FragmentCardinality::One as i32,
+            }],
+        }],
+        indexes: vec![IndexDefinition {
+            id: 1,
+            bucket_id: 1,
+            name: "by-level".to_owned(),
+            kind: IndexKind::Range as i32,
+            fields: vec![2],
+        }],
+    };
+
+    let encoded = request.encode_to_vec();
+    let decoded = CatalogApplyRequest::decode(encoded.as_slice()).expect("decode");
+
+    assert_eq!(decoded, request);
 }
 
 #[test]

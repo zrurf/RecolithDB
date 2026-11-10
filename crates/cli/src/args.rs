@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{ArgGroup, Parser, Subcommand};
+use recolith_security::DEFAULT_TTL_SECONDS;
 
 /// Command-line client configuration.
 #[derive(Debug, Parser)]
@@ -68,6 +69,160 @@ pub enum Command {
         /// Document command.
         #[command(subcommand)]
         command: DocCommand,
+    },
+    /// Issues local authentication tokens.
+    Token {
+        /// Token command.
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
+    /// Creates catalog objects through the server.
+    Catalog {
+        /// Catalog command.
+        #[command(subcommand)]
+        command: CatalogCommand,
+    },
+}
+
+/// Catalog definition commands.
+#[derive(Debug, Subcommand)]
+pub enum CatalogCommand {
+    /// Creates a keyspace.
+    CreateKeyspace {
+        /// Keyspace identifier.
+        #[arg(long)]
+        id: u32,
+        /// Keyspace name.
+        #[arg(long)]
+        name: String,
+        /// Expected catalog generation; zero disables the check.
+        #[arg(long, default_value_t = 0)]
+        catalog_generation: u64,
+    },
+    /// Registers a schema version from an IDL file.
+    RegisterSchema {
+        /// Schema identifier.
+        #[arg(long)]
+        id: u64,
+        /// Schema version.
+        #[arg(long)]
+        version: u32,
+        /// File containing the record IDL.
+        #[arg(long)]
+        idl_file: PathBuf,
+        /// Expected catalog generation; zero disables the check.
+        #[arg(long, default_value_t = 0)]
+        catalog_generation: u64,
+    },
+    /// Creates a bucket.
+    CreateBucket {
+        /// Bucket identifier.
+        #[arg(long)]
+        id: u64,
+        /// Owning keyspace identifier.
+        #[arg(long)]
+        keyspace_id: u32,
+        /// Bucket name.
+        #[arg(long)]
+        name: String,
+        /// Partition count.
+        #[arg(long)]
+        partitions: u32,
+        /// Schema identifier.
+        #[arg(long)]
+        schema_id: u64,
+        /// Schema version.
+        #[arg(long)]
+        schema_version: u32,
+        /// Bucket policy: strict, managed, or raw.
+        #[arg(long, default_value = "strict")]
+        policy: String,
+        /// Expected catalog generation; zero disables the check.
+        #[arg(long, default_value_t = 0)]
+        catalog_generation: u64,
+    },
+    /// Creates a collection.
+    CreateCollection {
+        /// Collection identifier.
+        #[arg(long)]
+        id: u64,
+        /// Owning keyspace identifier.
+        #[arg(long)]
+        keyspace_id: u32,
+        /// Collection name.
+        #[arg(long)]
+        name: String,
+        /// Affinity group. Defaults to the collection name.
+        #[arg(long)]
+        affinity_group: Option<String>,
+        /// Document key field in `name:type` form.
+        #[arg(long = "key", required = true)]
+        key_fields: Vec<String>,
+        /// Fragment in `id:name:bucket_id[:one|many]` form.
+        #[arg(long = "fragment", required = true)]
+        fragments: Vec<String>,
+        /// Expected catalog generation; zero disables the check.
+        #[arg(long, default_value_t = 0)]
+        catalog_generation: u64,
+    },
+    /// Creates an index on a bucket.
+    CreateIndex {
+        /// Bucket identifier.
+        #[arg(long)]
+        bucket_id: u64,
+        /// Index identifier.
+        #[arg(long)]
+        id: u64,
+        /// Index name.
+        #[arg(long)]
+        name: String,
+        /// Index kind: equality, range, composite, or unique.
+        #[arg(long, default_value = "equality")]
+        kind: String,
+        /// Indexed field identifier.
+        #[arg(long = "field", required = true)]
+        fields: Vec<u32>,
+        /// Expected catalog generation; zero disables the check.
+        #[arg(long, default_value_t = 0)]
+        catalog_generation: u64,
+    },
+}
+
+/// Local token commands.
+#[derive(Debug, Subcommand)]
+pub enum TokenCommand {
+    /// Signs a token with a local secret file.
+    Issue {
+        /// Hexadecimal HMAC secret file.
+        #[arg(long)]
+        secret_file: PathBuf,
+        /// Principal identifier.
+        #[arg(long)]
+        subject: String,
+        /// Role name. Repeat for multiple roles.
+        #[arg(long = "role", required = true)]
+        roles: Vec<String>,
+        /// Token lifetime in seconds.
+        #[arg(long, default_value_t = DEFAULT_TTL_SECONDS)]
+        ttl: u64,
+    },
+    /// Prints token claims without verifying the signature.
+    Inspect {
+        /// File containing the token. Reads stdin when omitted.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+    },
+    /// Verifies a token signature and prints its claims.
+    Verify {
+        /// Hexadecimal HMAC secret file.
+        #[arg(long)]
+        secret_file: PathBuf,
+        /// Optional previous secret accepted during rotation.
+        #[arg(long)]
+        previous_secret_file: Option<PathBuf>,
+        /// File containing the token. Reads stdin when omitted.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
     },
 }
 

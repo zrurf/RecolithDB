@@ -22,6 +22,8 @@ pub mod opcode {
     pub const BATCH: u16 = 0x0030;
     /// Collection metadata lookup.
     pub const DESCRIBE_COLLECTION: u16 = 0x0050;
+    /// Atomic catalog definition application.
+    pub const CATALOG_APPLY: u16 = 0x0060;
     /// Structured error response.
     pub const ERROR: u16 = 0x0040;
     /// Session shutdown notice.
@@ -68,6 +70,8 @@ pub mod status {
     pub const UNSUPPORTED_ENCODING: u16 = 17;
     /// Compression algorithm is not supported.
     pub const UNSUPPORTED_COMPRESSION: u16 = 18;
+    /// Operation is not valid for the current resource state.
+    pub const FAILED_PRECONDITION: u16 = 19;
 }
 
 /// Capability feature bits used by the handshake.
@@ -88,6 +92,8 @@ pub mod feature {
     pub const SBE: u64 = 1 << 6;
     /// Collection metadata lookup is supported.
     pub const CATALOG_DESCRIBE: u64 = 1 << 7;
+    /// Catalog definition changes are supported.
+    pub const CATALOG_WRITE: u64 = 1 << 8;
 }
 
 /// Compression algorithm bits used by the handshake.

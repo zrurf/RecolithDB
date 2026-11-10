@@ -877,6 +877,7 @@ dependencies = [
  "recolith-model",
  "recolith-protocol",
  "recolith-schema",
+ "recolith-security",
  "recolith-server",
  "recolith-storage",
  "recolith-testkit",
@@ -971,6 +972,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "recolith-security"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
 name = "recolith-server"
 version = "0.1.0"
 dependencies = [
@@ -989,6 +1000,7 @@ dependencies = [
  "recolith-protocol",
  "recolith-query",
  "recolith-schema",
+ "recolith-security",
  "recolith-storage",
  "recolith-testkit",
  "recolith-transaction",

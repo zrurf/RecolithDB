@@ -1,12 +1,14 @@
 //! Local catalog metadata, schema registry, and placement records.
 #![forbid(unsafe_code)]
 
+pub mod apply;
 pub mod catalog;
 pub mod error;
 pub mod placement;
 pub mod schema_registry;
 pub mod store;
 
+pub use apply::CatalogChanges;
 pub use catalog::{Catalog, CatalogSnapshot};
 pub use error::{CatalogError, Result};
 pub use placement::BucketPlacement;

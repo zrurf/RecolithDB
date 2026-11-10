@@ -22,3 +22,25 @@ Named keys and fields are validated against the collection metadata. Numeric
 The example uses the persistent fjall backend under `examples/recolithd/data/`.
 The catalog bootstrap is applied only when the catalog is empty. Later starts reuse
 the persisted catalog.
+
+## Authentication
+
+Generate a secret and uncomment the `[auth]` section in `recolith.toml`:
+
+```text
+openssl rand -hex 32 > secret.hex
+```
+
+```toml
+[auth]
+secret_file = "secret.hex"
+roles_file = "roles.toml"
+```
+
+Issue a token locally:
+
+```text
+cargo run -p recolith-cli --bin recolith -- token issue --secret-file examples/recolithd/secret.hex --subject admin --role admin
+```
+
+Pass it to commands with `--token` or `RECOLITH_TOKEN`.

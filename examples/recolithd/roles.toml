@@ -1,0 +1,11 @@
+[[roles]]
+name = "admin"
+permissions = [{ keyspace = "*", collection = "*", actions = ["admin"] }]
+
+[[roles]]
+name = "game-reader"
+permissions = [{ keyspace = "game", collection = "*", actions = ["read", "describe"] }]
+
+[[roles]]
+name = "game-writer"
+permissions = [{ keyspace = "game", collection = "*", actions = ["read", "write", "describe"] }]

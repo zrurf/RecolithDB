@@ -2,6 +2,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use prost::Message;
 use recolith_backend::StorageBackend;
@@ -12,13 +13,15 @@ use recolith_protocol::frame::{
     FrameCodec, FrameHeader, HEADER_LEN, PayloadEncoding, VERSION_MAJOR, VERSION_MINOR,
 };
 use recolith_protocol::messages::{
-    AuthMethod, AuthResult, DescribeCollectionRequest, DocumentGetRequest, DocumentPutRequest,
-    ErrorResponse, GoAway, HelloRequest, PingRequest, PingResponse, QueryRequest, SecurityMode,
-    WelcomeResponse, compression_bit, feature, opcode, status,
+    AuthMethod, AuthResult, CatalogApplyRequest, DescribeCollectionRequest, DocumentGetRequest,
+    DocumentPutRequest, ErrorResponse, GoAway, HelloRequest, PingRequest, PingResponse,
+    QueryRequest, SecurityMode, WelcomeResponse, compression_bit, feature, opcode, status,
 };
+use recolith_security::{Principal, unix_seconds};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::document::DocumentStore;
+use crate::metrics::ServerMetrics;
 use crate::net::{SERVER_VERSION, ServerConfig};
 
 use super::operations::{self, OperationError, OperationResponse};
@@ -46,6 +49,7 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
         send_error(
             &mut stream,
             &plain,
+            &config.metrics,
             hello_header.request_id(),
             status::INVALID_REQUEST,
             "first frame must be a HELLO request with a non-zero request ID",
@@ -60,6 +64,7 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             send_error(
                 &mut stream,
                 &plain,
+                &config.metrics,
                 hello_header.request_id(),
                 status::INVALID_REQUEST,
                 "malformed HELLO payload",
@@ -72,6 +77,7 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
         send_error(
             &mut stream,
             &plain,
+            &config.metrics,
             hello_header.request_id(),
             status::PROTOCOL_VERSION,
             "no mutually supported protocol version",
@@ -79,17 +85,21 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
         .await?;
         return Ok(());
     }
-    if let Err((code, message)) = authenticate(&hello, &config, peer, security) {
-        send_error(
-            &mut stream,
-            &plain,
-            hello_header.request_id(),
-            code,
-            &message,
-        )
-        .await?;
-        return Ok(());
-    }
+    let principal = match authenticate(&hello, &config, peer, security) {
+        Ok(principal) => principal,
+        Err((code, message)) => {
+            send_error(
+                &mut stream,
+                &plain,
+                &config.metrics,
+                hello_header.request_id(),
+                code,
+                &message,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
 
     let algorithm = select_compression(&hello);
     let threshold = select_threshold(&hello, &config);
@@ -115,7 +125,8 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             | feature::DOCUMENT_WRITE
             | feature::QUERY
             | feature::IDEMPOTENCY
-            | feature::CATALOG_DESCRIBE,
+            | feature::CATALOG_DESCRIBE
+            | feature::CATALOG_WRITE,
         max_frame_size: u32::try_from(max_frame_size).unwrap_or(u32::MAX),
         max_batch_subframes: u32::try_from(max_batch_subframes).unwrap_or(u32::MAX),
         max_batch_bytes: u32::try_from(max_batch_bytes).unwrap_or(u32::MAX),
@@ -145,10 +156,23 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
         let Some((header, payload)) = read_frame(&mut stream, max_frame_size).await? else {
             break;
         };
+        if principal.is_expired(unix_seconds()) {
+            send_error(
+                &mut stream,
+                &codec,
+                &config.metrics,
+                header.request_id(),
+                status::AUTH_FAILED,
+                "token expired",
+            )
+            .await?;
+            break;
+        }
         if header.is_response() || header.status() != 0 || header.stream_id() != 0 {
             send_error(
                 &mut stream,
                 &codec,
+                &config.metrics,
                 header.request_id(),
                 status::INVALID_REQUEST,
                 "invalid request frame",
@@ -160,6 +184,7 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             send_error(
                 &mut stream,
                 &codec,
+                &config.metrics,
                 header.request_id(),
                 status::UNSUPPORTED_ENCODING,
                 "unsupported payload encoding",
@@ -169,20 +194,20 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
         }
 
         let body = codec.decode(&header, &payload)?;
+        if header.opcode() != opcode::BATCH {
+            config.metrics.request(header.opcode());
+        }
         match header.opcode() {
             opcode::PING
             | opcode::DOC_GET
             | opcode::DOC_PUT
             | opcode::QUERY
-            | opcode::DESCRIBE_COLLECTION => {
-                match execute(
-                    header.opcode(),
-                    body,
-                    Arc::clone(&store),
-                    hello.client_id.clone(),
-                )
-                .await
-                {
+            | opcode::DESCRIBE_COLLECTION
+            | opcode::CATALOG_APPLY => {
+                let started = Instant::now();
+                let outcome =
+                    execute(header.opcode(), body, Arc::clone(&store), principal.clone()).await;
+                match outcome {
                     Ok(response) => {
                         write_operation(&mut stream, &codec, header.request_id(), response).await?;
                     }
@@ -190,6 +215,7 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
                         send_error(
                             &mut stream,
                             &codec,
+                            &config.metrics,
                             header.request_id(),
                             error.status(),
                             error.message(),
@@ -197,6 +223,9 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
                         .await?;
                     }
                 }
+                config
+                    .metrics
+                    .observe_latency(header.opcode(), started.elapsed());
             }
             opcode::BATCH => {
                 handle_batch(
@@ -206,7 +235,8 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
                     &body,
                     limits,
                     Arc::clone(&store),
-                    hello.client_id.clone(),
+                    principal.clone(),
+                    Arc::clone(&config.metrics),
                 )
                 .await?;
             }
@@ -230,6 +260,7 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
                 send_error(
                     &mut stream,
                     &codec,
+                    &config.metrics,
                     header.request_id(),
                     status::INVALID_REQUEST,
                     "opcode is not valid for a client request",
@@ -240,6 +271,7 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
                 send_error(
                     &mut stream,
                     &codec,
+                    &config.metrics,
                     header.request_id(),
                     status::UNSUPPORTED_OPCODE,
                     "unknown opcode",
@@ -256,7 +288,7 @@ async fn execute<B: StorageBackend>(
     opcode: u16,
     body: Vec<u8>,
     store: Arc<DocumentStore<B>>,
-    client_id: String,
+    principal: Principal,
 ) -> Result<OperationResponse, OperationError> {
     if opcode == opcode::PING {
         let request = PingRequest::decode(body.as_slice())
@@ -275,22 +307,27 @@ async fn execute<B: StorageBackend>(
         opcode::DOC_GET => {
             let request = DocumentGetRequest::decode(body.as_slice())
                 .map_err(|_| OperationError::invalid("malformed DOC_GET payload"))?;
-            operations::document_get(&store, request)
+            operations::document_get(&store, &principal, request)
         }
         opcode::DOC_PUT => {
             let request = DocumentPutRequest::decode(body.as_slice())
                 .map_err(|_| OperationError::invalid("malformed DOC_PUT payload"))?;
-            operations::document_put(&store, &client_id, request)
+            operations::document_put(&store, &principal, request)
         }
         opcode::QUERY => {
             let request = QueryRequest::decode(body.as_slice())
                 .map_err(|_| OperationError::invalid("malformed QUERY payload"))?;
-            operations::query(&store, request)
+            operations::query(&store, &principal, request)
         }
         opcode::DESCRIBE_COLLECTION => {
             let request = DescribeCollectionRequest::decode(body.as_slice())
                 .map_err(|_| OperationError::invalid("malformed DESCRIBE_COLLECTION payload"))?;
-            operations::describe_collection(&store, request)
+            operations::describe_collection(&store, &principal, request)
+        }
+        opcode::CATALOG_APPLY => {
+            let request = CatalogApplyRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed CATALOG_APPLY payload"))?;
+            operations::catalog_apply(&store, &principal, request)
         }
         _ => Err(OperationError::internal("unsupported operation")),
     })
@@ -308,6 +345,7 @@ async fn write_operation<W: AsyncWrite + Unpin>(
     write_frame(writer, codec, &header, &response.payload).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_batch<B: StorageBackend, W: AsyncWrite + Unpin>(
     writer: &mut W,
     codec: &FrameCodec,
@@ -315,7 +353,8 @@ async fn handle_batch<B: StorageBackend, W: AsyncWrite + Unpin>(
     body: &[u8],
     limits: BatchLimits,
     store: Arc<DocumentStore<B>>,
-    client_id: String,
+    principal: Principal,
+    metrics: Arc<ServerMetrics>,
 ) -> Result<(), SessionError> {
     let subframes = match decode_batch(body, limits) {
         Ok(subframes) => subframes,
@@ -323,6 +362,7 @@ async fn handle_batch<B: StorageBackend, W: AsyncWrite + Unpin>(
             send_error(
                 writer,
                 codec,
+                &metrics,
                 header.request_id(),
                 status::INVALID_REQUEST,
                 &error.to_string(),
@@ -333,11 +373,25 @@ async fn handle_batch<B: StorageBackend, W: AsyncWrite + Unpin>(
     };
 
     for subframe in subframes {
+        if subframe.opcode() == opcode::CATALOG_APPLY {
+            send_error(
+                writer,
+                codec,
+                &metrics,
+                subframe.request_id(),
+                status::INVALID_REQUEST,
+                "CATALOG_APPLY is not allowed in a batch",
+            )
+            .await?;
+            continue;
+        }
+        metrics.request(subframe.opcode());
+        let started = Instant::now();
         match execute(
             subframe.opcode(),
             subframe.payload().to_vec(),
             Arc::clone(&store),
-            client_id.clone(),
+            principal.clone(),
         )
         .await
         {
@@ -348,6 +402,7 @@ async fn handle_batch<B: StorageBackend, W: AsyncWrite + Unpin>(
                 send_error(
                     writer,
                     codec,
+                    &metrics,
                     subframe.request_id(),
                     error.status(),
                     error.message(),
@@ -355,6 +410,7 @@ async fn handle_batch<B: StorageBackend, W: AsyncWrite + Unpin>(
                 .await?;
             }
         }
+        metrics.observe_latency(subframe.opcode(), started.elapsed());
     }
 
     Ok(())
@@ -407,10 +463,12 @@ async fn write_frame<W: AsyncWrite + Unpin>(
 async fn send_error<W: AsyncWrite + Unpin>(
     writer: &mut W,
     codec: &FrameCodec,
+    metrics: &ServerMetrics,
     request_id: u64,
     code: u16,
     message: &str,
 ) -> Result<(), SessionError> {
+    metrics.error();
     let payload = ErrorResponse {
         message: message.to_owned(),
         retryable: false,
@@ -436,13 +494,29 @@ fn authenticate(
     config: &ServerConfig,
     peer: SocketAddr,
     security: SecurityMode,
-) -> Result<(), (u16, String)> {
+) -> Result<Principal, (u16, String)> {
     if security == SecurityMode::None && !peer.ip().is_loopback() && !config.allow_plaintext_remote
     {
         return Err((
             status::AUTH_FAILED,
             "plaintext remote sessions are disabled".to_owned(),
         ));
+    }
+
+    if let Some(authenticator) = &config.auth {
+        if hello.auth_method != AuthMethod::Bearer as i32 {
+            return Err((status::AUTH_FAILED, "authentication failed".to_owned()));
+        }
+        let token = std::str::from_utf8(&hello.auth_token)
+            .map_err(|_| (status::AUTH_FAILED, "authentication failed".to_owned()))?;
+        let principal = authenticator
+            .authenticate(token, unix_seconds())
+            .map_err(|error| {
+                tracing::debug!(%error, "token authentication failed");
+                (status::AUTH_FAILED, "authentication failed".to_owned())
+            })?;
+
+        return Ok(principal);
     }
 
     match &config.auth_token {
@@ -452,6 +526,8 @@ fn authenticate(
             {
                 return Err((status::AUTH_FAILED, "authentication failed".to_owned()));
             }
+
+            Ok(Principal::admin("admin"))
         }
         None => {
             if hello.auth_method != AuthMethod::None as i32 {
@@ -460,10 +536,10 @@ fn authenticate(
                     "server does not accept bearer tokens".to_owned(),
                 ));
             }
+
+            Ok(Principal::anonymous())
         }
     }
-
-    Ok(())
 }
 
 fn select_compression(hello: &HelloRequest) -> CompressionAlgorithm {

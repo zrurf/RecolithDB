@@ -2,6 +2,19 @@ use recolith_common::{BucketId, IndexId, PartitionId};
 
 use crate::encoding::key::encode_partition_prefix;
 
+pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    for index in (0..end.len()).rev() {
+        if end[index] != u8::MAX {
+            end[index] += 1;
+            end.truncate(index + 1);
+            return Some(end);
+        }
+    }
+
+    None
+}
+
 /// Encodes the prefix shared by every entry of one index in a bucket partition.
 #[must_use]
 pub fn encode_index_prefix(bucket: BucketId, partition: PartitionId, index: IndexId) -> Vec<u8> {

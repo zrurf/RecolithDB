@@ -6,7 +6,7 @@ use recolith_protocol::messages::{
     RequestMeta, Value, value,
 };
 
-use crate::args::{Args, Command, DocCommand};
+use crate::args::{Args, Command, DocCommand, TokenCommand};
 use crate::error::CliError;
 use crate::format::{format_collection, format_document, format_fragments_named};
 use crate::hex;
@@ -18,6 +18,37 @@ use crate::metadata;
 ///
 /// Returns [`CliError`] for invalid parameters or client failures.
 pub async fn run(args: Args) -> Result<(), CliError> {
+    if let Command::Token { command } = &args.command {
+        match command {
+            TokenCommand::Issue {
+                secret_file,
+                subject,
+                roles,
+                ttl,
+            } => println!(
+                "{}",
+                crate::token::issue(secret_file, subject.clone(), roles.clone(), *ttl)?
+            ),
+            TokenCommand::Inspect { token_file } => {
+                let claims = crate::token::inspect(token_file.as_deref())?;
+                print!("{}", crate::token::format_claims(&claims, false));
+            }
+            TokenCommand::Verify {
+                secret_file,
+                previous_secret_file,
+                token_file,
+            } => {
+                let claims = crate::token::verify(
+                    secret_file,
+                    previous_secret_file.as_deref(),
+                    token_file.as_deref(),
+                )?;
+                print!("{}", crate::token::format_claims(&claims, true));
+            }
+        }
+        return Ok(());
+    }
+
     let mut config = ClientConfig::new(args.endpoint)
         .with_connect_timeout(Some(Duration::from_secs(args.timeout_secs)))
         .with_request_timeout(Some(Duration::from_secs(args.timeout_secs)));
@@ -65,6 +96,12 @@ pub async fn run(args: Args) -> Result<(), CliError> {
         } => {
             let collection = describe(&mut client, &collection, keyspace.as_deref()).await?;
             print!("{}", format_collection(&collection));
+        }
+        Command::Token { .. } => {}
+        Command::Catalog { command } => {
+            let request = crate::catalog::request(command)?;
+            let response = client.apply_catalog(&request).await?;
+            println!("catalog generation: {}", response.catalog_generation);
         }
         Command::Doc { command } => match command {
             DocCommand::Get {

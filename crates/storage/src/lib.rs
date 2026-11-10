@@ -14,8 +14,8 @@ pub mod value;
 pub use codec::{decode_fields, encode_fields};
 pub use commit::CommitClock;
 pub use document::{
-    DocumentFragments, FragmentData, FragmentMode, FragmentReader, IndexFilter, read_document,
-    read_fragment,
+    DocumentFragments, FragmentData, FragmentMode, FragmentReader, IndexBound, IndexFilter,
+    read_document, read_fragment,
 };
 pub use encoding::document_key::{MAX_DOCUMENT_KEY_LEN, encode_document_key};
 pub use encoding::key::{
@@ -30,6 +30,6 @@ pub use record::{DecodedRecord, HEADER_LEN, RecordHeader, crc32c, decode_record,
 pub use store::{
     StoredRecord, delete_index_entry, delete_record, get_record, get_record_from_snapshot,
     put_index_entry, put_unique_index_entry, read_fields, read_fields_from_snapshot, scan_index,
-    write_fields,
+    scan_index_components, scan_index_range, write_fields,
 };
 pub use value::{RecordData, Value};

@@ -9,7 +9,7 @@ use crate::codec::decode_fields;
 use crate::encoding::key::{encode_document_prefix, encode_record_key};
 use crate::error::{Result, StorageError};
 use crate::record::{RecordHeader, decode_record};
-use crate::store::index::scan_index;
+use crate::store::index::{scan_index, scan_index_components, scan_index_range};
 use crate::store::record::ensure_schema;
 use crate::value::RecordData;
 
@@ -22,33 +22,128 @@ pub enum FragmentMode {
     Many,
 }
 
-/// Index equality lookup applied while reading a `many` fragment.
+/// One bound of an encoded index range.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IndexFilter {
-    index: IndexId,
+pub struct IndexBound {
     encoded_values: Vec<u8>,
+    inclusive: bool,
 }
 
-impl IndexFilter {
-    /// Creates an index equality filter from already encoded index values.
+impl IndexBound {
+    /// Creates an index bound from already encoded index values.
     #[must_use]
-    pub fn new(index: IndexId, encoded_values: impl Into<Vec<u8>>) -> Self {
+    pub fn new(encoded_values: impl Into<Vec<u8>>, inclusive: bool) -> Self {
         Self {
-            index,
             encoded_values: encoded_values.into(),
+            inclusive,
         }
-    }
-
-    /// Returns the index identifier.
-    #[must_use]
-    pub fn index(&self) -> IndexId {
-        self.index
     }
 
     /// Returns the encoded index values.
     #[must_use]
     pub fn encoded_values(&self) -> &[u8] {
         &self.encoded_values
+    }
+
+    /// Returns whether the bound is inclusive.
+    #[must_use]
+    pub const fn inclusive(&self) -> bool {
+        self.inclusive
+    }
+}
+
+/// Index lookup applied while reading a `many` fragment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndexFilter {
+    /// Equality lookup on encoded index values.
+    Equality {
+        /// Index identifier.
+        index: IndexId,
+        /// Encoded index values.
+        encoded_values: Vec<u8>,
+        /// Number of index components before the record key.
+        components: usize,
+    },
+    /// Ordered range lookup on encoded index values.
+    Range {
+        /// Index identifier.
+        index: IndexId,
+        /// Lower bound.
+        lower: Option<IndexBound>,
+        /// Upper bound.
+        upper: Option<IndexBound>,
+        /// Number of index components before the record key.
+        components: usize,
+    },
+}
+
+impl IndexFilter {
+    /// Creates an index equality filter from already encoded index values.
+    #[must_use]
+    pub fn new(index: IndexId, encoded_values: impl Into<Vec<u8>>) -> Self {
+        Self::new_with_components(index, encoded_values, 1)
+    }
+
+    /// Creates an equality filter with an explicit component count.
+    #[must_use]
+    pub fn new_with_components(
+        index: IndexId,
+        encoded_values: impl Into<Vec<u8>>,
+        components: usize,
+    ) -> Self {
+        Self::Equality {
+            index,
+            encoded_values: encoded_values.into(),
+            components,
+        }
+    }
+
+    /// Creates an index range filter from already encoded bounds.
+    #[must_use]
+    pub fn range(index: IndexId, lower: Option<IndexBound>, upper: Option<IndexBound>) -> Self {
+        Self::range_with_components(index, lower, upper, 1)
+    }
+
+    /// Creates a range filter with an explicit component count.
+    #[must_use]
+    pub fn range_with_components(
+        index: IndexId,
+        lower: Option<IndexBound>,
+        upper: Option<IndexBound>,
+        components: usize,
+    ) -> Self {
+        Self::Range {
+            index,
+            lower,
+            upper,
+            components,
+        }
+    }
+
+    /// Returns the index identifier.
+    #[must_use]
+    pub const fn index(&self) -> IndexId {
+        match self {
+            Self::Equality { index, .. } | Self::Range { index, .. } => *index,
+        }
+    }
+
+    /// Returns equality values, if this is an equality filter.
+    #[must_use]
+    pub fn encoded_values(&self) -> Option<&[u8]> {
+        match self {
+            Self::Equality { encoded_values, .. } => Some(encoded_values),
+            Self::Range { .. } => None,
+        }
+    }
+
+    /// Returns range bounds, if this is a range filter.
+    #[must_use]
+    pub fn bounds(&self) -> Option<(Option<&IndexBound>, Option<&IndexBound>)> {
+        match self {
+            Self::Equality { .. } => None,
+            Self::Range { lower, upper, .. } => Some((lower.as_ref(), upper.as_ref())),
+        }
     }
 }
 
@@ -60,7 +155,7 @@ pub struct FragmentReader {
     fragment: FragmentId,
     mode: FragmentMode,
     schema: RecordSchema,
-    index: Option<IndexFilter>,
+    indexes: Vec<IndexFilter>,
 }
 
 impl FragmentReader {
@@ -79,7 +174,7 @@ impl FragmentReader {
             fragment,
             mode,
             schema,
-            index: None,
+            indexes: Vec::new(),
         }
     }
 
@@ -88,7 +183,52 @@ impl FragmentReader {
     /// The index is ignored for `one` fragments.
     #[must_use]
     pub fn with_index(mut self, index: IndexId, encoded_values: impl Into<Vec<u8>>) -> Self {
-        self.index = Some(IndexFilter::new(index, encoded_values));
+        self.indexes.push(IndexFilter::new(index, encoded_values));
+        self
+    }
+
+    /// Reads a `many` fragment through an index equality lookup with a component count.
+    #[must_use]
+    pub fn with_index_components(
+        mut self,
+        index: IndexId,
+        encoded_values: impl Into<Vec<u8>>,
+        components: usize,
+    ) -> Self {
+        self.indexes.push(IndexFilter::new_with_components(
+            index,
+            encoded_values,
+            components,
+        ));
+        self
+    }
+
+    /// Reads a `many` fragment through a single-field index range.
+    ///
+    /// The index is ignored for `one` fragments.
+    #[must_use]
+    pub fn with_index_range(
+        mut self,
+        index: IndexId,
+        lower: Option<IndexBound>,
+        upper: Option<IndexBound>,
+    ) -> Self {
+        self.indexes.push(IndexFilter::range(index, lower, upper));
+        self
+    }
+
+    /// Reads a `many` fragment through a range filter with a component count.
+    #[must_use]
+    pub fn with_index_range_components(
+        mut self,
+        index: IndexId,
+        lower: Option<IndexBound>,
+        upper: Option<IndexBound>,
+        components: usize,
+    ) -> Self {
+        self.indexes.push(IndexFilter::range_with_components(
+            index, lower, upper, components,
+        ));
         self
     }
 
@@ -98,10 +238,16 @@ impl FragmentReader {
         self.fragment
     }
 
-    /// Returns the index filter, if any.
+    /// Returns the first index filter, if any.
     #[must_use]
     pub fn index_filter(&self) -> Option<&IndexFilter> {
-        self.index.as_ref()
+        self.indexes.first()
+    }
+
+    /// Returns all index filters.
+    #[must_use]
+    pub fn index_filters(&self) -> &[IndexFilter] {
+        &self.indexes
     }
 }
 
@@ -193,10 +339,13 @@ pub fn read_fragment<S: Snapshot>(
 ) -> Result<Vec<FragmentData>> {
     match fragment.mode {
         FragmentMode::One => read_one(snapshot, document_key, fragment),
-        FragmentMode::Many => match fragment.index_filter() {
-            Some(filter) => read_many_by_index(snapshot, document_key, fragment, filter),
-            None => read_many(snapshot, document_key, fragment),
-        },
+        FragmentMode::Many => {
+            if fragment.index_filters().is_empty() {
+                read_many(snapshot, document_key, fragment)
+            } else {
+                read_many_by_indexes(snapshot, document_key, fragment)
+            }
+        }
     }
 }
 
@@ -251,21 +400,98 @@ fn read_many<S: Snapshot>(
     Ok(records)
 }
 
-fn read_many_by_index<S: Snapshot>(
+fn read_many_by_indexes<S: Snapshot>(
     snapshot: &S,
     document_key: &[u8],
     fragment: &FragmentReader,
+) -> Result<Vec<FragmentData>> {
+    let mut filters = fragment.index_filters().iter();
+    let Some(first) = filters.next() else {
+        return read_many(snapshot, document_key, fragment);
+    };
+    let first_keys = scan_index_filter(snapshot, fragment, first)?;
+    let mut allowed: Option<BTreeSet<Vec<u8>>> = None;
+    for filter in filters {
+        let keys = scan_index_filter(snapshot, fragment, filter)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        allowed = Some(match allowed {
+            Some(current) => current.intersection(&keys).cloned().collect(),
+            None => keys,
+        });
+    }
+    let record_keys = match allowed {
+        Some(allowed) => first_keys
+            .into_iter()
+            .filter(|key| allowed.contains(key))
+            .collect(),
+        None => first_keys,
+    };
+
+    read_many_by_record_keys(snapshot, document_key, fragment, record_keys)
+}
+
+fn scan_index_filter<S: Snapshot>(
+    snapshot: &S,
+    fragment: &FragmentReader,
     filter: &IndexFilter,
+) -> Result<Vec<Vec<u8>>> {
+    match filter {
+        IndexFilter::Equality {
+            index,
+            encoded_values,
+            components,
+        } => {
+            if *components == 1 {
+                scan_index(
+                    snapshot,
+                    fragment.bucket,
+                    fragment.partition,
+                    *index,
+                    encoded_values,
+                    ScanOptions::default(),
+                )
+            } else {
+                scan_index_components(
+                    snapshot,
+                    fragment.bucket,
+                    fragment.partition,
+                    *index,
+                    encoded_values,
+                    *components,
+                    ScanOptions::default(),
+                )
+            }
+        }
+        IndexFilter::Range {
+            index,
+            lower,
+            upper,
+            components,
+        } => scan_index_range(
+            snapshot,
+            fragment.bucket,
+            fragment.partition,
+            *index,
+            lower
+                .as_ref()
+                .map(|bound| (bound.encoded_values(), bound.inclusive())),
+            upper
+                .as_ref()
+                .map(|bound| (bound.encoded_values(), bound.inclusive())),
+            *components,
+            ScanOptions::default(),
+        ),
+    }
+}
+
+fn read_many_by_record_keys<S: Snapshot>(
+    snapshot: &S,
+    document_key: &[u8],
+    fragment: &FragmentReader,
+    record_keys: Vec<Vec<u8>>,
 ) -> Result<Vec<FragmentData>> {
     let prefix = fragment_prefix(fragment, document_key);
-    let record_keys = scan_index(
-        snapshot,
-        fragment.bucket,
-        fragment.partition,
-        filter.index(),
-        filter.encoded_values(),
-        ScanOptions::default(),
-    )?;
     let mut records = Vec::with_capacity(record_keys.len());
 
     for record_key in record_keys {
