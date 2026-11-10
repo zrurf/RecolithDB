@@ -1,7 +1,7 @@
 use std::fmt;
 
 use recolith_client::ClientError;
-use recolith_security::TokenError;
+use recolith_security::{SecurityError, TokenError};
 
 /// Command-line failure.
 #[derive(Debug)]
@@ -33,6 +33,8 @@ pub enum CliError {
     Client(ClientError),
     /// Token issuance failed.
     Token(TokenError),
+    /// Authentication file handling failed.
+    Security(SecurityError),
     /// Token lifetime is invalid.
     InvalidTtl,
     /// The token input is empty.
@@ -73,6 +75,7 @@ impl fmt::Display for CliError {
             Self::EmptyIdempotencyKey => formatter.write_str("idempotency key must not be empty"),
             Self::Client(error) => error.fmt(formatter),
             Self::Token(error) => error.fmt(formatter),
+            Self::Security(error) => error.fmt(formatter),
             Self::InvalidTtl => formatter.write_str("token lifetime overflows the timestamp"),
             Self::EmptyToken => formatter.write_str("token input is empty"),
             Self::Io(error) => write!(formatter, "I/O error: {error}"),
@@ -85,6 +88,7 @@ impl std::error::Error for CliError {
         match self {
             Self::Client(error) => Some(error),
             Self::Token(error) => Some(error),
+            Self::Security(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::IncompleteTls
             | Self::InvalidParameter(_)
@@ -110,6 +114,12 @@ impl From<ClientError> for CliError {
 impl From<TokenError> for CliError {
     fn from(error: TokenError) -> Self {
         Self::Token(error)
+    }
+}
+
+impl From<SecurityError> for CliError {
+    fn from(error: SecurityError) -> Self {
+        Self::Security(error)
     }
 }
 

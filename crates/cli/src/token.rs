@@ -3,7 +3,8 @@ use std::io::Read;
 use std::path::Path;
 
 use recolith_security::{
-    TokenClaims, TokenIssuer, TokenVerifier, fingerprint_hex, token_fingerprint, unix_seconds,
+    RevocationList, TokenClaims, TokenIssuer, TokenVerifier, fingerprint_hex, token_fingerprint,
+    unix_seconds,
 };
 
 use crate::error::CliError;
@@ -27,21 +28,25 @@ pub(crate) fn issue(
     Ok(issuer.issue(&claims)?)
 }
 
-pub(crate) fn inspect(token_file: Option<&Path>) -> Result<TokenClaims, CliError> {
+pub(crate) fn inspect(token_file: Option<&Path>) -> Result<(TokenClaims, String), CliError> {
     let token = read_token(token_file)?;
+    let fingerprint = fingerprint_hex(&token_fingerprint(&token));
+    let claims = TokenVerifier::decode_unverified(&token)?;
 
-    Ok(TokenVerifier::decode_unverified(&token)?)
+    Ok((claims, fingerprint))
 }
 
 pub(crate) fn verify(
     secret_file: &Path,
     previous_secret_file: Option<&Path>,
     token_file: Option<&Path>,
-) -> Result<TokenClaims, CliError> {
+) -> Result<(TokenClaims, String), CliError> {
     let token = read_token(token_file)?;
+    let fingerprint = fingerprint_hex(&token_fingerprint(&token));
     let verifier = TokenVerifier::from_secret_files(secret_file, previous_secret_file)?;
+    let claims = verifier.verify(&token, unix_seconds())?;
 
-    Ok(verifier.verify(&token, unix_seconds())?)
+    Ok((claims, fingerprint))
 }
 
 pub(crate) fn hash(token_file: Option<&Path>) -> Result<String, CliError> {
@@ -50,7 +55,24 @@ pub(crate) fn hash(token_file: Option<&Path>) -> Result<String, CliError> {
     Ok(fingerprint_hex(&token_fingerprint(&token)))
 }
 
-pub(crate) fn format_claims(claims: &TokenClaims, verified: bool) -> String {
+pub(crate) fn revoke(
+    token_file: Option<&Path>,
+    revoked_file: &Path,
+) -> Result<(bool, String), CliError> {
+    let token = read_token(token_file)?;
+    let fingerprint = token_fingerprint(&token);
+    let mut list = if revoked_file.exists() {
+        RevocationList::load(revoked_file)?
+    } else {
+        RevocationList::default()
+    };
+    let added = list.insert(fingerprint);
+    fs::write(revoked_file, list.to_toml_string())?;
+
+    Ok((added, fingerprint_hex(&fingerprint)))
+}
+
+pub(crate) fn format_claims(claims: &TokenClaims, verified: bool, fingerprint: &str) -> String {
     let now = unix_seconds();
     let status = if claims.expires_at <= now {
         "expired"
@@ -63,6 +85,7 @@ subject: {}
 roles: {}
 issued_at: {}
 expires_at: {} ({status})
+fingerprint: {fingerprint}
 ",
         claims.subject,
         claims.roles.join(", "),

@@ -84,6 +84,7 @@ fn issues_inspects_and_verifies_tokens_without_a_server() {
     assert!(inspected.contains("subject: game-service"));
     assert!(inspected.contains("roles: game-writer"));
     assert!(inspected.contains("(valid)"));
+    assert!(inspected.contains("fingerprint:"));
 
     let verified = recolith()
         .args(["token", "verify", "--secret-file"])
@@ -193,4 +194,46 @@ fn prints_fingerprints_for_revocation() {
     assert!(output.status.success(), "hash failed: {output:?}");
     let printed = String::from_utf8(output.stdout).expect("utf8");
     assert_eq!(printed.trim(), fingerprint_hex(&token_fingerprint(&token)));
+}
+
+#[test]
+fn revokes_tokens_into_a_revocation_file() {
+    let fixture = Fixture::new("revoke");
+    let secret = fixture.secret("secret.hex", "11");
+    let token = issue(&secret);
+    let token_file = fixture.token("token.txt", &token);
+    let revoked = fixture.dir.join("revoked.toml");
+    let fingerprint = fingerprint_hex(&token_fingerprint(&token));
+
+    let output = recolith()
+        .args(["token", "revoke", "--token-file"])
+        .arg(&token_file)
+        .args(["--revoked-file"])
+        .arg(&revoked)
+        .output()
+        .expect("revoke");
+    assert!(output.status.success(), "revoke failed: {output:?}");
+    assert!(
+        String::from_utf8(output.stdout)
+            .expect("utf8")
+            .contains(&fingerprint)
+    );
+    let contents = std::fs::read_to_string(&revoked).expect("revocation file");
+    assert!(contents.contains(&fingerprint));
+
+    let output = recolith()
+        .args(["token", "revoke", "--token-file"])
+        .arg(&token_file)
+        .args(["--revoked-file"])
+        .arg(&revoked)
+        .output()
+        .expect("revoke again");
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .expect("utf8")
+            .contains("already revoked")
+    );
+    let contents = std::fs::read_to_string(&revoked).expect("revocation file");
+    assert_eq!(contents.matches(&fingerprint).count(), 1);
 }

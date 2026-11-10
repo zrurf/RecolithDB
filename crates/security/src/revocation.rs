@@ -7,6 +7,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::roles::SecurityError;
+use crate::token::fingerprint_hex;
 
 /// Set of revoked token SHA-256 fingerprints.
 #[derive(Clone, Debug, Default)]
@@ -70,6 +71,30 @@ impl RevocationList {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.hashes.is_empty()
+    }
+
+    /// Adds a fingerprint and returns whether it was new.
+    pub fn insert(&mut self, fingerprint: [u8; 32]) -> bool {
+        self.hashes.insert(fingerprint)
+    }
+
+    /// Removes a fingerprint and returns whether it was present.
+    pub fn remove(&mut self, fingerprint: &[u8; 32]) -> bool {
+        self.hashes.remove(fingerprint)
+    }
+
+    /// Serializes the list as a TOML document.
+    #[must_use]
+    pub fn to_toml_string(&self) -> String {
+        let mut output = String::from("hashes = [\n");
+        for fingerprint in &self.hashes {
+            output.push_str("  \"");
+            output.push_str(&fingerprint_hex(fingerprint));
+            output.push_str("\",\n");
+        }
+        output.push_str("]\n");
+
+        output
     }
 }
 

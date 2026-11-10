@@ -30,23 +30,40 @@ pub async fn run(args: Args) -> Result<(), CliError> {
                 crate::token::issue(secret_file, subject.clone(), roles.clone(), *ttl)?
             ),
             TokenCommand::Inspect { token_file } => {
-                let claims = crate::token::inspect(token_file.as_deref())?;
-                print!("{}", crate::token::format_claims(&claims, false));
+                let (claims, fingerprint) = crate::token::inspect(token_file.as_deref())?;
+                print!(
+                    "{}",
+                    crate::token::format_claims(&claims, false, &fingerprint)
+                );
             }
             TokenCommand::Verify {
                 secret_file,
                 previous_secret_file,
                 token_file,
             } => {
-                let claims = crate::token::verify(
+                let (claims, fingerprint) = crate::token::verify(
                     secret_file,
                     previous_secret_file.as_deref(),
                     token_file.as_deref(),
                 )?;
-                print!("{}", crate::token::format_claims(&claims, true));
+                print!(
+                    "{}",
+                    crate::token::format_claims(&claims, true, &fingerprint)
+                );
             }
             TokenCommand::Hash { token_file } => {
                 println!("{}", crate::token::hash(token_file.as_deref())?);
+            }
+            TokenCommand::Revoke {
+                token_file,
+                revoked_file,
+            } => {
+                let (added, fingerprint) =
+                    crate::token::revoke(token_file.as_deref(), revoked_file)?;
+                println!(
+                    "{}: {fingerprint}",
+                    if added { "revoked" } else { "already revoked" }
+                );
             }
         }
         return Ok(());

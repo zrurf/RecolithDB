@@ -341,6 +341,15 @@ pub enum TokenCommand {
         #[arg(long)]
         token_file: Option<PathBuf>,
     },
+    /// Adds a token fingerprint to a revocation file.
+    Revoke {
+        /// File containing the token. Reads stdin when omitted.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Revocation list TOML file.
+        #[arg(long)]
+        revoked_file: PathBuf,
+    },
 }
 
 /// Document read and write commands.
