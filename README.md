@@ -83,7 +83,7 @@ RecolithDB is in early single-node development. Implemented today:
 - Schema-aware field codec, record framing, partition-scoped record and index keys, CRC32C checks.
 - Lazy one/many fragment assembly, equality and range index pushdown including composite leading fields, same-fragment multi-index intersection, and range filters.
 - Local transactions, multi-fragment commits with one timestamp, optimistic `if_match`, unique reservation workflow, persistent commit clock.
-- RQL document-query subset: parser, catalog binder, document key encoding, planner, executor, single-document point reads, multi-document scans with primary-key ranges, fragment filters, limits, index pushdown, cursor pagination, and chunked streaming results.
+- RQL document-query subset: parser, catalog binder, document key encoding, planner, executor, single-document point reads, multi-document scans with primary-key ranges, fragment filters, limits, index pushdown, cursor pagination, chunked streaming results, and offline migration for oversized buckets.
 - In-process document service: catalog-bound multi-fragment writes, cardinality and partition validation, multi-fragment reads, and automatic index maintenance with sparse and unique indexes.
 - Protocol frame layer: fixed 38-byte header, CRC32C, zstd/lz4 compression, BATCH codec, Protobuf v1 messages, and collection metadata lookup.
 - TCP session layer: HELLO/WELCOME negotiation, bearer-token auth, compression selection, PING/PONG, BATCH dispatch, and structured errors.
@@ -105,7 +105,7 @@ Not yet implemented:
 
 - Benchmarks on the target hardware profile and compaction tuning.
 - Additional persistent adapters (RocksDB, redb).
-- Offline migration for buckets beyond the synchronous limit, streaming flow control, and broader CLI administration.
+- Streaming flow control and broader CLI administration.
 - Distributed placement, replication, and cross-partition workflows.
 
 ## Quick Start
@@ -274,6 +274,16 @@ Indexes can be redefined in place; old entries are removed and the new definitio
 ```text
 cargo run -p recolith-cli --bin recolith -- catalog alter-index --bucket-id 1 --index-id 1 --name by-name --kind equality --field 1
 ```
+
+## Offline Migration
+
+Buckets beyond the online 100,000-record / 64 MiB migration limit can be migrated while the server is stopped:
+
+```text
+cargo run -p recolith-server --bin recolith-migrate -- --data-dir examples/recolithd/data --bucket-id 1 --schema-version 3 --default 3=string:migrated --batch-size 1000
+```
+
+Mappings use the same forms as `catalog alter-bucket-schema`: `--mapping to=from`, `--convert to=from:conversion`, and `--default to=type:value`. The tool writes a maintenance marker; `recolithd` refuses to start until the migration completes. Batches are transactional and resumable, and re-running skips records already on the target schema version. The catalog version is updated only after the whole bucket is scanned.
 
 ## Build
 

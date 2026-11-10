@@ -43,6 +43,11 @@ backend-rocksdb = ["dep:recolith-backend-rocksdb"]
 backend-fjall = ["dep:recolith-backend-fjall"]
 backend-redb = ["dep:recolith-backend-redb"]
 
+[[bin]]
+name = "recolith-migrate"
+path = "src/bin/recolith-migrate.rs"
+required-features = ["backend-fjall"]
+
 [dev-dependencies]
 recolith-backend-fjall.workspace = true
 recolith-testkit.workspace = true

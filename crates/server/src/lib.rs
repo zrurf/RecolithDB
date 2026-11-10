@@ -8,6 +8,7 @@ pub mod document;
 pub mod metrics;
 pub mod migration;
 pub mod net;
+pub mod offline_migration;
 mod query_cursor;
 
 pub use backup::{BackupError, BackupStats, backup, restore, verify};
@@ -25,3 +26,7 @@ pub use migration::{
     migrate_record,
 };
 pub use net::{SERVER_VERSION, ServerConfig, TlsServerConfig, serve, serve_with_shutdown};
+pub use offline_migration::{
+    DEFAULT_MIGRATION_BATCH, MigrationBatch, MigrationStats, OfflineMigration,
+    OfflineMigrationError, migration_in_progress,
+};

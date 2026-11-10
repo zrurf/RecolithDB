@@ -19,7 +19,7 @@ struct Entry {
 }
 
 /// In-memory ordered transactional backend.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MemoryBackend {
     state: Arc<Mutex<Arc<State>>>,
     capabilities: Capabilities,
