@@ -9,6 +9,7 @@ use recolith_storage::{StorageError, Value, encode_document_key};
 
 use super::ast::{RqlDocumentQuery, RqlLiteral, RqlOp, RqlOperand, RqlPath};
 use crate::ir::{DocumentQuery, FieldSelection, Filter, FilterOp};
+use crate::scan::{BoundQuery, DocumentScan, KeyFilter};
 
 /// RQL binding error.
 #[derive(Debug)]
@@ -27,6 +28,8 @@ pub enum RqlBindError {
     MissingKeyField(String),
     /// A document key field is bound more than once.
     DuplicateKeyField(String),
+    /// The query does not bind a single document.
+    NotPointQuery,
     /// A bind parameter has no value.
     MissingParameter(String),
     /// A literal does not fit the target field type.
@@ -57,6 +60,7 @@ impl fmt::Display for RqlBindError {
             Self::DuplicateKeyField(name) => {
                 write!(formatter, "duplicate document key field: {name}")
             }
+            Self::NotPointQuery => formatter.write_str("query does not bind a single document"),
             Self::MissingParameter(name) => write!(formatter, "missing bind parameter: {name}"),
             Self::InvalidLiteral { field, expected } => {
                 write!(
@@ -117,12 +121,12 @@ struct BoundFragment<'a> {
 ///
 /// Returns [`RqlBindError`] for unknown names, missing parameters, value type
 /// mismatches, or an incomplete document key.
-pub fn bind_document_query(
+pub fn bind_query(
     catalog: &CatalogSnapshot,
     query: &RqlDocumentQuery,
     partition: PartitionId,
     parameters: &BindParameters,
-) -> Result<DocumentQuery, RqlBindError> {
+) -> Result<BoundQuery, RqlBindError> {
     let collection = catalog
         .collection_by_name(query.collection())
         .ok_or_else(|| RqlBindError::UnknownCollection(query.collection().to_owned()))?;
@@ -149,7 +153,10 @@ pub fn bind_document_query(
         }
     }
 
-    let mut key_values: Vec<Option<KeyValue>> = vec![None; collection.key_schema().fields().len()];
+    let mut key_filters = Vec::new();
+    let mut point_values: Vec<Option<KeyValue>> =
+        vec![None; collection.key_schema().fields().len()];
+    let mut point = true;
     for predicate in query.predicates() {
         if let Some(fragment) = predicate.path().fragment() {
             let bound = fragment_by_name(&fragments, fragment)?;
@@ -184,35 +191,69 @@ pub fn bind_document_query(
                 .iter()
                 .position(|field| field.name() == key_field.name())
                 .expect("key field came from the schema");
-            if key_values[index].is_some() {
-                return Err(RqlBindError::DuplicateKeyField(key_field.name().to_owned()));
+            let op = filter_op(predicate.op());
+            let value = resolve_key_value(parameters, predicate.operand(), key_field)?;
+            if op == FilterOp::Eq && point_values[index].is_none() {
+                point_values[index] = Some(value.clone());
+            } else {
+                point = false;
             }
-            key_values[index] = Some(resolve_key_value(
-                parameters,
-                predicate.operand(),
-                key_field,
-            )?);
+            key_filters.push(KeyFilter::new(index, op, value));
         }
     }
 
-    let mut ordered = Vec::with_capacity(key_values.len());
-    for (field, value) in collection.key_schema().fields().iter().zip(key_values) {
-        ordered.push(value.ok_or_else(|| RqlBindError::MissingKeyField(field.name().to_owned()))?);
-    }
-    let key = encode_document_key(collection.key_schema(), &ordered)?;
+    if point && point_values.iter().all(Option::is_some) {
+        let mut ordered = Vec::with_capacity(point_values.len());
+        for value in point_values {
+            ordered.push(value.expect("point values are complete"));
+        }
+        let key = encode_document_key(collection.key_schema(), &ordered)?;
+        let mut document_query = DocumentQuery::new(collection.id(), key, partition);
+        for fragment in selected {
+            document_query = document_query.with_fragment(fragment);
+        }
+        for projection in projections {
+            document_query = document_query.with_projection(projection);
+        }
+        for filter in filters {
+            document_query = document_query.with_filter(filter);
+        }
 
-    let mut document_query = DocumentQuery::new(collection.id(), key, partition);
+        return Ok(BoundQuery::Document(document_query));
+    }
+
+    let mut scan = DocumentScan::new(collection.id(), partition, collection.key_schema().clone());
     for fragment in selected {
-        document_query = document_query.with_fragment(fragment);
+        scan = scan.with_fragment(fragment);
     }
     for projection in projections {
-        document_query = document_query.with_projection(projection);
+        scan = scan.with_projection(projection);
     }
     for filter in filters {
-        document_query = document_query.with_filter(filter);
+        scan = scan.with_filter(filter);
+    }
+    for filter in key_filters {
+        scan = scan.with_key_filter(filter);
     }
 
-    Ok(document_query)
+    Ok(BoundQuery::Scan(scan))
+}
+
+/// Binds a query that must resolve to one document.
+///
+/// # Errors
+///
+/// Returns [`RqlBindError`] for binding failures or when the query is a scan.
+pub fn bind_document_query(
+    catalog: &CatalogSnapshot,
+    query: &RqlDocumentQuery,
+    partition: PartitionId,
+    parameters: &BindParameters,
+) -> Result<DocumentQuery, RqlBindError> {
+    match bind_query(catalog, query, partition, parameters)? {
+        BoundQuery::Document(query) => Ok(query),
+        BoundQuery::Scan(_) => Err(RqlBindError::NotPointQuery),
+    }
 }
 
 fn bind_fragments<'a>(

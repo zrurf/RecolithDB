@@ -1,6 +1,7 @@
+use std::cmp::Ordering;
 use std::fmt;
 
-use recolith_common::bytes::put_ordered_bytes;
+use recolith_common::bytes::{get_ordered_bytes, put_ordered_bytes};
 
 /// Maximum canonical document key length in bytes.
 pub const MAX_DOCUMENT_KEY_LEN: usize = 256;
@@ -31,6 +32,8 @@ pub enum DocumentKeyError {
         /// Maximum length.
         limit: usize,
     },
+    /// Encoded key bytes are malformed or have trailing data.
+    InvalidEncoding,
 }
 
 impl fmt::Display for DocumentKeyError {
@@ -52,6 +55,7 @@ impl fmt::Display for DocumentKeyError {
                     "document key is {length} bytes, limit is {limit}"
                 )
             }
+            Self::InvalidEncoding => formatter.write_str("document key encoding is invalid"),
         }
     }
 }
@@ -199,6 +203,64 @@ impl DocumentKeySchema {
 
         Ok(output)
     }
+
+    /// Decodes canonical ordered bytes into typed key values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentKeyError::InvalidEncoding`] for malformed or trailing bytes.
+    pub fn decode(&self, bytes: &[u8]) -> Result<Vec<KeyValue>, DocumentKeyError> {
+        let mut values = Vec::with_capacity(self.fields.len());
+        let mut offset = 0;
+        for field in &self.fields {
+            let value = match field.ty() {
+                KeyType::U64 => {
+                    let raw = read_fixed::<8>(bytes, &mut offset)?;
+                    KeyValue::U64(u64::from_be_bytes(raw))
+                }
+                KeyType::I64 => {
+                    let raw = read_fixed::<8>(bytes, &mut offset)?;
+                    KeyValue::I64((u64::from_be_bytes(raw) ^ 0x8000_0000_0000_0000) as i64)
+                }
+                KeyType::Uuid => KeyValue::Uuid(read_fixed::<16>(bytes, &mut offset)?),
+                KeyType::String => {
+                    let (raw, consumed) = get_ordered_bytes(&bytes[offset..])
+                        .map_err(|_| DocumentKeyError::InvalidEncoding)?;
+                    offset += consumed;
+                    KeyValue::String(
+                        String::from_utf8(raw).map_err(|_| DocumentKeyError::InvalidEncoding)?,
+                    )
+                }
+                KeyType::Bytes => {
+                    let (raw, consumed) = get_ordered_bytes(&bytes[offset..])
+                        .map_err(|_| DocumentKeyError::InvalidEncoding)?;
+                    offset += consumed;
+                    KeyValue::Bytes(raw)
+                }
+            };
+            values.push(value);
+        }
+        if offset != bytes.len() {
+            return Err(DocumentKeyError::InvalidEncoding);
+        }
+
+        Ok(values)
+    }
+}
+
+fn read_fixed<const N: usize>(
+    bytes: &[u8],
+    offset: &mut usize,
+) -> Result<[u8; N], DocumentKeyError> {
+    let end = offset
+        .checked_add(N)
+        .ok_or(DocumentKeyError::InvalidEncoding)?;
+    let raw = bytes
+        .get(*offset..end)
+        .ok_or(DocumentKeyError::InvalidEncoding)?;
+    *offset = end;
+
+    Ok(raw.try_into().expect("fixed length"))
 }
 
 /// Typed value supplied for one document key component.
@@ -214,4 +276,19 @@ pub enum KeyValue {
     Bytes(Vec<u8>),
     /// 128-bit UUID.
     Uuid([u8; 16]),
+}
+
+impl KeyValue {
+    /// Compares two key values of the same type.
+    #[must_use]
+    pub fn compare(&self, other: &Self) -> Option<Ordering> {
+        match (self, other) {
+            (Self::U64(left), Self::U64(right)) => Some(left.cmp(right)),
+            (Self::I64(left), Self::I64(right)) => Some(left.cmp(right)),
+            (Self::String(left), Self::String(right)) => Some(left.cmp(right)),
+            (Self::Bytes(left), Self::Bytes(right)) => Some(left.cmp(right)),
+            (Self::Uuid(left), Self::Uuid(right)) => Some(left.cmp(right)),
+            _ => None,
+        }
+    }
 }

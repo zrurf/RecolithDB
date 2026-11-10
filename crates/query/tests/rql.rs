@@ -157,7 +157,9 @@ mod bind {
     use recolith_storage::{Value, encode_document_key};
 
     use recolith_query::ir::FilterOp;
-    use recolith_query::{BindParameters, RqlBindError, bind_document_query};
+    use recolith_query::{
+        BindParameters, BoundQuery, RqlBindError, bind_document_query, bind_query,
+    };
     use recolith_query::{RqlLiteral, parse_document_query};
 
     fn profile_schema() -> RecordSchema {
@@ -291,7 +293,7 @@ INCLUDE FRAGMENTS profile, items";
     }
 
     #[test]
-    fn requires_every_document_key_field() {
+    fn binds_missing_key_fields_as_scan_queries() {
         let catalog = catalog();
         let snapshot = catalog.snapshot().expect("snapshot");
         let parsed = parse_document_query(
@@ -299,15 +301,15 @@ INCLUDE FRAGMENTS profile, items";
         )
         .expect("parse");
 
-        let error = bind_document_query(
+        let bound = bind_query(
             &snapshot,
             &parsed,
             PartitionId::new(0),
             &BindParameters::new(),
         )
-        .expect_err("missing key");
+        .expect("scan");
 
-        assert!(matches!(error, RqlBindError::MissingKeyField(name) if name == "player_id"));
+        assert!(matches!(bound, BoundQuery::Scan(_)));
     }
 
     #[test]
@@ -371,7 +373,7 @@ INCLUDE FRAGMENTS profile, items";
     }
 
     #[test]
-    fn rejects_duplicate_key_predicates() {
+    fn binds_duplicate_key_predicates_as_scan_queries() {
         let catalog = catalog();
         let snapshot = catalog.snapshot().expect("snapshot");
         let parsed = parse_document_query(
@@ -380,14 +382,17 @@ INCLUDE FRAGMENTS profile, items";
         )
         .expect("parse");
 
-        let error = bind_document_query(
+        let bound = bind_query(
             &snapshot,
             &parsed,
             PartitionId::new(0),
             &BindParameters::new(),
         )
-        .expect_err("duplicate key");
+        .expect("scan");
 
-        assert!(matches!(error, RqlBindError::DuplicateKeyField(field) if field == "player_id"));
+        let BoundQuery::Scan(scan) = bound else {
+            panic!("expected scan");
+        };
+        assert_eq!(scan.key_filters().len(), 2);
     }
 }

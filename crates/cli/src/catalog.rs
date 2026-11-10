@@ -6,10 +6,11 @@ use recolith_model::{
     IndexKind as ModelIndexKind, KeyType as ModelKeyType,
 };
 use recolith_protocol::messages::{
-    BucketDefinition, BucketPolicy, CatalogApplyRequest, CatalogDropRequest, CatalogIndexTarget,
-    CollectionDefinition, FragmentCardinality, FragmentDefinition, IndexDefinition, IndexKind,
-    KeyFieldDefinition, KeyFieldType, KeyspaceDefinition, RequestMeta, SchemaDefinition,
-    catalog_drop_request,
+    BucketDefinition, BucketPolicy, CatalogAlterRequest, CatalogApplyRequest, CatalogDropRequest,
+    CatalogIndexTarget, CollectionDefinition, FieldConversion, FieldMapping, FragmentCardinality,
+    FragmentDefinition, IndexDefinition, IndexKind, KeyFieldDefinition, KeyFieldType,
+    KeyspaceDefinition, RedefineIndex, RequestMeta, SchemaDefinition, SchemaMigration,
+    SetBucketSchema, Value, catalog_alter_request, catalog_drop_request, field_mapping,
 };
 
 use crate::args::CatalogCommand;
@@ -18,11 +19,50 @@ use crate::error::CliError;
 pub(crate) enum CatalogRequest {
     Apply(CatalogApplyRequest),
     Drop(CatalogDropRequest),
+    Alter(CatalogAlterRequest),
 }
 
 pub(crate) fn request(command: CatalogCommand) -> Result<CatalogRequest, CliError> {
     let mut request = CatalogApplyRequest::default();
     match command {
+        CatalogCommand::AlterBucketSchema {
+            bucket_id,
+            schema_version,
+            mappings,
+            conversions,
+            defaults,
+            catalog_generation,
+        } => {
+            return Ok(CatalogRequest::Alter(CatalogAlterRequest {
+                meta: meta(catalog_generation),
+                change: Some(catalog_alter_request::Change::BucketSchema(
+                    SetBucketSchema {
+                        bucket_id,
+                        schema_version,
+                        migration: migration(&mappings, &conversions, &defaults)?,
+                    },
+                )),
+            }));
+        }
+        CatalogCommand::AlterIndex {
+            bucket_id,
+            index_id,
+            name,
+            kind,
+            fields,
+            catalog_generation,
+        } => {
+            return Ok(CatalogRequest::Alter(CatalogAlterRequest {
+                meta: meta(catalog_generation),
+                change: Some(catalog_alter_request::Change::Index(RedefineIndex {
+                    bucket_id,
+                    index_id,
+                    name,
+                    kind: index_kind(&kind)? as i32,
+                    fields,
+                })),
+            }));
+        }
         CatalogCommand::Apply {
             file,
             catalog_generation,
@@ -270,6 +310,76 @@ fn model_index_kind(kind: ModelIndexKind) -> IndexKind {
         ModelIndexKind::Composite => IndexKind::Composite,
         ModelIndexKind::Unique => IndexKind::Unique,
     }
+}
+
+fn migration(
+    mappings: &[String],
+    conversions: &[String],
+    defaults: &[String],
+) -> Result<Option<SchemaMigration>, CliError> {
+    let mut output = Vec::new();
+    for mapping in mappings {
+        let (to, from) = mapping
+            .split_once('=')
+            .ok_or_else(|| invalid_migration(mapping, "to=from"))?;
+        output.push(FieldMapping {
+            to_field: parse_u32(to, mapping)?,
+            source: Some(field_mapping::Source::FromField(parse_u32(from, mapping)?)),
+            conversion: FieldConversion::None as i32,
+        });
+    }
+    for conversion in conversions {
+        let (to, rest) = conversion
+            .split_once('=')
+            .ok_or_else(|| invalid_migration(conversion, "to=from:conversion"))?;
+        let (from, kind) = rest
+            .split_once(':')
+            .ok_or_else(|| invalid_migration(conversion, "to=from:conversion"))?;
+        output.push(FieldMapping {
+            to_field: parse_u32(to, conversion)?,
+            source: Some(field_mapping::Source::FromField(parse_u32(
+                from, conversion,
+            )?)),
+            conversion: conversion_kind(kind)? as i32,
+        });
+    }
+    for default in defaults {
+        let (to, specification) = default
+            .split_once('=')
+            .ok_or_else(|| invalid_migration(default, "to=type:value"))?;
+        let kind = crate::command::parse_typed_value(specification)?;
+        output.push(FieldMapping {
+            to_field: parse_u32(to, default)?,
+            source: Some(field_mapping::Source::DefaultValue(Value {
+                kind: Some(kind),
+            })),
+            conversion: FieldConversion::None as i32,
+        });
+    }
+
+    Ok((!output.is_empty()).then_some(SchemaMigration { mappings: output }))
+}
+
+fn conversion_kind(value: &str) -> Result<FieldConversion, CliError> {
+    match value {
+        "none" => Ok(FieldConversion::None),
+        "i32-i64" => Ok(FieldConversion::I32ToI64),
+        "u32-u64" => Ok(FieldConversion::U32ToU64),
+        "u32-i64" => Ok(FieldConversion::U32ToI64),
+        _ => Err(CliError::InvalidCatalog(format!(
+            "unknown conversion `{value}`; expected none, i32-i64, u32-u64, or u32-i64"
+        ))),
+    }
+}
+
+fn parse_u32(value: &str, original: &str) -> Result<u32, CliError> {
+    value
+        .parse()
+        .map_err(|_| CliError::InvalidCatalog(format!("invalid migration `{original}`")))
+}
+
+fn invalid_migration(value: &str, expected: &str) -> CliError {
+    CliError::InvalidCatalog(format!("invalid migration `{value}`; expected {expected}"))
 }
 
 fn meta(generation: u64) -> Option<RequestMeta> {

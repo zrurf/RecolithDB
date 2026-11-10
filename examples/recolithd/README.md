@@ -35,6 +35,7 @@ openssl rand -hex 32 > secret.hex
 [auth]
 secret_file = "secret.hex"
 roles_file = "roles.toml"
+# revoked_tokens_file = "revoked.toml"
 ```
 
 Issue a token locally:
@@ -42,5 +43,17 @@ Issue a token locally:
 ```text
 cargo run -p recolith-cli --bin recolith -- token issue --secret-file examples/recolithd/secret.hex --subject admin --role admin
 ```
+
+Revoke a token by printing its fingerprint and adding it to `revoked.toml`:
+
+```text
+cargo run -p recolith-cli --bin recolith -- token hash --token-file token.txt
+```
+
+```toml
+hashes = ["0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"]
+```
+
+Roles and revocation files reload when they change; revocation is checked on every request.
 
 Pass it to commands with `--token` or `RECOLITH_TOKEN`.

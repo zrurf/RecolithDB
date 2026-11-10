@@ -9,22 +9,26 @@ use recolith_backend::{
     BackendError, KeyRange, ScanOptions, Snapshot, StorageBackend, Transaction, TxnOptions,
 };
 use recolith_catalog::{
-    Catalog, CatalogChanges, CatalogDrop, CatalogError, CatalogSnapshot, CatalogWrite, save_catalog,
+    Catalog, CatalogAlter, CatalogChanges, CatalogDrop, CatalogError, CatalogSnapshot,
+    CatalogWrite, save_catalog,
 };
 use recolith_common::{
     BucketId, CatalogGeneration, CollectionId, CommitTs, FragmentId, IndexId, PartitionId,
 };
 use recolith_model::{FragmentCardinality, IndexDefinition, IndexKind};
 use recolith_query::{DocumentReadRequest, QueryEngine, QueryError};
-use recolith_schema::RecordSchema;
+use recolith_schema::{Compatibility, RecordSchema, check_compatibility};
 use recolith_storage::{
-    DocumentFragments, MAX_DOCUMENT_KEY_LEN, RecordData, StorageError, decode_fields,
-    decode_record, decode_record_key, encode_bucket_prefix, encode_index_prefix,
-    encode_index_value, encode_record_key, put_index_entry, put_unique_index_entry,
+    DocumentFragments, MAX_DOCUMENT_KEY_LEN, RecordData, RecordHeader, StorageError, decode_fields,
+    decode_record, decode_record_key, delete_index_entry, encode_bucket_prefix, encode_fields,
+    encode_index_prefix, encode_index_value, encode_record, encode_record_key, put_index_entry,
+    put_unique_index_entry,
 };
 use recolith_transaction::{
     BatchedCommitClock, FragmentWrite, IndexUpdate, LocalWritePath, TransactionError,
 };
+
+use crate::migration::{MigrationError, SchemaMigration, migrate_record};
 
 /// One fragment record to write as part of a document.
 #[derive(Clone, Debug)]
@@ -216,6 +220,10 @@ pub enum DocumentError {
     },
     /// The expected catalog generation no longer matches.
     StaleCatalog,
+    /// A schema change requires an explicit migration.
+    MigrationRequired,
+    /// Record migration failed.
+    Migration(MigrationError),
 }
 
 impl fmt::Display for DocumentError {
@@ -242,6 +250,10 @@ impl fmt::Display for DocumentError {
                 "index backfill exceeds limits: {entries} entries, {bytes} bytes"
             ),
             Self::StaleCatalog => formatter.write_str("catalog generation is stale"),
+            Self::MigrationRequired => {
+                formatter.write_str("schema change requires an explicit migration")
+            }
+            Self::Migration(error) => write!(formatter, "migration error: {error}"),
             Self::InvalidRequest(message) => {
                 write!(formatter, "invalid document request: {message}")
             }
@@ -278,6 +290,12 @@ impl From<StorageError> for DocumentError {
 impl From<BackendError> for DocumentError {
     fn from(error: BackendError) -> Self {
         Self::Catalog(CatalogError::Backend(error))
+    }
+}
+
+impl From<MigrationError> for DocumentError {
+    fn from(error: MigrationError) -> Self {
+        Self::Migration(error)
     }
 }
 
@@ -419,6 +437,132 @@ impl<B: StorageBackend> DocumentStore<B> {
         Ok(generation)
     }
 
+    /// Alters one catalog object and optionally migrates bucket records.
+    ///
+    /// Compatible schema changes can switch the bucket version without
+    /// rewriting records. Incompatible changes require a declarative migration
+    /// and rewrite all bucket records in the catalog transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] for missing objects, missing migrations,
+    /// invalid mappings, oversized migrations, conflicts, or backend failures.
+    pub fn alter_catalog(
+        &self,
+        alter: CatalogAlter,
+        migration: Option<&SchemaMigration>,
+        expected: Option<CatalogGeneration>,
+    ) -> Result<CatalogGeneration, DocumentError> {
+        let _ddl = self.ddl_lock.lock().map_err(|_| lock_error())?;
+        let _gate = self.data_gate.write().map_err(|_| lock_error())?;
+        let current = self.catalog();
+        let snapshot = current.snapshot()?;
+        if expected.is_some_and(|generation| generation != snapshot.generation) {
+            return Err(DocumentError::StaleCatalog);
+        }
+        if let CatalogAlter::BucketSchema { bucket, version } = &alter {
+            let current_bucket = snapshot
+                .buckets
+                .get(bucket)
+                .ok_or(DocumentError::MissingMetadata("bucket"))?;
+            if current_bucket.schema_version() == *version {
+                return Ok(snapshot.generation);
+            }
+            if *version < current_bucket.schema_version() {
+                return Err(DocumentError::InvalidRequest(
+                    "schema version must increase".to_owned(),
+                ));
+            }
+        }
+
+        let candidate = current.alter_object(alter.clone())?;
+        let catalog_write = CatalogWrite::prepare(self.backend.as_ref(), &candidate)?;
+        let mut transaction = self.backend.begin(TxnOptions::default())?;
+        let result = (|| -> Result<(), DocumentError> {
+            match &alter {
+                CatalogAlter::BucketSchema { bucket, version } => {
+                    let bucket_meta = snapshot
+                        .buckets
+                        .get(bucket)
+                        .ok_or(DocumentError::MissingMetadata("bucket"))?;
+                    let old_schema = snapshot
+                        .schemas
+                        .schemas
+                        .get(&(bucket_meta.schema_id(), bucket_meta.schema_version()))
+                        .ok_or(DocumentError::MissingMetadata("schema"))?;
+                    let new_schema = snapshot
+                        .schemas
+                        .schemas
+                        .get(&(bucket_meta.schema_id(), *version))
+                        .ok_or(DocumentError::MissingMetadata("schema"))?;
+                    let compatibility =
+                        check_compatibility(old_schema, new_schema).map_err(CatalogError::from)?;
+                    if compatibility == Compatibility::RequiresMigration && migration.is_none() {
+                        return Err(DocumentError::MigrationRequired);
+                    }
+                    if let Some(migration) = migration {
+                        let records =
+                            collect_bucket_records(self.backend.as_ref(), &snapshot, *bucket)?;
+                        let indexes: Vec<IndexDefinition> = snapshot
+                            .indexes
+                            .get(bucket)
+                            .map(|indexes| indexes.values().cloned().collect())
+                            .unwrap_or_default();
+                        rewrite_records(
+                            &mut transaction,
+                            *bucket,
+                            &records,
+                            new_schema,
+                            migration,
+                            &indexes,
+                        )?;
+                    }
+                }
+                CatalogAlter::Index {
+                    bucket,
+                    index,
+                    definition,
+                } => {
+                    let old_index = snapshot
+                        .indexes
+                        .get(bucket)
+                        .and_then(|indexes| indexes.get(index))
+                        .cloned()
+                        .ok_or(DocumentError::MissingMetadata("index"))?;
+                    let bucket_meta = snapshot
+                        .buckets
+                        .get(bucket)
+                        .ok_or(DocumentError::MissingMetadata("bucket"))?;
+                    let records =
+                        collect_bucket_records(self.backend.as_ref(), &snapshot, *bucket)?;
+                    let old_keys = collect_index_keys(
+                        self.backend.as_ref(),
+                        *bucket,
+                        old_index.id(),
+                        bucket_meta.partition_count(),
+                    )?;
+                    for key in &old_keys {
+                        transaction.delete(key);
+                    }
+                    write_index_entries(&mut transaction, *bucket, &records, definition)?;
+                }
+            }
+
+            Ok(())
+        })();
+        if let Err(error) = result {
+            transaction.rollback();
+            return Err(error);
+        }
+        catalog_write.stage(&mut transaction);
+        transaction.commit()?;
+
+        let generation = candidate.generation();
+        *self.catalog.write().map_err(|_| lock_error())? = Arc::new(candidate);
+
+        Ok(generation)
+    }
+
     fn catalog(&self) -> Arc<Catalog> {
         self.catalog
             .read()
@@ -539,9 +683,14 @@ impl<B: StorageBackend> DocumentStore<B> {
 
         let mut writes = Vec::with_capacity(targets.len());
         for target in targets {
-            let old = path
-                .read_fields(&target.key, &target.schema)?
-                .map(|(_, data)| data);
+            let old = match path.get_raw(&target.key)? {
+                Some(frame) => {
+                    let decoded = decode_record(&frame)?;
+                    let schema = record_schema(&snapshot, &target.schema, decoded.header())?;
+                    Some(decode_fields(&schema, decoded.payload())?)
+                }
+                None => None,
+            };
             let mut write = FragmentWrite::new(target.key, target.schema, target.data.clone());
             for index in &target.indexes {
                 let old_values = match &old {
@@ -601,16 +750,45 @@ fn lock_error() -> DocumentError {
     DocumentError::Catalog(CatalogError::LockPoisoned)
 }
 
+fn record_schema(
+    snapshot: &CatalogSnapshot,
+    current: &RecordSchema,
+    header: &RecordHeader,
+) -> Result<RecordSchema, DocumentError> {
+    if header.schema_id() != current.id() {
+        return Err(schema_mismatch(header, current));
+    }
+    if header.schema_version() == current.version() {
+        return Ok(current.clone());
+    }
+    snapshot
+        .schemas
+        .schemas
+        .get(&(current.id(), header.schema_version()))
+        .cloned()
+        .ok_or_else(|| schema_mismatch(header, current))
+}
+
+fn schema_mismatch(header: &RecordHeader, expected: &RecordSchema) -> DocumentError {
+    DocumentError::Storage(StorageError::SchemaMismatch {
+        record_schema: header.schema_id(),
+        record_version: header.schema_version(),
+        expected_schema: expected.id(),
+        expected_version: expected.version(),
+    })
+}
+
+struct BucketRecord {
+    key: Vec<u8>,
+    partition: PartitionId,
+    header: RecordHeader,
+    data: RecordData,
+}
+
 struct BackfillBucket {
     bucket: BucketId,
     indexes: Vec<IndexDefinition>,
-    records: Vec<BackfillRecord>,
-}
-
-struct BackfillRecord {
-    key: Vec<u8>,
-    partition: PartitionId,
-    data: RecordData,
+    records: Vec<BucketRecord>,
 }
 
 fn pending_indexes(
@@ -632,78 +810,76 @@ fn pending_indexes(
     pending
 }
 
+fn collect_bucket_records<B: StorageBackend>(
+    backend: &B,
+    snapshot: &CatalogSnapshot,
+    bucket_id: BucketId,
+) -> Result<Vec<BucketRecord>, DocumentError> {
+    let bucket = snapshot
+        .buckets
+        .get(&bucket_id)
+        .ok_or(DocumentError::MissingMetadata("bucket"))?;
+    let current_schema = snapshot
+        .schemas
+        .schemas
+        .get(&(bucket.schema_id(), bucket.schema_version()))
+        .ok_or(DocumentError::MissingMetadata("schema"))?
+        .clone();
+    let storage = backend.snapshot()?;
+    let prefix = encode_bucket_prefix(bucket_id);
+    let end = KeyRange::prefix(&prefix).end_bound().clone();
+    let mut range = KeyRange::prefix(&prefix);
+    let mut records = Vec::new();
+    let mut checked_entries = 0_usize;
+    let mut checked_bytes = 0_usize;
+    loop {
+        let entries = storage.scan(
+            &range,
+            ScanOptions {
+                limit: Some(BACKFILL_SCAN_ENTRIES),
+                reverse: false,
+            },
+        )?;
+        if entries.is_empty() {
+            break;
+        }
+        let last = entries.last().expect("non-empty scan").0.clone();
+        for (key, value) in entries {
+            let Ok(decoded) = decode_record_key(&key) else {
+                continue;
+            };
+            checked_entries += 1;
+            checked_bytes = checked_bytes.saturating_add(key.len() + value.len());
+            if checked_entries > MAX_BACKFILL_ENTRIES || checked_bytes > MAX_BACKFILL_BYTES {
+                return Err(DocumentError::BackfillTooLarge {
+                    entries: checked_entries,
+                    bytes: checked_bytes,
+                });
+            }
+            let record = decode_record(&value)?;
+            let schema = record_schema(snapshot, &current_schema, record.header())?;
+            let data = decode_fields(&schema, record.payload())?;
+            records.push(BucketRecord {
+                key,
+                partition: decoded.head().partition(),
+                header: record.header().clone(),
+                data,
+            });
+        }
+        range = KeyRange::new(Bound::Excluded(last), end.clone());
+    }
+
+    Ok(records)
+}
+
 fn collect_backfill<B: StorageBackend>(
     backend: &B,
     snapshot: &CatalogSnapshot,
     pending: BTreeMap<BucketId, Vec<IndexDefinition>>,
 ) -> Result<Vec<BackfillBucket>, DocumentError> {
-    if pending.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let storage = backend.snapshot()?;
     let mut output = Vec::with_capacity(pending.len());
-    let mut checked_entries = 0_usize;
-    let mut checked_bytes = 0_usize;
     for (bucket_id, indexes) in pending {
-        let bucket = snapshot
-            .buckets
-            .get(&bucket_id)
-            .ok_or(DocumentError::MissingMetadata("bucket"))?;
-        let schema = snapshot
-            .schemas
-            .schemas
-            .get(&(bucket.schema_id(), bucket.schema_version()))
-            .ok_or(DocumentError::MissingMetadata("schema"))?
-            .clone();
-        let prefix = encode_bucket_prefix(bucket_id);
-        let end = KeyRange::prefix(&prefix).end_bound().clone();
-        let mut range = KeyRange::prefix(&prefix);
-        let mut records = Vec::new();
-        loop {
-            let entries = storage.scan(
-                &range,
-                ScanOptions {
-                    limit: Some(BACKFILL_SCAN_ENTRIES),
-                    reverse: false,
-                },
-            )?;
-            if entries.is_empty() {
-                break;
-            }
-            let last = entries.last().expect("non-empty scan").0.clone();
-            for (key, value) in entries {
-                let Ok(decoded) = decode_record_key(&key) else {
-                    continue;
-                };
-                checked_entries += 1;
-                checked_bytes = checked_bytes.saturating_add(key.len() + value.len());
-                if checked_entries > MAX_BACKFILL_ENTRIES || checked_bytes > MAX_BACKFILL_BYTES {
-                    return Err(DocumentError::BackfillTooLarge {
-                        entries: checked_entries,
-                        bytes: checked_bytes,
-                    });
-                }
-                let record = decode_record(&value)?;
-                if record.header().schema_id() != schema.id()
-                    || record.header().schema_version() != schema.version()
-                {
-                    return Err(DocumentError::Storage(StorageError::SchemaMismatch {
-                        record_schema: record.header().schema_id(),
-                        record_version: record.header().schema_version(),
-                        expected_schema: schema.id(),
-                        expected_version: schema.version(),
-                    }));
-                }
-                let data = decode_fields(&schema, record.payload())?;
-                records.push(BackfillRecord {
-                    key,
-                    partition: decoded.head().partition(),
-                    data,
-                });
-            }
-            range = KeyRange::new(Bound::Excluded(last), end.clone());
-        }
+        let records = collect_bucket_records(backend, snapshot, bucket_id)?;
         output.push(BackfillBucket {
             bucket: bucket_id,
             indexes,
@@ -719,27 +895,144 @@ fn write_backfill<T: Transaction>(
     backfill: &[BackfillBucket],
 ) -> Result<(), DocumentError> {
     for bucket in backfill {
-        for record in &bucket.records {
-            for index in &bucket.indexes {
-                let Some(values) = encoded_index_values(index, &record.data)? else {
-                    continue;
-                };
+        for index in &bucket.indexes {
+            write_index_entries(transaction, bucket.bucket, &bucket.records, index)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_index_entries<T: Transaction>(
+    transaction: &mut T,
+    bucket: BucketId,
+    records: &[BucketRecord],
+    index: &IndexDefinition,
+) -> Result<(), DocumentError> {
+    for record in records {
+        let Some(values) = encoded_index_values(index, &record.data)? else {
+            continue;
+        };
+        if index.kind() == IndexKind::Unique {
+            put_unique_index_entry(
+                transaction,
+                bucket,
+                record.partition,
+                index.id(),
+                &values,
+                &record.key,
+            )?;
+        } else {
+            put_index_entry(
+                transaction,
+                bucket,
+                record.partition,
+                index.id(),
+                &values,
+                &record.key,
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn collect_index_keys<B: StorageBackend>(
+    backend: &B,
+    bucket: BucketId,
+    index: IndexId,
+    partitions: u32,
+) -> Result<Vec<Vec<u8>>, DocumentError> {
+    let storage = backend.snapshot()?;
+    let mut keys = Vec::new();
+    let mut checked_bytes = 0_usize;
+    for partition in 0..partitions {
+        let prefix = encode_index_prefix(bucket, PartitionId::new(partition), index);
+        let end = KeyRange::prefix(&prefix).end_bound().clone();
+        let mut range = KeyRange::prefix(&prefix);
+        loop {
+            let entries = storage.scan(
+                &range,
+                ScanOptions {
+                    limit: Some(BACKFILL_SCAN_ENTRIES),
+                    reverse: false,
+                },
+            )?;
+            if entries.is_empty() {
+                break;
+            }
+            let last = entries.last().expect("non-empty scan").0.clone();
+            for (key, _) in entries {
+                checked_bytes = checked_bytes.saturating_add(key.len());
+                if keys.len() >= MAX_BACKFILL_ENTRIES || checked_bytes > MAX_BACKFILL_BYTES {
+                    return Err(DocumentError::BackfillTooLarge {
+                        entries: keys.len() + 1,
+                        bytes: checked_bytes,
+                    });
+                }
+                keys.push(key);
+            }
+            range = KeyRange::new(Bound::Excluded(last), end.clone());
+        }
+    }
+
+    Ok(keys)
+}
+
+fn rewrite_records<T: Transaction>(
+    transaction: &mut T,
+    bucket: BucketId,
+    records: &[BucketRecord],
+    new_schema: &RecordSchema,
+    migration: &SchemaMigration,
+    indexes: &[IndexDefinition],
+) -> Result<(), DocumentError> {
+    for record in records {
+        let new_data = migrate_record(&record.data, new_schema, migration)?;
+        let header = RecordHeader::new(
+            new_schema.id(),
+            new_schema.version(),
+            record.header.commit_ts(),
+        )
+        .with_flags(record.header.flags())
+        .with_expire_at(record.header.expire_at());
+        let payload = encode_fields(new_schema, &new_data)?;
+        let frame = encode_record(&header, &payload)?;
+        transaction.put(&record.key, frame);
+
+        for index in indexes {
+            let old_values = encoded_index_values(index, &record.data)?;
+            let new_values = encoded_index_values(index, &new_data)?;
+            if old_values == new_values {
+                continue;
+            }
+            if let Some(old) = old_values {
+                delete_index_entry(
+                    transaction,
+                    bucket,
+                    record.partition,
+                    index.id(),
+                    &old,
+                    &record.key,
+                );
+            }
+            if let Some(new) = new_values {
                 if index.kind() == IndexKind::Unique {
                     put_unique_index_entry(
                         transaction,
-                        bucket.bucket,
+                        bucket,
                         record.partition,
                         index.id(),
-                        &values,
+                        &new,
                         &record.key,
                     )?;
                 } else {
                     put_index_entry(
                         transaction,
-                        bucket.bucket,
+                        bucket,
                         record.partition,
                         index.id(),
-                        &values,
+                        &new,
                         &record.key,
                     );
                 }

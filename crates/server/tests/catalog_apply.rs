@@ -16,14 +16,14 @@ use recolith_model::{
 use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN};
 use recolith_protocol::messages::{
-    AuthMethod, AuthResult, BucketDefinition, BucketPolicy, CatalogApplyRequest,
-    CatalogApplyResponse, CatalogDropRequest, CatalogDropResponse, CatalogIndexTarget,
-    CollectionDefinition, DescribeCollectionRequest, DescribeCollectionResponse,
-    DocumentGetRequest, DocumentGetResponse, DocumentPutRequest, ErrorResponse, FieldValue,
-    FragmentDefinition, FragmentPayload, HelloRequest, IndexDefinition, IndexKind,
-    KeyFieldDefinition, KeyFieldType, KeyspaceDefinition, QueryRequest, QueryResponse, RequestMeta,
-    SchemaDefinition, Value, WelcomeResponse, catalog_drop_request, describe_collection_request,
-    opcode, status, value,
+    AuthMethod, AuthResult, BucketDefinition, BucketPolicy, CatalogAlterRequest,
+    CatalogAlterResponse, CatalogApplyRequest, CatalogApplyResponse, CatalogDropRequest,
+    CatalogDropResponse, CatalogIndexTarget, CollectionDefinition, DescribeCollectionRequest,
+    DescribeCollectionResponse, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest,
+    ErrorResponse, FieldValue, FragmentDefinition, FragmentPayload, HelloRequest, IndexDefinition,
+    IndexKind, KeyFieldDefinition, KeyFieldType, KeyspaceDefinition, QueryRequest, QueryResponse,
+    RequestMeta, SchemaDefinition, SetBucketSchema, Value, WelcomeResponse, catalog_alter_request,
+    catalog_drop_request, describe_collection_request, opcode, status, value,
 };
 use recolith_schema::{Field, RecordSchema, Type};
 use recolith_server::{DocumentStore, ServerConfig, serve};
@@ -225,6 +225,29 @@ async fn drop_catalog(
         CatalogDropResponse::decode(payload.as_slice()).expect("drop response")
     } else {
         CatalogDropResponse::default()
+    };
+
+    (header, response)
+}
+
+async fn alter_catalog(
+    stream: &mut TcpStream,
+    codec: &FrameCodec,
+    request_id: u64,
+    request: &CatalogAlterRequest,
+) -> (FrameHeader, CatalogAlterResponse) {
+    write_frame(
+        stream,
+        codec,
+        &FrameHeader::new(opcode::CATALOG_ALTER, request_id),
+        &request.encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(stream, codec).await;
+    let response = if header.status() == status::OK {
+        CatalogAlterResponse::decode(payload.as_slice()).expect("alter response")
+    } else {
+        CatalogAlterResponse::default()
     };
 
     (header, response)
@@ -722,6 +745,81 @@ async fn drops_indexes_only_with_purge_and_queries_still_work() {
     }
     let response = QueryResponse::decode(payload.as_slice()).expect("query");
     assert_eq!(response.documents.len(), 1);
+}
+
+#[tokio::test]
+async fn switches_bucket_schema_and_reads_old_records() {
+    let store = store();
+    let address = start_server(Arc::clone(&store)).await;
+    let (mut stream, codec) = connect(address).await;
+
+    let mut request = base_request();
+    request.schemas.push(SchemaDefinition {
+        id: 1,
+        version: 2,
+        idl: r#"
+record Profile {
+    name: string @1;
+    level: u32 @2;
+    optional nickname: string @3;
+}
+"#
+        .to_owned(),
+    });
+    let (header, _) = apply(&mut stream, &codec, 2, &request).await;
+    assert_eq!(header.status(), status::OK);
+
+    let key = document_key(7);
+    assert_eq!(
+        put_document(&mut stream, &codec, 3, key.clone(), b"alter", "alex", 5)
+            .await
+            .status(),
+        status::OK
+    );
+
+    let alter = CatalogAlterRequest {
+        meta: Some(RequestMeta::default()),
+        change: Some(catalog_alter_request::Change::BucketSchema(
+            SetBucketSchema {
+                bucket_id: 1,
+                schema_version: 2,
+                migration: None,
+            },
+        )),
+    };
+    let (header, response) = alter_catalog(&mut stream, &codec, 4, &alter).await;
+    assert_eq!(header.status(), status::OK);
+    assert_eq!(response.catalog_generation, 6);
+
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::DOC_GET, 5),
+        &DocumentGetRequest {
+            meta: None,
+            collection_id: 1,
+            partition: 0,
+            document_key: key,
+            fragments: vec![1],
+            projection: Vec::new(),
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.status(), status::OK);
+    let read = DocumentGetResponse::decode(payload.as_slice()).expect("read");
+    assert_eq!(read.fragments.len(), 1);
+    assert_eq!(read.fragments[0].fields.len(), 2);
+
+    let mut stale = alter;
+    stale.meta = Some(RequestMeta {
+        catalog_generation: 1,
+        ..Default::default()
+    });
+    let (header, _) = alter_catalog(&mut stream, &codec, 6, &stale).await;
+    assert_eq!(header.opcode(), opcode::ERROR);
+    assert_eq!(header.status(), status::STALE_CATALOG);
 }
 
 #[tokio::test]

@@ -45,6 +45,9 @@ pub async fn run(args: Args) -> Result<(), CliError> {
                 )?;
                 print!("{}", crate::token::format_claims(&claims, true));
             }
+            TokenCommand::Hash { token_file } => {
+                println!("{}", crate::token::hash(token_file.as_deref())?);
+            }
         }
         return Ok(());
     }
@@ -105,6 +108,10 @@ pub async fn run(args: Args) -> Result<(), CliError> {
             }
             crate::catalog::CatalogRequest::Drop(request) => {
                 let response = client.drop_catalog(&request).await?;
+                println!("catalog generation: {}", response.catalog_generation);
+            }
+            crate::catalog::CatalogRequest::Alter(request) => {
+                let response = client.alter_catalog(&request).await?;
                 println!("catalog generation: {}", response.catalog_generation);
             }
         },

@@ -151,6 +151,7 @@ permissions = [{ keyspace = "*", collection = "*", actions = ["admin"] }]
 "#,
     )
     .expect("roles");
+    fs::write(dir.join("revoked.toml"), "hashes = []\n").expect("revocations");
     fs::write(
         &config_path,
         r#"
@@ -163,14 +164,17 @@ backend = "memory"
 [auth]
 secret_file = "secret.hex"
 roles_file = "roles.toml"
+revoked_tokens_file = "revoked.toml"
 "#,
     )
     .expect("write config");
 
     let config = Config::load(&config_path).expect("load config");
+    let auth = config.auth.as_ref().expect("auth");
+    assert_eq!(auth.secret_file, dir.join("secret.hex"));
     assert_eq!(
-        config.auth.as_ref().expect("auth").secret_file,
-        dir.join("secret.hex")
+        auth.revoked_tokens_file.as_ref().expect("revocations"),
+        &dir.join("revoked.toml")
     );
     let server = config.server_config().expect("server config");
     assert!(server.auth.is_some());

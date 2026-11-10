@@ -457,3 +457,76 @@ async fn rejects_unknown_or_stale_collection_description() {
     assert_eq!(header.opcode(), opcode::ERROR);
     assert_eq!(header.status(), status::STALE_CATALOG);
 }
+
+#[tokio::test]
+async fn scans_multiple_documents_without_a_key_predicate() {
+    let store = store();
+    let address = start_server(Arc::clone(&store)).await;
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let codec = handshake(&mut stream).await;
+
+    for (index, player) in [1_u64, 2, 3].into_iter().enumerate() {
+        let put = profile_put(
+            &document_key(player),
+            &format!("player-{player}"),
+            format!("scan-{index}").as_bytes(),
+        );
+        write_frame(
+            &mut stream,
+            &codec,
+            &FrameHeader::new(opcode::DOC_PUT, 10 + index as u64),
+            &put.encode_to_vec(),
+        )
+        .await;
+        let (header, _) = read_frame(&mut stream, &codec).await;
+        assert_eq!(header.status(), status::OK);
+    }
+
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::QUERY, 20),
+        &QueryRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT profile.name FROM player WHERE profile.level >= 10 \
+                  INCLUDE FRAGMENTS profile"
+                .to_owned(),
+            parameters: Vec::new(),
+            limit: 2,
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.status(), status::OK);
+    let response = QueryResponse::decode(payload.as_slice()).expect("query");
+    assert_eq!(response.documents.len(), 2);
+
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::QUERY, 21),
+        &QueryRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT profile.name FROM player WHERE player_id >= 2 \
+                  AND profile.level >= 10 INCLUDE FRAGMENTS profile"
+                .to_owned(),
+            parameters: Vec::new(),
+            limit: 10,
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.status(), status::OK);
+    let response = QueryResponse::decode(payload.as_slice()).expect("query");
+    assert_eq!(response.documents.len(), 2);
+    let keys: Vec<_> = response
+        .documents
+        .iter()
+        .map(|document| document.document_key.clone())
+        .collect();
+    assert_eq!(keys, vec![document_key(2), document_key(3)]);
+}

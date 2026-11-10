@@ -1,13 +1,14 @@
 use prost::Message;
 use recolith_protocol::messages::{
-    AuthMethod, BucketDefinition, BucketPolicy, CatalogApplyRequest, CatalogDropRequest,
-    CatalogIndexTarget, CollectionDefinition, CollectionMetadata, DescribeCollectionRequest,
-    DescribeCollectionResponse, DocumentPutRequest, FieldValue, FragmentDefinition,
-    FragmentMetadata, FragmentPayload, HelloRequest, IndexDefinition, IndexKind,
-    KeyFieldDefinition, KeyFieldMetadata, KeyFieldType, KeyspaceDefinition, NamedParameter,
-    QueryRequest, RequestMeta, SchemaDefinition, SchemaField, SchemaList, SchemaScalarType,
-    SchemaType, Value, catalog_drop_request, compression_bit, describe_collection_request, feature,
-    schema_type, value,
+    AuthMethod, BucketDefinition, BucketPolicy, CatalogAlterRequest, CatalogApplyRequest,
+    CatalogDropRequest, CatalogIndexTarget, CollectionDefinition, CollectionMetadata,
+    DescribeCollectionRequest, DescribeCollectionResponse, DocumentPutRequest, FieldConversion,
+    FieldMapping, FieldValue, FragmentDefinition, FragmentMetadata, FragmentPayload, HelloRequest,
+    IndexDefinition, IndexKind, KeyFieldDefinition, KeyFieldMetadata, KeyFieldType,
+    KeyspaceDefinition, NamedParameter, QueryRequest, RequestMeta, SchemaDefinition, SchemaField,
+    SchemaList, SchemaMigration, SchemaScalarType, SchemaType, SetBucketSchema, Value,
+    catalog_alter_request, catalog_drop_request, compression_bit, describe_collection_request,
+    feature, field_mapping, schema_type, value,
 };
 
 #[test]
@@ -214,6 +215,36 @@ fn roundtrips_catalog_drop_request() {
 
     let encoded = request.encode_to_vec();
     let decoded = CatalogDropRequest::decode(encoded.as_slice()).expect("decode");
+
+    assert_eq!(decoded, request);
+}
+
+#[test]
+fn roundtrips_catalog_alter_request() {
+    let request = CatalogAlterRequest {
+        meta: Some(RequestMeta {
+            catalog_generation: 4,
+            ..Default::default()
+        }),
+        change: Some(catalog_alter_request::Change::BucketSchema(
+            SetBucketSchema {
+                bucket_id: 1,
+                schema_version: 3,
+                migration: Some(SchemaMigration {
+                    mappings: vec![FieldMapping {
+                        to_field: 3,
+                        source: Some(field_mapping::Source::DefaultValue(Value {
+                            kind: Some(value::Kind::StringValue("default".to_owned())),
+                        })),
+                        conversion: FieldConversion::None as i32,
+                    }],
+                }),
+            },
+        )),
+    };
+
+    let encoded = request.encode_to_vec();
+    let decoded = CatalogAlterRequest::decode(encoded.as_slice()).expect("decode");
 
     assert_eq!(decoded, request);
 }

@@ -238,6 +238,64 @@ async fn creates_catalog_objects_and_uses_them_from_the_cli() {
     .await
     .expect("index");
 
+    let idl_v2: PathBuf = dir.join("schema-v2.idl");
+    fs::write(
+        &idl_v2,
+        r#"
+record Profile {
+    name: string @1;
+    level: u32 @2;
+    optional nickname: string @3;
+}
+"#,
+    )
+    .expect("idl v2");
+    run(args(
+        endpoint.clone(),
+        Command::Catalog {
+            command: CatalogCommand::RegisterSchema {
+                id: 1,
+                version: 2,
+                idl_file: idl_v2,
+                catalog_generation: 0,
+            },
+        },
+    ))
+    .await
+    .expect("schema v2");
+
+    run(args(
+        endpoint.clone(),
+        Command::Catalog {
+            command: CatalogCommand::AlterBucketSchema {
+                bucket_id: 1,
+                schema_version: 2,
+                mappings: Vec::new(),
+                conversions: Vec::new(),
+                defaults: Vec::new(),
+                catalog_generation: 0,
+            },
+        },
+    ))
+    .await
+    .expect("alter bucket schema");
+
+    run(args(
+        endpoint.clone(),
+        Command::Catalog {
+            command: CatalogCommand::AlterIndex {
+                bucket_id: 1,
+                index_id: 1,
+                name: "by-level-v2".to_owned(),
+                kind: "range".to_owned(),
+                fields: vec![2],
+                catalog_generation: 0,
+            },
+        },
+    ))
+    .await
+    .expect("alter index");
+
     run(args(
         endpoint.clone(),
         Command::Describe {

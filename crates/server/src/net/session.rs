@@ -13,10 +13,10 @@ use recolith_protocol::frame::{
     FrameCodec, FrameHeader, HEADER_LEN, PayloadEncoding, VERSION_MAJOR, VERSION_MINOR,
 };
 use recolith_protocol::messages::{
-    AuthMethod, AuthResult, CatalogApplyRequest, CatalogDropRequest, DescribeCollectionRequest,
-    DocumentGetRequest, DocumentPutRequest, ErrorResponse, GoAway, HelloRequest, PingRequest,
-    PingResponse, QueryRequest, SecurityMode, WelcomeResponse, compression_bit, feature, opcode,
-    status,
+    AuthMethod, AuthResult, CatalogAlterRequest, CatalogApplyRequest, CatalogDropRequest,
+    DescribeCollectionRequest, DocumentGetRequest, DocumentPutRequest, ErrorResponse, GoAway,
+    HelloRequest, PingRequest, PingResponse, QueryRequest, SecurityMode, WelcomeResponse,
+    compression_bit, feature, opcode, status,
 };
 use recolith_security::{Principal, unix_seconds};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -169,6 +169,20 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             .await?;
             break;
         }
+        if let (Some(auth), Some(fingerprint)) = (config.auth.as_deref(), principal.fingerprint())
+            && auth.is_revoked(fingerprint)
+        {
+            send_error(
+                &mut stream,
+                &codec,
+                &config.metrics,
+                header.request_id(),
+                status::AUTH_FAILED,
+                "token revoked",
+            )
+            .await?;
+            break;
+        }
         if header.is_response() || header.status() != 0 || header.stream_id() != 0 {
             send_error(
                 &mut stream,
@@ -205,7 +219,8 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             | opcode::QUERY
             | opcode::DESCRIBE_COLLECTION
             | opcode::CATALOG_APPLY
-            | opcode::CATALOG_DROP => {
+            | opcode::CATALOG_DROP
+            | opcode::CATALOG_ALTER => {
                 let started = Instant::now();
                 let outcome =
                     execute(header.opcode(), body, Arc::clone(&store), principal.clone()).await;
@@ -336,6 +351,11 @@ async fn execute<B: StorageBackend>(
                 .map_err(|_| OperationError::invalid("malformed CATALOG_DROP payload"))?;
             operations::catalog_drop(&store, &principal, request)
         }
+        opcode::CATALOG_ALTER => {
+            let request = CatalogAlterRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed CATALOG_ALTER payload"))?;
+            operations::catalog_alter(&store, &principal, request)
+        }
         _ => Err(OperationError::internal("unsupported operation")),
     })
     .await
@@ -382,7 +402,7 @@ async fn handle_batch<B: StorageBackend, W: AsyncWrite + Unpin>(
     for subframe in subframes {
         if matches!(
             subframe.opcode(),
-            opcode::CATALOG_APPLY | opcode::CATALOG_DROP
+            opcode::CATALOG_APPLY | opcode::CATALOG_DROP | opcode::CATALOG_ALTER
         ) {
             send_error(
                 writer,

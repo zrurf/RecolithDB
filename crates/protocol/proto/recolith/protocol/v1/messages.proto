@@ -413,3 +413,50 @@ message CatalogDropRequest {
 message CatalogDropResponse {
   uint64 catalog_generation = 1;
 }
+
+enum FieldConversion {
+  FIELD_CONVERSION_UNSPECIFIED = 0;
+  FIELD_CONVERSION_NONE = 1;
+  FIELD_CONVERSION_I32_TO_I64 = 2;
+  FIELD_CONVERSION_U32_TO_U64 = 3;
+  FIELD_CONVERSION_U32_TO_I64 = 4;
+}
+
+message FieldMapping {
+  uint32 to_field = 1;
+  oneof source {
+    uint32 from_field = 2;
+    Value default_value = 3;
+  }
+  FieldConversion conversion = 4;
+}
+
+message SchemaMigration {
+  repeated FieldMapping mappings = 1;
+}
+
+message SetBucketSchema {
+  uint64 bucket_id = 1;
+  uint32 schema_version = 2;
+  SchemaMigration migration = 3;
+}
+
+message RedefineIndex {
+  uint64 bucket_id = 1;
+  uint64 index_id = 2;
+  string name = 3;
+  IndexKind kind = 4;
+  repeated uint32 fields = 5;
+}
+
+message CatalogAlterRequest {
+  RequestMeta meta = 1;
+  oneof change {
+    SetBucketSchema bucket_schema = 2;
+    RedefineIndex index = 3;
+  }
+}
+
+message CatalogAlterResponse {
+  uint64 catalog_generation = 1;
+}

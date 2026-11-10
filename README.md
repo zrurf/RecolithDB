@@ -83,13 +83,13 @@ RecolithDB is in early single-node development. Implemented today:
 - Schema-aware field codec, record framing, partition-scoped record and index keys, CRC32C checks.
 - Lazy one/many fragment assembly, equality and range index pushdown including composite leading fields, same-fragment multi-index intersection, and range filters.
 - Local transactions, multi-fragment commits with one timestamp, optimistic `if_match`, unique reservation workflow, persistent commit clock.
-- RQL document-query subset: parser, catalog binder, document key encoding, planner, and executor.
+- RQL document-query subset: parser, catalog binder, document key encoding, planner, executor, single-document point reads, and multi-document scans with primary-key ranges, fragment filters, limits, and index pushdown.
 - In-process document service: catalog-bound multi-fragment writes, cardinality and partition validation, multi-fragment reads, and automatic index maintenance with sparse and unique indexes.
 - Protocol frame layer: fixed 38-byte header, CRC32C, zstd/lz4 compression, BATCH codec, Protobuf v1 messages, and collection metadata lookup.
 - TCP session layer: HELLO/WELCOME negotiation, bearer-token auth, compression selection, PING/PONG, BATCH dispatch, and structured errors.
 - TLS 1.3 transport with rustls and typed Rust client handshake, authentication, document, query, batch, and collection-description calls.
 - Runnable `recolithd` process with TOML configuration, memory or fjall storage, optional catalog bootstrap, persisted catalog reload, runtime catalog creation, TLS, bearer auth, logging, and graceful shutdown.
-- `recolith` CLI with `ping`, RQL `query`, `describe`, schema-aware `doc get` / `doc put`, runtime `catalog` creation, file-based catalog apply, and drop commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
+- `recolith` CLI with `ping`, RQL `query`, `describe`, schema-aware `doc get` / `doc put`, runtime `catalog` creation, alteration, file apply, and drop commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
 - Protocol document and query operations: DOC_GET, idempotent DOC_PUT with same-transaction deduplication, and RQL QUERY execution.
 - Process-exit crash recovery test and a full restart test covering catalog reload, commit-clock continuity, and persisted documents.
 - Point read/write benchmark example for the fjall adapter.
@@ -98,15 +98,14 @@ RecolithDB is in early single-node development. Implemented today:
 - Process-local server metrics for sessions, requests, errors, operation counts, and per-operation latency percentiles, logged periodically and at shutdown.
 - Bounded concurrent sessions with connection-limit overload rejection and rejection metrics.
 - HMAC-SHA256 opaque tokens, role-based collection permissions, token expiry, local token inspection and verification, and principal-scoped idempotency.
-- Atomic catalog creation and removal for keyspaces, schema versions, buckets, collections, and indexes, with generation checks, purge controls, synchronous index backfill, and persisted reload.
+- Atomic catalog creation, alteration, and removal for keyspaces, schema versions, buckets, collections, and indexes, with generation checks, purge controls, synchronous index backfill, schema switching, declarative record migration, and persisted reload.
 - Offline logical backup, verification, and restore with checksums, entry-count validation, and bounded scan batches.
 
 Not yet implemented:
 
 - Benchmarks on the target hardware profile and compaction tuning.
 - Additional persistent adapters (RocksDB, redb).
-- Catalog alters, online backfill for very large buckets, and schema migration.
-- Higher-level Rust SDK ergonomics, streaming result descriptors, and broader CLI administration.
+- Offline migration for buckets beyond the synchronous limit, cursor pagination and streaming result descriptors, and broader CLI administration.
 - Distributed placement, replication, and cross-partition workflows.
 
 ## Quick Start
@@ -153,7 +152,22 @@ openssl rand -hex 32 > examples/recolithd/secret.hex
 [auth]
 secret_file = "secret.hex"
 roles_file = "roles.toml"
+revoked_tokens_file = "revoked.toml"
 ```
+
+Revocation is optional. Print a token fingerprint and add it to the revocation file:
+
+```text
+cargo run -p recolith-cli --bin recolith -- token hash --token-file token.txt
+```
+
+```toml
+hashes = [
+  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+]
+```
+
+Revocation is checked at handshake and on every request, so an active session stops working after its token is revoked. The roles and revocation files are reloaded when they change; role changes apply to new sessions.
 
 Issue a token locally:
 
@@ -176,7 +190,18 @@ Then pass the token to commands:
 cargo run -p recolith-cli --bin recolith -- --token "$RECOLITH_TOKEN" ping
 ```
 
-Roles grant `read`, `write`, `describe`, or `admin` actions over keyspace/collection scopes. Role changes apply after restart. `DOC_GET` and `QUERY` require `read`; `DOC_PUT` requires `write`; `DESCRIBE_COLLECTION` requires `describe`. The example `roles.toml` includes `admin`, `game-reader`, and `game-writer` roles. `CATALOG_APPLY` requires `admin` on every affected scope; schema registration requires global admin on `*/*`.
+Roles grant `read`, `write`, `describe`, or `admin` actions over keyspace/collection scopes. Role changes apply after restart. `DOC_GET` and `QUERY` require `read`; `DOC_PUT` requires `write`; `DESCRIBE_COLLECTION` requires `describe`. The example `roles.toml` includes `admin`, `game-reader`, and `game-writer` roles. Catalog changes (`CATALOG_APPLY`, `CATALOG_DROP`, `CATALOG_ALTER`) require `admin` on every affected scope; schema registration requires global admin on `*/*`.
+
+## Queries
+
+A query whose document key fields are all bound by equality is a point read. Other queries scan the selected collection:
+
+```text
+cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM player WHERE profile.level >= 10 INCLUDE FRAGMENTS profile" --limit 100
+cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM player WHERE player_id >= 2 AND profile.name = 'alex' INCLUDE FRAGMENTS profile"
+```
+
+Scans prefer an indexable `many`-fragment predicate; otherwise they scan the fragment bucket and post-filter. Primary-key ranges are evaluated after candidate enumeration. `LIMIT` caps returned documents, and results are ordered by document key. A scan considers at most 10,000 candidate documents. Cursor pagination and streaming results are not implemented yet.
 
 ## Catalog Changes
 
@@ -213,7 +238,25 @@ cargo run -p recolith-cli --bin recolith -- catalog drop-keyspace --id 1 --purge
 
 Non-empty targets require `--purge`; without it they return `FAILED_PRECONDITION`. Purge deletes records and index entries in bounded batches before the catalog snapshot is committed. A crash during purge leaves the object visible, so the drop can be retried. Dropping a collection or keyspace is rejected while its buckets are shared with another collection. Keyspace drops cascade their collections, buckets, indexes, and placements; schemas remain because they are shared.
 
-Catalog alters are not implemented yet.
+Buckets can switch to a registered schema version:
+
+```text
+cargo run -p recolith-cli --bin recolith -- catalog alter-bucket-schema --bucket-id 1 --schema-version 2
+```
+
+Compatible changes keep existing records readable through their own schema version; new writes use the bucket's current version. Incompatible changes require a migration:
+
+```text
+cargo run -p recolith-cli --bin recolith -- catalog alter-bucket-schema --bucket-id 1 --schema-version 3 --default 3=string:migrated
+```
+
+Mappings use `--mapping to=from`, `--convert to=from:conversion` (`i32-i64`, `u32-u64`, `u32-i64`), and `--default to=type:value`. Defaults apply only when the target field has no value. Unmapped old fields are dropped. Migration rewrites bucket records, updates indexes, and commits the new catalog in one transaction, bounded to 100,000 records or 64 MiB.
+
+Indexes can be redefined in place; old entries are removed and the new definition is backfilled atomically:
+
+```text
+cargo run -p recolith-cli --bin recolith -- catalog alter-index --bucket-id 1 --index-id 1 --name by-name --kind equality --field 1
+```
 
 ## Build
 

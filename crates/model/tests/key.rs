@@ -72,3 +72,30 @@ fn rejects_oversized_keys() {
         Err(DocumentKeyError::TooLong { .. })
     ));
 }
+
+#[test]
+fn decodes_composite_keys_with_embedded_nul() {
+    let schema = schema(&[
+        ("owner", KeyType::String),
+        ("slot", KeyType::I64),
+        ("region", KeyType::Uuid),
+    ]);
+    let values = vec![
+        KeyValue::String("a\0b".to_owned()),
+        KeyValue::I64(-7),
+        KeyValue::Uuid([3_u8; 16]),
+    ];
+    let encoded = schema.encode(&values).expect("encode");
+
+    assert_eq!(schema.decode(&encoded).expect("decode"), values);
+    assert_eq!(
+        schema.decode(&encoded[..encoded.len() - 1]),
+        Err(DocumentKeyError::InvalidEncoding)
+    );
+    let mut trailing = encoded;
+    trailing.push(0);
+    assert_eq!(
+        schema.decode(&trailing),
+        Err(DocumentKeyError::InvalidEncoding)
+    );
+}
