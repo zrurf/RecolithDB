@@ -20,6 +20,9 @@ struct Args {
     /// Path to the server TOML configuration.
     #[arg(long, default_value = "recolith.toml")]
     config: PathBuf,
+    /// Validates configuration and referenced files without starting the server.
+    #[arg(long)]
+    check_config: bool,
 }
 
 #[tokio::main]
@@ -37,6 +40,13 @@ async fn main() -> ExitCode {
 async fn run(args: Args) -> Result<(), RuntimeError> {
     let config = Config::load(&args.config)?;
     let server_config = config.server_config()?;
+    if args.check_config {
+        if let Some(bootstrap) = &config.catalog.bootstrap {
+            let _ = load_bootstrap(bootstrap)?;
+        }
+        println!("configuration is valid");
+        return Ok(());
+    }
 
     match &config.storage {
         StorageSettings::Memory => {

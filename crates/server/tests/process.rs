@@ -111,3 +111,47 @@ fn temp_dir(label: &str) -> PathBuf {
 
     path
 }
+
+#[test]
+fn validates_configuration_without_starting() {
+    let dir = temp_dir("check-config");
+    fs::write(dir.join("catalog.toml"), CATALOG).expect("write catalog");
+    fs::write(
+        dir.join("recolith.toml"),
+        r#"
+[server]
+listen = "127.0.0.1:0"
+
+[storage]
+backend = "memory"
+
+[catalog]
+bootstrap = "catalog.toml"
+"#,
+    )
+    .expect("write config");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_recolithd"))
+        .arg("--config")
+        .arg(dir.join("recolith.toml"))
+        .arg("--check-config")
+        .output()
+        .expect("check config");
+    assert!(output.status.success(), "check failed: {output:?}");
+    assert!(
+        String::from_utf8(output.stdout)
+            .expect("utf8")
+            .contains("configuration is valid")
+    );
+
+    fs::remove_file(dir.join("catalog.toml")).expect("remove catalog");
+    let output = Command::new(env!("CARGO_BIN_EXE_recolithd"))
+        .arg("--config")
+        .arg(dir.join("recolith.toml"))
+        .arg("--check-config")
+        .output()
+        .expect("check invalid config");
+    assert!(!output.status.success());
+
+    let _ = fs::remove_dir_all(dir);
+}

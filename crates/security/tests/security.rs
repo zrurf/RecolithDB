@@ -183,6 +183,20 @@ fn rejects_revoked_token_fingerprints() {
 }
 
 #[test]
+fn serializes_and_updates_revocation_lists() {
+    let fingerprint = [7_u8; 32];
+    let mut list = RevocationList::default();
+    assert!(list.insert(fingerprint));
+    assert!(!list.insert(fingerprint));
+    assert!(list.contains(&fingerprint));
+
+    let mut parsed = RevocationList::parse(&list.to_toml_string()).expect("parse");
+    assert!(parsed.contains(&fingerprint));
+    assert!(parsed.remove(&fingerprint));
+    assert!(parsed.is_empty());
+}
+
+#[test]
 fn reloads_roles_and_revocations_without_restart() {
     let fixture = AuthFixture::new("reload");
     let token = TokenIssuer::from_secret_file(&fixture.secret)

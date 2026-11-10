@@ -88,7 +88,7 @@ RecolithDB is in early single-node development. Implemented today:
 - Protocol frame layer: fixed 38-byte header, CRC32C, zstd/lz4 compression, BATCH codec, Protobuf v1 messages, and collection metadata lookup.
 - TCP session layer: HELLO/WELCOME negotiation, bearer-token auth, compression selection, PING/PONG, BATCH dispatch, and structured errors.
 - TLS 1.3 transport with rustls and typed Rust client handshake, authentication, document, query, batch, and collection-description calls.
-- Runnable `recolithd` process with TOML configuration, memory or fjall storage, optional catalog bootstrap, persisted catalog reload, runtime catalog creation, TLS, bearer auth, logging, and graceful shutdown.
+- Runnable `recolithd` process with TOML configuration, memory or fjall storage, optional catalog bootstrap, persisted catalog reload, runtime catalog creation, TLS, bearer auth, logging, graceful shutdown, and offline configuration validation.
 - `recolith` CLI with `ping`, RQL `query`, `describe`, schema-aware `doc get` / `doc put`, runtime `catalog` creation, alteration, file apply, and drop commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
 - Protocol document and query operations: DOC_GET, idempotent DOC_PUT with same-transaction deduplication, and RQL QUERY execution.
 - Process-exit crash recovery test and a full restart test covering catalog reload, commit-clock continuity, and persisted documents.
@@ -97,7 +97,7 @@ RecolithDB is in early single-node development. Implemented today:
 - Network robustness coverage: oversized, truncated, and corrupt frames, malformed batches, TLS rejection, and shutdown draining.
 - Process-local server metrics for sessions, requests, errors, operation counts, and per-operation latency percentiles, logged periodically and at shutdown.
 - Bounded concurrent sessions with connection-limit overload rejection and rejection metrics.
-- HMAC-SHA256 opaque tokens, role-based collection permissions, token expiry, local token inspection and verification, and principal-scoped idempotency.
+- HMAC-SHA256 opaque tokens, role-based collection permissions, token expiry, local token inspection, verification, fingerprint display, revocation file management, and principal-scoped idempotency.
 - Atomic catalog creation, alteration, and removal for keyspaces, schema versions, buckets, collections, and indexes, with generation checks, purge controls, synchronous index backfill, schema switching, declarative record migration, and persisted reload.
 - Offline logical backup, verification, and restore with checksums, entry-count validation, and bounded scan batches.
 
@@ -155,11 +155,13 @@ roles_file = "roles.toml"
 revoked_tokens_file = "revoked.toml"
 ```
 
-Revocation is optional. Print a token fingerprint and add it to the revocation file:
+Revocation is optional. Add a token fingerprint to the revocation file:
 
 ```text
-cargo run -p recolith-cli --bin recolith -- token hash --token-file token.txt
+cargo run -p recolith-cli --bin recolith -- token revoke --token-file token.txt --revoked-file examples/recolithd/revoked.toml
 ```
+
+The file is created when missing and duplicate fingerprints are ignored. Use `token hash` to print a fingerprint without modifying the file. `token inspect` and `token verify` also print the fingerprint.
 
 ```toml
 hashes = [
@@ -294,6 +296,12 @@ cargo build --workspace
 cargo test --workspace --all-targets
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Validate a server configuration and its referenced files without starting the server:
+
+```text
+cargo run -p recolith-server --bin recolithd -- --config examples/recolithd/recolith.toml --check-config
 ```
 
 ## Benchmarks
