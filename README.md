@@ -93,6 +93,7 @@ RecolithDB is in early single-node development. Implemented today:
 - Process-exit crash recovery test and a full restart test covering catalog reload, commit-clock continuity, and persisted documents.
 - Point read/write benchmark example for the fjall adapter.
 - Batched commit-timestamp allocation, parallel document writes, and document plus concurrent multi-client benchmarks.
+- Network robustness coverage: oversized, truncated, and corrupt frames, malformed batches, TLS rejection, and shutdown draining.
 
 Not yet implemented:
 
