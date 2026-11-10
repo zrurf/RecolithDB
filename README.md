@@ -76,7 +76,7 @@ flowchart TB
 
 RecolithDB is in early single-node development. Implemented today:
 
-- Ordered transactional KV contract, in-memory backend, fjall persistent adapter, and a reusable conformance suite.
+- Ordered transactional KV contract, copy-on-write in-memory backend, fjall persistent adapter, and a reusable conformance suite.
 - Schema types, record IDL parser, compatibility classification, and catalog schema registry.
 - Catalog metadata, index definitions, bucket placement, generations, and atomic persistence.
 - Schema-aware field codec, record framing, partition-scoped record and index keys, CRC32C checks.
@@ -84,22 +84,21 @@ RecolithDB is in early single-node development. Implemented today:
 - Local transactions, multi-fragment commits with one timestamp, optimistic `if_match`, unique reservation workflow, persistent commit clock.
 - RQL document-query subset: parser, catalog binder, document key encoding, planner, and executor.
 - In-process document service: catalog-bound multi-fragment writes, cardinality and partition validation, multi-fragment reads, and automatic index maintenance with sparse and unique indexes.
-- Protocol frame layer: fixed 38-byte header, CRC32C, zstd/lz4 compression, BATCH codec, and Protobuf v1 messages.
+- Protocol frame layer: fixed 38-byte header, CRC32C, zstd/lz4 compression, BATCH codec, Protobuf v1 messages, and collection metadata lookup.
 - TCP session layer: HELLO/WELCOME negotiation, bearer-token auth, compression selection, PING/PONG, BATCH dispatch, and structured errors.
-- TLS 1.3 transport with rustls and typed Rust client handshake, authentication, document, query, and batch calls.
+- TLS 1.3 transport with rustls and typed Rust client handshake, authentication, document, query, batch, and collection-description calls.
 - Runnable `recolithd` process with TOML configuration, memory or fjall storage, catalog bootstrap, persisted catalog reload, TLS, bearer auth, logging, and graceful shutdown.
-- `recolith` CLI with `ping` and RQL `query` commands, typed query parameters, and human-readable document output.
+- `recolith` CLI with `ping`, RQL `query`, `describe`, and schema-aware `doc get` / `doc put`, including TLS, bearer auth, named keys and fields, and human-readable output.
 - Protocol document and query operations: DOC_GET, idempotent DOC_PUT with same-transaction deduplication, and RQL QUERY execution.
 - Process-exit crash recovery test and a full restart test covering catalog reload, commit-clock continuity, and persisted documents.
 - Point read/write benchmark example for the fjall adapter.
-- Document write and read benchmark example for the full store path.
+- Batched commit-timestamp allocation, parallel document writes, and document plus concurrent multi-client benchmarks.
 
 Not yet implemented:
 
 - Benchmarks on the target hardware profile and compaction tuning.
 - Additional persistent adapters (RocksDB, redb).
-- Higher-level Rust SDK ergonomics, CLI write/admin commands, and streaming result descriptors.
-- Server-level query and concurrent-client benchmarks.
+- Higher-level Rust SDK ergonomics, CLI admin commands, and streaming result descriptors.
 - Distributed placement, replication, and cross-partition workflows.
 
 ## Quick Start
@@ -114,6 +113,9 @@ In another terminal:
 
 ```text
 cargo run -p recolith-cli --bin recolith -- ping
+cargo run -p recolith-cli --bin recolith -- describe player --keyspace game
+cargo run -p recolith-cli --bin recolith -- doc put --collection player --keyspace game --key player_id=u64:1 --idempotency-key demo-1 --field profile.name=string:alex --field profile.level=u32:10
+cargo run -p recolith-cli --bin recolith -- doc get --collection player --keyspace game --key player_id=u64:1 --fragment profile
 cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM player WHERE player_id = :id INCLUDE FRAGMENTS profile" --param id=u64:1
 ```
 

@@ -16,6 +16,7 @@ tokio.workspace = true
 tokio-rustls.workspace = true
 
 [dev-dependencies]
+recolith-backend-fjall.workspace = true
 recolith-backend-memory.workspace = true
 recolith-catalog.workspace = true
 recolith-model.workspace = true

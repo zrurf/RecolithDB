@@ -9,6 +9,7 @@ publish = false
 [dependencies]
 clap.workspace = true
 recolith-client.workspace = true
+recolith-model.workspace = true
 recolith-protocol.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -17,7 +18,6 @@ tokio.workspace = true
 recolith-backend-memory.workspace = true
 recolith-catalog.workspace = true
 recolith-common.workspace = true
-recolith-model.workspace = true
 recolith-schema.workspace = true
 recolith-server.workspace = true
 recolith-storage.workspace = true

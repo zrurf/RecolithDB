@@ -1,4 +1,4 @@
-use recolith_cli::{CliError, parse_parameter};
+use recolith_cli::{CliError, parse_field, parse_parameter};
 use recolith_protocol::messages::{Value, value};
 
 #[test]
@@ -43,10 +43,34 @@ fn rejects_malformed_parameters() {
     ));
     assert!(matches!(
         parse_parameter("id=unknown:1"),
-        Err(CliError::InvalidParameter(_))
+        Err(CliError::UnknownValueType(_))
     ));
     assert!(matches!(
         parse_parameter("data=bytes:xyz"),
+        Err(CliError::InvalidValue { .. })
+    ));
+}
+
+#[test]
+fn parses_field_specifications() {
+    let (fragment, field, kind) = parse_field("2:3=u32:7").expect("field");
+    assert_eq!((fragment, field), (2, 3));
+    assert_eq!(kind, value::Kind::U32Value(7));
+}
+
+#[test]
+fn rejects_malformed_field_specifications() {
+    assert!(matches!(parse_field("1:1"), Err(CliError::InvalidField(_))));
+    assert!(matches!(
+        parse_field("fragment:1=u32:1"),
+        Err(CliError::InvalidField(_))
+    ));
+    assert!(matches!(
+        parse_field("1:field=u32:1"),
+        Err(CliError::InvalidField(_))
+    ));
+    assert!(matches!(
+        parse_field("1:1=u32:not-a-number"),
         Err(CliError::InvalidValue { .. })
     ));
 }

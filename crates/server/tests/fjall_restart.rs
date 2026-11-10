@@ -157,7 +157,7 @@ fn survives_restart_with_catalog_clock_and_document() {
     }
 
     assert_eq!(loaded_generation, generation);
-    assert_eq!(second_ts.get(), first_ts.get() + 1);
+    assert!(second_ts > first_ts);
 
     let backend = Arc::new(FjallBackend::open(dir.path()).expect("reopen again"));
     let catalog = load_catalog(backend.as_ref()).expect("load catalog again");

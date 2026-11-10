@@ -4,8 +4,9 @@ use prost::Message;
 use recolith_client::{BatchOperation, Client, ClientConfig, ClientError};
 use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::messages::{
-    DocumentGetRequest, DocumentGetResponse, FieldSelection, NamedParameter, QueryRequest,
-    SecurityMode, Value, feature, opcode, status, value,
+    DescribeCollectionRequest, DocumentGetRequest, DocumentGetResponse, FieldSelection,
+    NamedParameter, QueryRequest, SecurityMode, Value, describe_collection_request, feature,
+    opcode, status, value,
 };
 use recolith_server::ServerConfig;
 
@@ -48,6 +49,21 @@ async fn writes_reads_and_queries_documents() {
         .await
         .expect("connect");
     let key = support::document_key(42);
+
+    let metadata = client
+        .describe_collection(&DescribeCollectionRequest {
+            meta: None,
+            keyspace: "game".to_owned(),
+            target: Some(describe_collection_request::Target::CollectionName(
+                "player".to_owned(),
+            )),
+        })
+        .await
+        .expect("describe");
+    let collection = metadata.collection.expect("collection");
+    assert_eq!(collection.name, "player");
+    assert_eq!(collection.key_fields[0].name, "player_id");
+    assert_eq!(collection.fragments[0].name, "profile");
 
     let put = client
         .document_put(&support::profile_put(&key, "alex", b"idem-1"))

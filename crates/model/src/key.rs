@@ -1,3 +1,63 @@
+use std::fmt;
+
+use recolith_common::bytes::put_ordered_bytes;
+
+/// Maximum canonical document key length in bytes.
+pub const MAX_DOCUMENT_KEY_LEN: usize = 256;
+
+/// Document key encoding failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DocumentKeyError {
+    /// The key schema has no fields.
+    EmptySchema,
+    /// The value count does not match the schema.
+    CountMismatch {
+        /// Expected value count.
+        expected: usize,
+        /// Supplied value count.
+        actual: usize,
+    },
+    /// A value does not match its field type.
+    TypeMismatch {
+        /// Key field name.
+        field: String,
+        /// Expected field type.
+        expected: KeyType,
+    },
+    /// The encoded key exceeds the length limit.
+    TooLong {
+        /// Encoded length.
+        length: usize,
+        /// Maximum length.
+        limit: usize,
+    },
+}
+
+impl fmt::Display for DocumentKeyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptySchema => formatter.write_str("document key schema has no fields"),
+            Self::CountMismatch { expected, actual } => {
+                write!(
+                    formatter,
+                    "document key expects {expected} values, got {actual}"
+                )
+            }
+            Self::TypeMismatch { field, expected } => {
+                write!(formatter, "key field {field} expects {expected}")
+            }
+            Self::TooLong { length, limit } => {
+                write!(
+                    formatter,
+                    "document key is {length} bytes, limit is {limit}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DocumentKeyError {}
+
 /// Scalar type allowed in a document key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyType {
@@ -78,6 +138,66 @@ impl DocumentKeySchema {
     #[must_use]
     pub fn field(&self, name: &str) -> Option<&KeyField> {
         self.fields.iter().find(|field| field.name() == name)
+    }
+
+    /// Encodes typed key values into canonical ordered bytes.
+    ///
+    /// Fixed-width components are big-endian and signed integers are biased by
+    /// their sign bit. Strings and bytes are self-terminating, so composite keys
+    /// stay unambiguous.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentKeyError`] for an empty schema, a value count or type
+    /// mismatch, or a key longer than [`MAX_DOCUMENT_KEY_LEN`].
+    pub fn encode(&self, values: &[KeyValue]) -> Result<Vec<u8>, DocumentKeyError> {
+        if self.fields.is_empty() {
+            return Err(DocumentKeyError::EmptySchema);
+        }
+        if self.fields.len() != values.len() {
+            return Err(DocumentKeyError::CountMismatch {
+                expected: self.fields.len(),
+                actual: values.len(),
+            });
+        }
+
+        let mut output = Vec::new();
+        for (field, value) in self.fields.iter().zip(values) {
+            match (field.ty(), value) {
+                (KeyType::U64, KeyValue::U64(value)) => {
+                    output.extend_from_slice(&value.to_be_bytes());
+                }
+                (KeyType::I64, KeyValue::I64(value)) => {
+                    output.extend_from_slice(
+                        &((*value as u64) ^ 0x8000_0000_0000_0000).to_be_bytes(),
+                    );
+                }
+                (KeyType::String, KeyValue::String(value)) => {
+                    put_ordered_bytes(value.as_bytes(), &mut output);
+                }
+                (KeyType::Bytes, KeyValue::Bytes(value)) => {
+                    put_ordered_bytes(value, &mut output);
+                }
+                (KeyType::Uuid, KeyValue::Uuid(value)) => {
+                    output.extend_from_slice(value);
+                }
+                (expected, _) => {
+                    return Err(DocumentKeyError::TypeMismatch {
+                        field: field.name().to_owned(),
+                        expected,
+                    });
+                }
+            }
+        }
+
+        if output.len() > MAX_DOCUMENT_KEY_LEN {
+            return Err(DocumentKeyError::TooLong {
+                length: output.len(),
+                limit: MAX_DOCUMENT_KEY_LEN,
+            });
+        }
+
+        Ok(output)
     }
 }
 

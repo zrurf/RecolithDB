@@ -8,10 +8,10 @@ use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::error::ProtocolError;
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN, VERSION_MAJOR, VERSION_MINOR};
 use recolith_protocol::messages::{
-    AuthMethod, AuthResult, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest,
-    DocumentPutResponse, ErrorResponse, GoAway, HelloRequest, PingRequest, PingResponse,
-    QueryRequest, QueryResponse, SecurityMode, WelcomeResponse, compression_bit, encoding_bit,
-    feature, opcode, status,
+    AuthMethod, AuthResult, DescribeCollectionRequest, DescribeCollectionResponse,
+    DocumentGetRequest, DocumentGetResponse, DocumentPutRequest, DocumentPutResponse,
+    ErrorResponse, GoAway, HelloRequest, PingRequest, PingResponse, QueryRequest, QueryResponse,
+    SecurityMode, WelcomeResponse, compression_bit, encoding_bit, feature, opcode, status,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -290,6 +290,28 @@ impl Client {
             .map_err(|_| ClientError::UnexpectedResponse("malformed QUERY response".to_owned()))
     }
 
+    /// Describes a collection by name or identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn describe_collection(
+        &mut self,
+        request: &DescribeCollectionRequest,
+    ) -> Result<DescribeCollectionResponse, ClientError> {
+        self.require_feature(feature::CATALOG_DESCRIBE, "collection metadata")?;
+        let body = self
+            .request(
+                opcode::DESCRIBE_COLLECTION,
+                opcode::DESCRIBE_COLLECTION,
+                &request.encode_to_vec(),
+            )
+            .await?;
+        DescribeCollectionResponse::decode(body.as_slice()).map_err(|_| {
+            ClientError::UnexpectedResponse("malformed DESCRIBE_COLLECTION response".to_owned())
+        })
+    }
+
     /// Sends unary requests in one batch frame and returns their responses.
     ///
     /// Failed operations are returned as results with [`opcode::ERROR`] rather
@@ -545,7 +567,8 @@ fn build_hello(config: &ClientConfig) -> HelloRequest {
             | feature::DOCUMENT_READ
             | feature::DOCUMENT_WRITE
             | feature::QUERY
-            | feature::IDEMPOTENCY,
+            | feature::IDEMPOTENCY
+            | feature::CATALOG_DESCRIBE,
         max_frame_size: to_u32(config.max_frame_size),
         max_batch_subframes: to_u32(config.max_batch_subframes),
         max_batch_bytes: to_u32(config.max_batch_bytes),

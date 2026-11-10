@@ -1,5 +1,16 @@
 use crate::error::{Error, Result};
 
+/// Appends an order-preserving, self-terminating byte component to `output`.
+pub fn put_ordered_bytes(value: &[u8], output: &mut Vec<u8>) {
+    for byte in value {
+        output.push(*byte);
+        if *byte == 0 {
+            output.push(0xFF);
+        }
+    }
+    output.extend_from_slice(&[0, 0]);
+}
+
 /// Appends an unsigned LEB128 varint to `output`.
 pub fn put_uvarint(mut value: u64, output: &mut Vec<u8>) {
     while value >= 0x80 {

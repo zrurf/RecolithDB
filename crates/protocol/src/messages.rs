@@ -20,6 +20,8 @@ pub mod opcode {
     pub const QUERY: u16 = 0x0020;
     /// Batched unary requests.
     pub const BATCH: u16 = 0x0030;
+    /// Collection metadata lookup.
+    pub const DESCRIBE_COLLECTION: u16 = 0x0050;
     /// Structured error response.
     pub const ERROR: u16 = 0x0040;
     /// Session shutdown notice.
@@ -84,6 +86,8 @@ pub mod feature {
     pub const STREAMING: u64 = 1 << 5;
     /// SBE payload encoding is supported.
     pub const SBE: u64 = 1 << 6;
+    /// Collection metadata lookup is supported.
+    pub const CATALOG_DESCRIBE: u64 = 1 << 7;
 }
 
 /// Compression algorithm bits used by the handshake.

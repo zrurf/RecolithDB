@@ -834,6 +834,7 @@ name = "recolith-backend-memory"
 version = "0.1.0"
 dependencies = [
  "recolith-backend",
+ "recolith-backend-conformance",
  "recolith-common",
 ]
 
@@ -888,6 +889,7 @@ name = "recolith-client"
 version = "0.1.0"
 dependencies = [
  "prost",
+ "recolith-backend-fjall",
  "recolith-backend-memory",
  "recolith-catalog",
  "recolith-common",

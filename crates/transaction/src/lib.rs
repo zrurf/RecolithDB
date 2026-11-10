@@ -9,7 +9,9 @@ pub mod local_write;
 pub mod unique;
 
 pub use atomic::{AtomicOp, apply_atomic};
-pub use clock::{DEFAULT_CLOCK_KEY, PersistentCommitClock};
+pub use clock::{
+    BatchedCommitClock, DEFAULT_CLOCK_KEY, DEFAULT_TIMESTAMP_BATCH, PersistentCommitClock,
+};
 pub use error::{Result, TransactionError};
 pub use local::LocalTransaction;
 pub use local_write::{FragmentWrite, IndexUpdate, LocalWritePath};

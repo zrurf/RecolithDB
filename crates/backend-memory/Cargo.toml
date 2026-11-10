@@ -12,3 +12,6 @@ recolith-backend.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+recolith-backend-conformance.workspace = true

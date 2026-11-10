@@ -1,6 +1,6 @@
-use crate::encoding::ordered::encode_ordered_bytes;
 use crate::error::{Result, StorageError};
 use crate::value::Value;
+use recolith_common::bytes::put_ordered_bytes as encode_ordered_bytes;
 
 const TAG_BOOL: u8 = 0x01;
 const TAG_I32: u8 = 0x02;

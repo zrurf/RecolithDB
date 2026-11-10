@@ -1,12 +1,16 @@
 use std::time::Duration;
 
 use recolith_client::{Client, ClientConfig};
-use recolith_protocol::messages::{NamedParameter, QueryRequest, Value, value};
+use recolith_protocol::messages::{
+    CollectionMetadata, DocumentGetRequest, DocumentPutRequest, NamedParameter, QueryRequest,
+    RequestMeta, Value, value,
+};
 
-use crate::args::{Args, Command};
+use crate::args::{Args, Command, DocCommand};
 use crate::error::CliError;
-use crate::format::format_document;
+use crate::format::{format_collection, format_document, format_fragments_named};
 use crate::hex;
+use crate::metadata;
 
 /// Executes a CLI command.
 ///
@@ -55,6 +59,75 @@ pub async fn run(args: Args) -> Result<(), CliError> {
                 print!("{}", format_document(document));
             }
         }
+        Command::Describe {
+            collection,
+            keyspace,
+        } => {
+            let collection = describe(&mut client, &collection, keyspace.as_deref()).await?;
+            print!("{}", format_collection(&collection));
+        }
+        Command::Doc { command } => match command {
+            DocCommand::Get {
+                collection,
+                keyspace,
+                partition,
+                key_hex,
+                keys,
+                fragments,
+            } => {
+                let collection = describe(&mut client, &collection, keyspace.as_deref()).await?;
+                let request = DocumentGetRequest {
+                    meta: None,
+                    collection_id: collection.id,
+                    partition,
+                    document_key: metadata::document_key(&keys, key_hex.as_deref(), &collection)?,
+                    fragments: metadata::fragment_ids(&fragments, &collection)?,
+                    projection: Vec::new(),
+                };
+                let response = client.document_get(&request).await?;
+                print!(
+                    "{}",
+                    format_fragments_named(
+                        &response.document_key,
+                        &response.fragments,
+                        &collection
+                    )
+                );
+            }
+            DocCommand::Put {
+                collection,
+                keyspace,
+                partition,
+                key_hex,
+                keys,
+                idempotency_key,
+                fields,
+                subkeys,
+            } => {
+                if idempotency_key.is_empty() {
+                    return Err(CliError::EmptyIdempotencyKey);
+                }
+                let collection = describe(&mut client, &collection, keyspace.as_deref()).await?;
+                let request = DocumentPutRequest {
+                    meta: Some(RequestMeta {
+                        idempotency_key: idempotency_key.into_bytes(),
+                        ..Default::default()
+                    }),
+                    collection_id: collection.id,
+                    partition,
+                    document_key: metadata::document_key(&keys, key_hex.as_deref(), &collection)?,
+                    fragments: metadata::fragments(&fields, &subkeys, &collection)?,
+                };
+                let response = client.document_put(&request).await?;
+                println!("commit_ts: {}", response.commit_ts);
+                for version in &response.versions {
+                    println!(
+                        "fragment {} commit={}",
+                        version.fragment_id, version.commit_ts
+                    );
+                }
+            }
+        },
     }
     client.close().await?;
 
@@ -73,38 +146,76 @@ pub fn parse_parameter(input: &str) -> Result<NamedParameter, CliError> {
     let (name, specification) = input
         .split_once('=')
         .ok_or_else(|| CliError::InvalidParameter(input.to_owned()))?;
-    let (kind, raw) = specification
-        .split_once(':')
-        .ok_or_else(|| CliError::InvalidParameter(input.to_owned()))?;
     if name.is_empty() {
         return Err(CliError::InvalidParameter(input.to_owned()));
     }
-
-    let kind = kind.trim().to_ascii_lowercase();
-    let value = match kind.as_str() {
-        "bool" => value::Kind::BoolValue(parse(raw, "bool")?),
-        "i32" => value::Kind::I32Value(parse(raw, "i32")?),
-        "i64" => value::Kind::I64Value(parse(raw, "i64")?),
-        "u32" => value::Kind::U32Value(parse(raw, "u32")?),
-        "u64" => value::Kind::U64Value(parse(raw, "u64")?),
-        "f32" => value::Kind::F32Value(parse(raw, "f32")?),
-        "f64" => value::Kind::F64Value(parse(raw, "f64")?),
-        "string" | "str" => value::Kind::StringValue(raw.to_owned()),
-        "bytes" | "hex" => {
-            value::Kind::BytesValue(hex::decode(raw).ok_or_else(|| CliError::InvalidValue {
-                kind: "bytes",
-                value: raw.to_owned(),
-            })?)
-        }
-        "timestamp" => value::Kind::TimestampMicros(parse(raw, "timestamp")?),
-        "duration" => value::Kind::DurationMicros(parse(raw, "duration")?),
-        _ => return Err(CliError::InvalidParameter(input.to_owned())),
-    };
+    let value = parse_typed_value(specification)?;
 
     Ok(NamedParameter {
         name: name.to_owned(),
         value: Some(Value { kind: Some(value) }),
     })
+}
+
+/// Parses a numeric field specification in `fragment:field=type:value` form.
+///
+/// # Errors
+///
+/// Returns [`CliError`] when the target or value is invalid.
+pub fn parse_field(input: &str) -> Result<(u32, u32, value::Kind), CliError> {
+    let (target, specification) = input
+        .split_once('=')
+        .ok_or_else(|| CliError::InvalidField(input.to_owned()))?;
+    let (fragment, field) = target
+        .split_once(':')
+        .ok_or_else(|| CliError::InvalidField(input.to_owned()))?;
+    let fragment = fragment
+        .parse()
+        .map_err(|_| CliError::InvalidField(input.to_owned()))?;
+    let field = field
+        .parse()
+        .map_err(|_| CliError::InvalidField(input.to_owned()))?;
+    let value = parse_typed_value(specification)?;
+
+    Ok((fragment, field, value))
+}
+
+pub(crate) fn parse_typed_value(specification: &str) -> Result<value::Kind, CliError> {
+    let (kind, raw) = specification
+        .split_once(':')
+        .ok_or_else(|| CliError::InvalidParameter(specification.to_owned()))?;
+    let kind = kind.trim().to_ascii_lowercase();
+
+    match kind.as_str() {
+        "bool" => Ok(value::Kind::BoolValue(parse(raw, "bool")?)),
+        "i32" => Ok(value::Kind::I32Value(parse(raw, "i32")?)),
+        "i64" => Ok(value::Kind::I64Value(parse(raw, "i64")?)),
+        "u32" => Ok(value::Kind::U32Value(parse(raw, "u32")?)),
+        "u64" => Ok(value::Kind::U64Value(parse(raw, "u64")?)),
+        "f32" => Ok(value::Kind::F32Value(parse(raw, "f32")?)),
+        "f64" => Ok(value::Kind::F64Value(parse(raw, "f64")?)),
+        "string" | "str" => Ok(value::Kind::StringValue(raw.to_owned())),
+        "bytes" | "hex" => Ok(value::Kind::BytesValue(hex::decode(raw).ok_or_else(
+            || CliError::InvalidValue {
+                kind: "bytes",
+                value: raw.to_owned(),
+            },
+        )?)),
+        "timestamp" => Ok(value::Kind::TimestampMicros(parse(raw, "timestamp")?)),
+        "duration" => Ok(value::Kind::DurationMicros(parse(raw, "duration")?)),
+        _ => Err(CliError::UnknownValueType(kind)),
+    }
+}
+
+async fn describe(
+    client: &mut Client,
+    collection: &str,
+    keyspace: Option<&str>,
+) -> Result<CollectionMetadata, CliError> {
+    let request = metadata::describe_request(collection, keyspace);
+    let response = client.describe_collection(&request).await?;
+
+    metadata::collection(response)
 }
 
 fn parse<T>(raw: &str, kind: &'static str) -> Result<T, CliError>

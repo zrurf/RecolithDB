@@ -21,7 +21,7 @@ struct Entry {
 /// In-memory ordered transactional backend.
 #[derive(Debug)]
 pub struct MemoryBackend {
-    state: Arc<Mutex<State>>,
+    state: Arc<Mutex<Arc<State>>>,
     capabilities: Capabilities,
 }
 
@@ -30,7 +30,7 @@ impl MemoryBackend {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            state: Arc::new(Mutex::new(State::default())),
+            state: Arc::new(Mutex::new(Arc::new(State::default()))),
             capabilities: Capabilities {
                 snapshot_isolation: true,
                 multi_key_atomic: true,
@@ -43,7 +43,7 @@ impl MemoryBackend {
         }
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, State>> {
+    fn lock(&self) -> Result<MutexGuard<'_, Arc<State>>> {
         lock_state(self.state.as_ref())
     }
 }
@@ -66,7 +66,7 @@ impl StorageBackend for MemoryBackend {
         let state = self.lock()?;
 
         Ok(MemorySnapshot {
-            state: state.clone(),
+            state: Arc::clone(&state),
         })
     }
 
@@ -74,7 +74,8 @@ impl StorageBackend for MemoryBackend {
         let state = self.lock()?;
 
         Ok(MemoryTransaction {
-            base: state.clone(),
+            base_sequence: state.sequence,
+            base: Arc::clone(&state),
             state: Arc::clone(&self.state),
             writes: BTreeMap::new(),
             reads: BTreeSet::new(),
@@ -95,7 +96,7 @@ impl StorageBackend for MemoryBackend {
 /// Stable in-memory snapshot.
 #[derive(Clone, Debug)]
 pub struct MemorySnapshot {
-    state: State,
+    state: Arc<State>,
 }
 
 impl Snapshot for MemorySnapshot {
@@ -115,8 +116,9 @@ impl Snapshot for MemorySnapshot {
 /// In-memory read-write transaction.
 #[derive(Debug)]
 pub struct MemoryTransaction {
-    base: State,
-    state: Arc<Mutex<State>>,
+    base: Arc<State>,
+    base_sequence: u64,
+    state: Arc<Mutex<Arc<State>>>,
     writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     reads: BTreeSet<Vec<u8>>,
 }
@@ -167,17 +169,20 @@ impl Transaction for MemoryTransaction {
     }
 
     fn commit(self) -> Result<CommitInfo> {
-        let mut state = lock_state(self.state.as_ref())?;
+        let base_sequence = self.base_sequence;
+        drop(self.base);
 
+        let mut state = lock_state(self.state.as_ref())?;
         for key in self.reads.iter().chain(self.writes.keys()) {
             if let Some(entry) = state.entries.get(key)
-                && entry.sequence > self.base.sequence
+                && entry.sequence > base_sequence
             {
                 return Err(BackendError::Conflict);
             }
         }
 
         let sequence = state.sequence + 1;
+        let state = Arc::make_mut(&mut state);
         for (key, value) in self.writes {
             state.entries.insert(key, Entry { value, sequence });
         }
@@ -189,7 +194,7 @@ impl Transaction for MemoryTransaction {
     fn rollback(self) {}
 }
 
-fn lock_state(state: &Mutex<State>) -> Result<MutexGuard<'_, State>> {
+fn lock_state(state: &Mutex<Arc<State>>) -> Result<MutexGuard<'_, Arc<State>>> {
     state
         .lock()
         .map_err(|_| BackendError::Other("memory backend lock poisoned".to_owned()))

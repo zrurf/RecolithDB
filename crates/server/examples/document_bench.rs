@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use recolith_backend::StorageBackend;
 use recolith_backend_fjall::FjallBackend;
+use recolith_backend_memory::MemoryBackend;
 use recolith_common::{CollectionId, FieldId, FragmentId, PartitionId};
 use recolith_model::{DocumentKeySchema, KeyField, KeyType, KeyValue};
 use recolith_query::DocumentReadRequest;
@@ -16,6 +17,8 @@ const WRITES: u64 = 20_000;
 const READS: usize = 100_000;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    bench("memory", Arc::new(MemoryBackend::new()))?;
+
     let dir = bench_dir("server-document-fjall");
     bench("fjall", Arc::new(FjallBackend::open(&dir)?))?;
     let _ = std::fs::remove_dir_all(&dir);

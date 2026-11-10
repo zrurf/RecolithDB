@@ -1,6 +1,7 @@
 //! TCP and TLS server runtime and session handling.
 
 mod convert;
+mod metadata;
 mod operations;
 mod session;
 mod tls;

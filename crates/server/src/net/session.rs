@@ -12,9 +12,9 @@ use recolith_protocol::frame::{
     FrameCodec, FrameHeader, HEADER_LEN, PayloadEncoding, VERSION_MAJOR, VERSION_MINOR,
 };
 use recolith_protocol::messages::{
-    AuthMethod, AuthResult, DocumentGetRequest, DocumentPutRequest, ErrorResponse, GoAway,
-    HelloRequest, PingRequest, PingResponse, QueryRequest, SecurityMode, WelcomeResponse,
-    compression_bit, feature, opcode, status,
+    AuthMethod, AuthResult, DescribeCollectionRequest, DocumentGetRequest, DocumentPutRequest,
+    ErrorResponse, GoAway, HelloRequest, PingRequest, PingResponse, QueryRequest, SecurityMode,
+    WelcomeResponse, compression_bit, feature, opcode, status,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -114,7 +114,8 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             | feature::DOCUMENT_READ
             | feature::DOCUMENT_WRITE
             | feature::QUERY
-            | feature::IDEMPOTENCY,
+            | feature::IDEMPOTENCY
+            | feature::CATALOG_DESCRIBE,
         max_frame_size: u32::try_from(max_frame_size).unwrap_or(u32::MAX),
         max_batch_subframes: u32::try_from(max_batch_subframes).unwrap_or(u32::MAX),
         max_batch_bytes: u32::try_from(max_batch_bytes).unwrap_or(u32::MAX),
@@ -169,7 +170,11 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
 
         let body = codec.decode(&header, &payload)?;
         match header.opcode() {
-            opcode::PING | opcode::DOC_GET | opcode::DOC_PUT | opcode::QUERY => {
+            opcode::PING
+            | opcode::DOC_GET
+            | opcode::DOC_PUT
+            | opcode::QUERY
+            | opcode::DESCRIBE_COLLECTION => {
                 match execute(
                     header.opcode(),
                     body,
@@ -281,6 +286,11 @@ async fn execute<B: StorageBackend>(
             let request = QueryRequest::decode(body.as_slice())
                 .map_err(|_| OperationError::invalid("malformed QUERY payload"))?;
             operations::query(&store, request)
+        }
+        opcode::DESCRIBE_COLLECTION => {
+            let request = DescribeCollectionRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed DESCRIBE_COLLECTION payload"))?;
+            operations::describe_collection(&store, request)
         }
         _ => Err(OperationError::internal("unsupported operation")),
     })

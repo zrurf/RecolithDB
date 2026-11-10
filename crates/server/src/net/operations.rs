@@ -5,9 +5,9 @@ use prost::Message;
 use recolith_backend::StorageBackend;
 use recolith_common::{CollectionId, CommitTs, FieldId, FragmentId, PartitionId};
 use recolith_protocol::messages::{
-    self, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest, DocumentPutResponse,
-    DocumentResult, FragmentVersion, QueryRequest, QueryResponse, RequestMeta, opcode, status,
-    value,
+    self, DescribeCollectionRequest, DescribeCollectionResponse, DocumentGetRequest,
+    DocumentGetResponse, DocumentPutRequest, DocumentPutResponse, DocumentResult, FragmentVersion,
+    QueryRequest, QueryResponse, RequestMeta, describe_collection_request, opcode, status, value,
 };
 use recolith_query::error::QueryError;
 use recolith_query::{
@@ -108,6 +108,91 @@ pub(crate) fn document_get<B: StorageBackend>(
         opcode: opcode::DOC_GET,
         payload: response.encode_to_vec(),
     })
+}
+
+pub(crate) fn describe_collection<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    request: DescribeCollectionRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    let snapshot = store
+        .catalog_snapshot()
+        .map_err(|error| OperationError::internal(error.to_string()))?;
+    let collection = resolve_collection(&snapshot, &request)?;
+    let metadata = super::metadata::collection_metadata(&snapshot, collection)?;
+    let response = DescribeCollectionResponse {
+        catalog_generation: snapshot.generation.get(),
+        collection: Some(metadata),
+    };
+
+    Ok(OperationResponse {
+        opcode: opcode::DESCRIBE_COLLECTION,
+        payload: response.encode_to_vec(),
+    })
+}
+
+fn resolve_collection<'a>(
+    snapshot: &'a recolith_catalog::CatalogSnapshot,
+    request: &DescribeCollectionRequest,
+) -> Result<&'a recolith_model::Collection, OperationError> {
+    let target = request
+        .target
+        .as_ref()
+        .ok_or_else(|| OperationError::invalid("collection target is required"))?;
+    match target {
+        describe_collection_request::Target::CollectionId(id) => {
+            let collection = snapshot
+                .collections
+                .get(&CollectionId::new(*id))
+                .ok_or_else(|| {
+                    OperationError::new(status::NOT_FOUND, "collection was not found")
+                })?;
+            if !request.keyspace.is_empty()
+                && !keyspace_matches(snapshot, collection, &request.keyspace)
+            {
+                return Err(OperationError::new(
+                    status::NOT_FOUND,
+                    "collection was not found in the requested keyspace",
+                ));
+            }
+
+            Ok(collection)
+        }
+        describe_collection_request::Target::CollectionName(name) => {
+            let mut matches = snapshot
+                .collections
+                .values()
+                .filter(|collection| collection.name() == name)
+                .filter(|collection| {
+                    request.keyspace.is_empty()
+                        || keyspace_matches(snapshot, collection, &request.keyspace)
+                });
+            let Some(collection) = matches.next() else {
+                return Err(OperationError::new(
+                    status::NOT_FOUND,
+                    "collection was not found",
+                ));
+            };
+            if matches.next().is_some() {
+                return Err(OperationError::invalid(
+                    "collection name is ambiguous; specify a keyspace",
+                ));
+            }
+
+            Ok(collection)
+        }
+    }
+}
+
+fn keyspace_matches(
+    snapshot: &recolith_catalog::CatalogSnapshot,
+    collection: &recolith_model::Collection,
+    keyspace: &str,
+) -> bool {
+    snapshot
+        .keyspaces
+        .get(&collection.keyspace_id())
+        .is_some_and(|candidate| candidate.name() == keyspace)
 }
 
 pub(crate) fn document_put<B: StorageBackend>(

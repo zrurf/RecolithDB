@@ -201,3 +201,125 @@ message DocumentResult {
 message QueryResponse {
   repeated DocumentResult documents = 1;
 }
+
+enum KeyFieldType {
+  KEY_FIELD_TYPE_UNSPECIFIED = 0;
+  KEY_FIELD_TYPE_U64 = 1;
+  KEY_FIELD_TYPE_I64 = 2;
+  KEY_FIELD_TYPE_STRING = 3;
+  KEY_FIELD_TYPE_BYTES = 4;
+  KEY_FIELD_TYPE_UUID = 5;
+}
+
+enum FragmentCardinality {
+  FRAGMENT_CARDINALITY_UNSPECIFIED = 0;
+  FRAGMENT_CARDINALITY_ONE = 1;
+  FRAGMENT_CARDINALITY_MANY = 2;
+}
+
+enum SchemaScalarType {
+  SCHEMA_SCALAR_TYPE_UNSPECIFIED = 0;
+  SCHEMA_SCALAR_TYPE_BOOL = 1;
+  SCHEMA_SCALAR_TYPE_I32 = 2;
+  SCHEMA_SCALAR_TYPE_I64 = 3;
+  SCHEMA_SCALAR_TYPE_U32 = 4;
+  SCHEMA_SCALAR_TYPE_U64 = 5;
+  SCHEMA_SCALAR_TYPE_F32 = 6;
+  SCHEMA_SCALAR_TYPE_F64 = 7;
+  SCHEMA_SCALAR_TYPE_STRING = 8;
+  SCHEMA_SCALAR_TYPE_BYTES = 9;
+  SCHEMA_SCALAR_TYPE_TIMESTAMP = 10;
+  SCHEMA_SCALAR_TYPE_DURATION = 11;
+}
+
+enum IndexKind {
+  INDEX_KIND_UNSPECIFIED = 0;
+  INDEX_KIND_EQUALITY = 1;
+  INDEX_KIND_RANGE = 2;
+  INDEX_KIND_COMPOSITE = 3;
+  INDEX_KIND_UNIQUE = 4;
+}
+
+message SchemaList {
+  SchemaType element = 1;
+}
+
+message SchemaMap {
+  SchemaType key = 1;
+  SchemaType value = 2;
+}
+
+message SchemaEnum {
+  string name = 1;
+  repeated string variants = 2;
+}
+
+message SchemaRecord {
+  string name = 1;
+  repeated SchemaField fields = 2;
+}
+
+message SchemaType {
+  oneof kind {
+    SchemaScalarType scalar = 1;
+    SchemaList list = 2;
+    SchemaMap map = 3;
+    SchemaEnum enum_type = 4;
+    SchemaRecord record = 5;
+  }
+}
+
+message SchemaField {
+  uint32 id = 1;
+  string name = 2;
+  bool optional = 3;
+  SchemaType type = 4;
+}
+
+message KeyFieldMetadata {
+  string name = 1;
+  KeyFieldType type = 2;
+}
+
+message FragmentMetadata {
+  uint32 id = 1;
+  string name = 2;
+  FragmentCardinality cardinality = 3;
+  uint64 bucket_id = 4;
+  uint64 schema_id = 5;
+  uint32 schema_version = 6;
+  repeated SchemaField fields = 7;
+}
+
+message IndexMetadata {
+  uint64 id = 1;
+  uint64 bucket_id = 2;
+  string name = 3;
+  IndexKind kind = 4;
+  repeated uint32 fields = 5;
+}
+
+message CollectionMetadata {
+  uint64 id = 1;
+  uint32 keyspace_id = 2;
+  string keyspace = 3;
+  string name = 4;
+  string affinity_group = 5;
+  repeated KeyFieldMetadata key_fields = 6;
+  repeated FragmentMetadata fragments = 7;
+  repeated IndexMetadata indexes = 8;
+}
+
+message DescribeCollectionRequest {
+  RequestMeta meta = 1;
+  string keyspace = 2;
+  oneof target {
+    uint64 collection_id = 3;
+    string collection_name = 4;
+  }
+}
+
+message DescribeCollectionResponse {
+  uint64 catalog_generation = 1;
+  CollectionMetadata collection = 2;
+}

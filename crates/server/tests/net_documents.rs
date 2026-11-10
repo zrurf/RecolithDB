@@ -13,9 +13,11 @@ use recolith_model::{
 };
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN};
 use recolith_protocol::messages::{
-    AuthMethod, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest, DocumentPutResponse,
-    FieldSelection, FieldValue, FragmentPayload, HelloRequest, NamedParameter, QueryRequest,
-    QueryResponse, RequestMeta, Value, WelcomeResponse, opcode, status, value,
+    AuthMethod, DescribeCollectionRequest, DescribeCollectionResponse, DocumentGetRequest,
+    DocumentGetResponse, DocumentPutRequest, DocumentPutResponse, FieldSelection, FieldValue,
+    FragmentPayload, HelloRequest, KeyFieldType, NamedParameter, QueryRequest, QueryResponse,
+    RequestMeta, SchemaScalarType, Value, WelcomeResponse, describe_collection_request, opcode,
+    schema_type, status, value,
 };
 use recolith_schema::{Field, RecordSchema, Type};
 use recolith_server::{DocumentStore, ServerConfig, serve};
@@ -363,4 +365,95 @@ async fn executes_rql_query_over_protocol() {
             kind: Some(value::Kind::StringValue("alex".to_owned())),
         })
     );
+}
+
+#[tokio::test]
+async fn describes_collection_metadata() {
+    let store = store();
+    let address = start_server(Arc::clone(&store)).await;
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let codec = handshake(&mut stream).await;
+
+    let request = DescribeCollectionRequest {
+        meta: None,
+        keyspace: "game".to_owned(),
+        target: Some(describe_collection_request::Target::CollectionName(
+            "player".to_owned(),
+        )),
+    };
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::DESCRIBE_COLLECTION, 50),
+        &request.encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.opcode(), opcode::DESCRIBE_COLLECTION);
+    assert_eq!(header.status(), status::OK);
+    let response = DescribeCollectionResponse::decode(payload.as_slice()).expect("describe");
+    assert_eq!(
+        response.catalog_generation,
+        store.catalog_generation().get()
+    );
+    let collection = response.collection.expect("collection");
+    assert_eq!(collection.id, 1);
+    assert_eq!(collection.keyspace, "game");
+    assert_eq!(collection.name, "player");
+    assert_eq!(collection.key_fields[0].name, "player_id");
+    assert_eq!(collection.key_fields[0].r#type, KeyFieldType::U64 as i32);
+    assert_eq!(collection.fragments[0].name, "profile");
+    assert_eq!(collection.fragments[0].fields[0].name, "name");
+    assert!(matches!(
+        collection.fragments[0].fields[0]
+            .r#type
+            .as_ref()
+            .and_then(|schema_type| schema_type.kind.as_ref()),
+        Some(schema_type::Kind::Scalar(value)) if *value == SchemaScalarType::String as i32
+    ));
+}
+
+#[tokio::test]
+async fn rejects_unknown_or_stale_collection_description() {
+    let store = store();
+    let address = start_server(store).await;
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let codec = handshake(&mut stream).await;
+
+    let unknown = DescribeCollectionRequest {
+        meta: None,
+        keyspace: String::new(),
+        target: Some(describe_collection_request::Target::CollectionName(
+            "missing".to_owned(),
+        )),
+    };
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::DESCRIBE_COLLECTION, 51),
+        &unknown.encode_to_vec(),
+    )
+    .await;
+    let (header, _) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.opcode(), opcode::ERROR);
+    assert_eq!(header.status(), status::NOT_FOUND);
+
+    let stale = DescribeCollectionRequest {
+        meta: Some(RequestMeta {
+            catalog_generation: 999,
+            ..Default::default()
+        }),
+        keyspace: String::new(),
+        target: Some(describe_collection_request::Target::CollectionId(1)),
+    };
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::DESCRIBE_COLLECTION, 52),
+        &stale.encode_to_vec(),
+    )
+    .await;
+    let (header, _) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.opcode(), opcode::ERROR);
+    assert_eq!(header.status(), status::STALE_CATALOG);
 }

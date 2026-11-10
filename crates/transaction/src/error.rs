@@ -20,6 +20,12 @@ pub enum TransactionError {
     },
     /// Commit-clock record is malformed.
     InvalidCommitClock { length: usize },
+    /// Commit-clock timestamp space is exhausted.
+    CommitClockOverflow,
+    /// Commit-clock allocation state is poisoned.
+    ClockLockPoisoned,
+    /// This write path has no commit clock.
+    MissingCommitClock,
     /// Storage encoding or record operation failed.
     Storage(StorageError),
     /// Optimistic version check failed.
@@ -45,6 +51,9 @@ impl fmt::Display for TransactionError {
             Self::InvalidCommitClock { length } => {
                 write!(formatter, "commit clock must be 8 bytes, got {length}")
             }
+            Self::CommitClockOverflow => formatter.write_str("commit clock overflow"),
+            Self::ClockLockPoisoned => formatter.write_str("commit clock lock poisoned"),
+            Self::MissingCommitClock => formatter.write_str("write path has no commit clock"),
             Self::Storage(error) => write!(formatter, "storage error: {error}"),
             Self::VersionConflict { expected, actual } => match actual {
                 Some(actual) => write!(

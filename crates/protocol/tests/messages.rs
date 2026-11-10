@@ -1,7 +1,10 @@
 use prost::Message;
 use recolith_protocol::messages::{
-    AuthMethod, DocumentPutRequest, FieldValue, FragmentPayload, HelloRequest, NamedParameter,
-    QueryRequest, RequestMeta, Value, compression_bit, feature, value,
+    AuthMethod, CollectionMetadata, DescribeCollectionRequest, DescribeCollectionResponse,
+    DocumentPutRequest, FieldValue, FragmentMetadata, FragmentPayload, HelloRequest,
+    KeyFieldMetadata, KeyFieldType, NamedParameter, QueryRequest, RequestMeta, SchemaField,
+    SchemaList, SchemaScalarType, SchemaType, Value, compression_bit, describe_collection_request,
+    feature, schema_type, value,
 };
 
 #[test]
@@ -81,4 +84,76 @@ fn roundtrips_query_parameters() {
     let decoded = QueryRequest::decode(encoded.as_slice()).expect("decode");
 
     assert_eq!(decoded, query);
+}
+
+#[test]
+fn roundtrips_collection_metadata() {
+    let string_type = SchemaType {
+        kind: Some(schema_type::Kind::Scalar(SchemaScalarType::String as i32)),
+    };
+    let response = DescribeCollectionResponse {
+        catalog_generation: 7,
+        collection: Some(CollectionMetadata {
+            id: 1,
+            keyspace_id: 1,
+            keyspace: "game".to_owned(),
+            name: "player".to_owned(),
+            affinity_group: "player".to_owned(),
+            key_fields: vec![KeyFieldMetadata {
+                name: "player_id".to_owned(),
+                r#type: KeyFieldType::U64 as i32,
+            }],
+            fragments: vec![FragmentMetadata {
+                id: 1,
+                name: "profile".to_owned(),
+                cardinality: recolith_protocol::messages::FragmentCardinality::One as i32,
+                bucket_id: 1,
+                schema_id: 1,
+                schema_version: 1,
+                fields: vec![
+                    SchemaField {
+                        id: 1,
+                        name: "name".to_owned(),
+                        optional: false,
+                        r#type: Some(string_type.clone()),
+                    },
+                    SchemaField {
+                        id: 2,
+                        name: "tags".to_owned(),
+                        optional: true,
+                        r#type: Some(SchemaType {
+                            kind: Some(schema_type::Kind::List(Box::new(SchemaList {
+                                element: Some(Box::new(string_type)),
+                            }))),
+                        }),
+                    },
+                ],
+            }],
+            indexes: Vec::new(),
+        }),
+    };
+
+    let encoded = response.encode_to_vec();
+    let decoded = DescribeCollectionResponse::decode(encoded.as_slice()).expect("decode");
+
+    assert_eq!(decoded, response);
+}
+
+#[test]
+fn roundtrips_describe_collection_request() {
+    let request = DescribeCollectionRequest {
+        meta: Some(RequestMeta {
+            catalog_generation: 7,
+            ..Default::default()
+        }),
+        keyspace: "game".to_owned(),
+        target: Some(describe_collection_request::Target::CollectionName(
+            "player".to_owned(),
+        )),
+    };
+
+    let encoded = request.encode_to_vec();
+    let decoded = DescribeCollectionRequest::decode(encoded.as_slice()).expect("decode");
+
+    assert_eq!(decoded, request);
 }

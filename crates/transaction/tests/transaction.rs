@@ -340,3 +340,155 @@ mod unique {
         assert!(reservation.confirm().is_err());
     }
 }
+
+mod batched_clock {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use recolith_backend::{StorageBackend, Transaction, TxnOptions};
+    use recolith_backend_memory::MemoryBackend;
+    use recolith_common::CommitTs;
+    use recolith_transaction::{BatchedCommitClock, DEFAULT_CLOCK_KEY, TransactionError};
+
+    #[test]
+    fn reserves_ranges_and_persists_high_water() {
+        let backend = MemoryBackend::new();
+        let clock = BatchedCommitClock::new(DEFAULT_CLOCK_KEY, 4);
+
+        assert_eq!(clock.reserve(&backend).expect("first"), CommitTs::new(1));
+        assert_eq!(clock.reserve(&backend).expect("second"), CommitTs::new(2));
+
+        let reloaded = BatchedCommitClock::new(DEFAULT_CLOCK_KEY, 4);
+        assert_eq!(
+            reloaded.reserve(&backend).expect("reloaded"),
+            CommitTs::new(5)
+        );
+        assert_eq!(clock.reserve(&backend).expect("third"), CommitTs::new(3));
+    }
+
+    #[test]
+    fn exhausts_and_reserves_another_range() {
+        let backend = MemoryBackend::new();
+        let clock = BatchedCommitClock::new(DEFAULT_CLOCK_KEY, 2);
+
+        assert_eq!(clock.reserve(&backend).expect("one"), CommitTs::new(1));
+        assert_eq!(clock.reserve(&backend).expect("two"), CommitTs::new(2));
+        assert_eq!(clock.reserve(&backend).expect("three"), CommitTs::new(3));
+    }
+
+    #[test]
+    fn concurrent_reservations_are_unique() {
+        let backend = MemoryBackend::new();
+        let clock = Arc::new(BatchedCommitClock::new(DEFAULT_CLOCK_KEY, 8));
+
+        let reservations = std::thread::scope(|scope| {
+            let handles = (0..8)
+                .map(|_| {
+                    let backend = &backend;
+                    let clock = Arc::clone(&clock);
+                    scope.spawn(move || {
+                        (0..100)
+                            .map(|_| clock.reserve(backend).expect("reserve").get())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("thread"))
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(reservations.len(), 800);
+        assert_eq!(
+            reservations.iter().copied().collect::<HashSet<_>>().len(),
+            800
+        );
+        assert_eq!(reservations.iter().copied().min(), Some(1));
+        assert_eq!(reservations.iter().copied().max(), Some(800));
+    }
+
+    #[test]
+    fn rejects_malformed_clock_record() {
+        let backend = MemoryBackend::new();
+        let mut transaction = backend.begin(TxnOptions::default()).expect("begin");
+        transaction.put(DEFAULT_CLOCK_KEY, vec![1, 2, 3]);
+        transaction.commit().expect("commit");
+
+        let clock = BatchedCommitClock::with_default_key();
+        assert!(matches!(
+            clock.reserve(&backend),
+            Err(TransactionError::InvalidCommitClock { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_clock_overflow() {
+        let backend = MemoryBackend::new();
+        let mut transaction = backend.begin(TxnOptions::default()).expect("begin");
+        transaction.put(DEFAULT_CLOCK_KEY, u64::MAX.to_be_bytes().to_vec());
+        transaction.commit().expect("commit");
+
+        let clock = BatchedCommitClock::with_default_key();
+        assert!(matches!(
+            clock.reserve(&backend),
+            Err(TransactionError::CommitClockOverflow)
+        ));
+    }
+
+    #[test]
+    fn zero_batch_size_still_allocates() {
+        let backend = MemoryBackend::new();
+        let clock = BatchedCommitClock::new(DEFAULT_CLOCK_KEY, 0);
+
+        assert_eq!(clock.batch_size(), 1);
+        assert_eq!(clock.reserve(&backend).expect("reserve"), CommitTs::new(1));
+    }
+}
+
+mod independent_batched_clocks {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use recolith_backend_memory::MemoryBackend;
+    use recolith_transaction::{BatchedCommitClock, DEFAULT_CLOCK_KEY};
+
+    #[test]
+    fn independent_allocators_do_not_reuse_timestamps() {
+        let backend = Arc::new(MemoryBackend::new());
+        let first = Arc::new(BatchedCommitClock::new(DEFAULT_CLOCK_KEY, 4));
+        let second = Arc::new(BatchedCommitClock::new(DEFAULT_CLOCK_KEY, 4));
+
+        let reservations = std::thread::scope(|scope| {
+            let handles = [first, second]
+                .into_iter()
+                .map(|clock| {
+                    let backend = Arc::clone(&backend);
+                    scope.spawn(move || {
+                        (0..50)
+                            .map(|_| clock.reserve(backend.as_ref()).expect("reserve").get())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            handles
+                .into_iter()
+                .flat_map(|handle| handle.join().expect("thread"))
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(reservations.len(), 100);
+        assert_eq!(
+            reservations.iter().copied().collect::<HashSet<_>>().len(),
+            100
+        );
+        assert_eq!(reservations.iter().copied().min(), Some(1));
+        let maximum = reservations.iter().copied().max().expect("maximum");
+        assert!(
+            (100..=104).contains(&maximum),
+            "unexpected maximum {maximum}"
+        );
+    }
+}

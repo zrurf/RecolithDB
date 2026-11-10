@@ -133,7 +133,7 @@ impl FragmentWrite {
 /// Local write path that stamps records with a persistent commit clock.
 pub struct LocalWritePath<B: StorageBackend> {
     transaction: B::Transaction,
-    clock: PersistentCommitClock,
+    clock: Option<PersistentCommitClock>,
 }
 
 impl<B: StorageBackend> LocalWritePath<B> {
@@ -146,7 +146,24 @@ impl<B: StorageBackend> LocalWritePath<B> {
         let mut transaction = backend.begin(options)?;
         clock.load(&mut transaction)?;
 
-        Ok(Self { transaction, clock })
+        Ok(Self {
+            transaction,
+            clock: Some(clock),
+        })
+    }
+
+    /// Begins a transaction without attaching a commit clock.
+    ///
+    /// Use [`Self::write_fragments_at`] with an externally allocated timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransactionError::Backend`] if the transaction cannot begin.
+    pub fn begin_unclocked(backend: &B, options: TxnOptions) -> Result<Self> {
+        Ok(Self {
+            transaction: backend.begin(options)?,
+            clock: None,
+        })
     }
 
     /// Writes a schema-aware record and returns its commit timestamp.
@@ -221,6 +238,30 @@ impl<B: StorageBackend> LocalWritePath<B> {
     /// Returns [`TransactionError::EmptyWriteBatch`] for an empty batch, or a version,
     /// storage, index, or backend error.
     pub fn write_fragments(&mut self, fragments: &[FragmentWrite]) -> Result<CommitTs> {
+        self.validate_fragments(fragments)?;
+        let commit_ts = self.reserve_timestamp()?;
+        self.write_fragments_inner(fragments, commit_ts)
+    }
+
+    /// Writes multiple fragments with a caller-supplied commit timestamp.
+    ///
+    /// The caller must allocate unique timestamps, for example with
+    /// [`crate::BatchedCommitClock`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransactionError::EmptyWriteBatch`] for an empty batch, or a version,
+    /// storage, index, or backend error.
+    pub fn write_fragments_at(
+        &mut self,
+        fragments: &[FragmentWrite],
+        commit_ts: CommitTs,
+    ) -> Result<CommitTs> {
+        self.validate_fragments(fragments)?;
+        self.write_fragments_inner(fragments, commit_ts)
+    }
+
+    fn validate_fragments(&mut self, fragments: &[FragmentWrite]) -> Result<()> {
         if fragments.is_empty() {
             return Err(TransactionError::EmptyWriteBatch);
         }
@@ -231,7 +272,14 @@ impl<B: StorageBackend> LocalWritePath<B> {
             }
         }
 
-        let commit_ts = self.clock.reserve(&mut self.transaction)?;
+        Ok(())
+    }
+
+    fn write_fragments_inner(
+        &mut self,
+        fragments: &[FragmentWrite],
+        commit_ts: CommitTs,
+    ) -> Result<CommitTs> {
         for fragment in fragments {
             let header = RecordHeader::new(
                 fragment.schema().id(),
@@ -251,6 +299,15 @@ impl<B: StorageBackend> LocalWritePath<B> {
         Ok(commit_ts)
     }
 
+    fn reserve_timestamp(&mut self) -> Result<CommitTs> {
+        let clock = self
+            .clock
+            .as_ref()
+            .ok_or(TransactionError::MissingCommitClock)?;
+
+        clock.reserve(&mut self.transaction)
+    }
+
     fn write_record_internal(
         &mut self,
         key: &[u8],
@@ -263,7 +320,7 @@ impl<B: StorageBackend> LocalWritePath<B> {
             self.check_version(key, expected)?;
         }
 
-        let commit_ts = self.clock.reserve(&mut self.transaction)?;
+        let commit_ts = self.reserve_timestamp()?;
         let header = RecordHeader::new(schema.id(), schema.version(), commit_ts);
         write_fields(&mut self.transaction, key, &header, schema, data)?;
         self.apply_indexes(key, indexes)?;

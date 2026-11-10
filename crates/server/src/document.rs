@@ -15,7 +15,7 @@ use recolith_storage::{
     encode_record_key,
 };
 use recolith_transaction::{
-    FragmentWrite, IndexUpdate, LocalWritePath, PersistentCommitClock, TransactionError,
+    BatchedCommitClock, FragmentWrite, IndexUpdate, LocalWritePath, TransactionError,
 };
 
 /// One fragment record to write as part of a document.
@@ -252,13 +252,18 @@ impl From<StorageError> for DocumentError {
 pub struct DocumentStore<B: StorageBackend> {
     catalog: Arc<Catalog>,
     backend: Arc<B>,
+    clock: BatchedCommitClock,
 }
 
 impl<B: StorageBackend> DocumentStore<B> {
     /// Creates a document store.
     #[must_use]
     pub fn new(catalog: Arc<Catalog>, backend: Arc<B>) -> Self {
-        Self { catalog, backend }
+        Self {
+            catalog,
+            backend,
+            clock: BatchedCommitClock::with_default_key(),
+        }
     }
 
     /// Returns the current catalog generation.
@@ -379,11 +384,8 @@ impl<B: StorageBackend> DocumentStore<B> {
             });
         }
 
-        let mut path = LocalWritePath::begin(
-            self.backend.as_ref(),
-            PersistentCommitClock::with_default_key(),
-            TxnOptions::default(),
-        )?;
+        let mut path =
+            LocalWritePath::begin_unclocked(self.backend.as_ref(), TxnOptions::default())?;
         if let Some(idempotency) = request.idempotency()
             && let Some(value) = path.get_raw(idempotency.key())?
         {
@@ -422,7 +424,8 @@ impl<B: StorageBackend> DocumentStore<B> {
             }
             writes.push(write);
         }
-        let commit_ts = path.write_fragments(&writes)?;
+        let commit_ts = self.clock.reserve(self.backend.as_ref())?;
+        path.write_fragments_at(&writes, commit_ts)?;
         if let Some(idempotency) = request.idempotency() {
             path.put_raw(
                 idempotency.key(),
