@@ -36,6 +36,8 @@ pub mod opcode {
     pub const CATALOG_DROP: u16 = 0x0061;
     /// Catalog object alteration.
     pub const CATALOG_ALTER: u16 = 0x0062;
+    /// Online logical backup.
+    pub const BACKUP: u16 = 0x0070;
     /// Structured error response.
     pub const ERROR: u16 = 0x0040;
     /// Session shutdown notice.
@@ -110,6 +112,8 @@ pub mod feature {
     pub const EXPLAIN: u64 = 1 << 9;
     /// Aggregate queries are supported.
     pub const AGGREGATE: u64 = 1 << 10;
+    /// Online logical backups are supported.
+    pub const BACKUP: u64 = 1 << 11;
 }
 
 /// Compression algorithm bits used by the handshake.

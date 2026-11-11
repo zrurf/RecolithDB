@@ -14,14 +14,15 @@ use recolith_model::{
     IndexDefinition, IndexKind, KeyField, KeyType, Keyspace,
 };
 use recolith_protocol::messages::{
-    self, AggregateColumn, AggregateRequest, AggregateResponse, AggregateRow, BucketDefinition,
-    CatalogAlterRequest, CatalogAlterResponse, CatalogApplyRequest, CatalogApplyResponse,
-    CatalogDropRequest, CatalogDropResponse, DescribeCollectionRequest, DescribeCollectionResponse,
-    DocumentGetRequest, DocumentGetResponse, DocumentPutRequest, DocumentPutResponse,
-    DocumentResult, ExplainDocumentPlan, ExplainDrive, ExplainFieldSelection, ExplainFilter,
-    ExplainFilterOp, ExplainIndex, ExplainKeyFilter, ExplainOrder, ExplainRequest, ExplainResponse,
-    ExplainScanPlan, FragmentVersion, QueryRequest, QueryResponse, RequestMeta,
-    describe_collection_request, explain_response, opcode, status, value,
+    self, AggregateColumn, AggregateRequest, AggregateResponse, AggregateRow, BackupRequest,
+    BackupResponse, BucketDefinition, CatalogAlterRequest, CatalogAlterResponse,
+    CatalogApplyRequest, CatalogApplyResponse, CatalogDropRequest, CatalogDropResponse,
+    DescribeCollectionRequest, DescribeCollectionResponse, DocumentGetRequest, DocumentGetResponse,
+    DocumentPutRequest, DocumentPutResponse, DocumentResult, ExplainDocumentPlan, ExplainDrive,
+    ExplainFieldSelection, ExplainFilter, ExplainFilterOp, ExplainIndex, ExplainKeyFilter,
+    ExplainOrder, ExplainRequest, ExplainResponse, ExplainScanPlan, FragmentVersion, QueryRequest,
+    QueryResponse, RequestMeta, describe_collection_request, explain_response, opcode, status,
+    value,
 };
 use recolith_query::error::QueryError;
 use recolith_query::{
@@ -35,6 +36,7 @@ use recolith_storage::StorageError;
 use recolith_transaction::TransactionError;
 use sha2::{Digest, Sha256};
 
+use crate::backup::BackupError;
 use crate::document::{
     DocumentError, DocumentStore, DocumentWrite, FragmentWriteRequest, Idempotency,
 };
@@ -916,6 +918,27 @@ const fn wire_aggregate_function(function: QueryAggregateFunction) -> messages::
     }
 }
 
+pub(crate) fn backup<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    request: BackupRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    require_admin(principal, "*", "*")?;
+    let (stats, generation) = store.backup(&request.name).map_err(map_backup)?;
+    let response = BackupResponse {
+        catalog_generation: generation.get(),
+        file_name: request.name,
+        entries: stats.entries,
+        bytes: stats.bytes,
+    };
+
+    Ok(OperationResponse {
+        opcode: opcode::BACKUP,
+        payload: response.encode_to_vec(),
+    })
+}
+
 pub(crate) fn explain<B: StorageBackend>(
     store: &DocumentStore<B>,
     principal: &Principal,
@@ -1356,6 +1379,17 @@ fn map_query(error: QueryError) -> OperationError {
         }
         _ => OperationError::new(status::INTERNAL, error.to_string()),
     }
+}
+
+fn map_backup(error: BackupError) -> OperationError {
+    let status_code = match error {
+        BackupError::NotConfigured => status::FAILED_PRECONDITION,
+        BackupError::InvalidName(_) => status::INVALID_REQUEST,
+        BackupError::OutputExists(_) => status::CONFLICT,
+        _ => status::INTERNAL,
+    };
+
+    OperationError::new(status_code, error.to_string())
 }
 
 fn map_bind(error: RqlBindError) -> OperationError {

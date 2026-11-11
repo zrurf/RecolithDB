@@ -26,6 +26,9 @@ pub struct Config {
     /// Optional token and role authentication settings.
     #[serde(default)]
     pub auth: Option<AuthSettings>,
+    /// Optional online backup settings.
+    #[serde(default)]
+    pub backup: BackupSettings,
 }
 
 /// Listener and protocol settings.
@@ -106,6 +109,15 @@ pub struct CatalogSettings {
     /// Metadata used only when the persistent catalog is empty.
     #[serde(default)]
     pub bootstrap: Option<PathBuf>,
+}
+
+/// Online backup settings.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupSettings {
+    /// Directory that may receive online logical backups.
+    #[serde(default)]
+    pub directory: Option<PathBuf>,
 }
 
 /// Configuration loading or validation failure.
@@ -217,6 +229,9 @@ impl Config {
         if let Some(bootstrap) = &mut self.catalog.bootstrap {
             resolve(base, bootstrap);
         }
+        if let Some(directory) = &mut self.backup.directory {
+            resolve(base, directory);
+        }
         if let Some(auth) = &mut self.auth {
             resolve(base, &mut auth.secret_file);
             if let Some(previous) = &mut auth.previous_secret_file {
@@ -274,6 +289,19 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "server.max_decompressed_size must be greater than zero".to_owned(),
             ));
+        }
+        if let Some(directory) = &self.backup.directory {
+            if directory.as_os_str().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "backup.directory must not be empty".to_owned(),
+                ));
+            }
+            if directory.exists() && !directory.is_dir() {
+                return Err(ConfigError::Invalid(format!(
+                    "backup.directory is not a directory: {}",
+                    directory.display()
+                )));
+            }
         }
 
         Ok(())

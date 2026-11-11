@@ -14,6 +14,6 @@ pub use args::{Args, CatalogCommand, Command, DocCommand, TokenCommand};
 pub use command::{parse_field, parse_parameter, run};
 pub use error::CliError;
 pub use format::{
-    format_aggregate, format_collection, format_document, format_explain, format_fragments,
-    format_fragments_named, format_value,
+    format_aggregate, format_backup, format_collection, format_document, format_explain,
+    format_fragments, format_fragments_named, format_value,
 };

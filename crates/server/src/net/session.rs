@@ -13,11 +13,11 @@ use recolith_protocol::frame::{
     FrameCodec, FrameHeader, HEADER_LEN, PayloadEncoding, VERSION_MAJOR, VERSION_MINOR,
 };
 use recolith_protocol::messages::{
-    AggregateRequest, AuthMethod, AuthResult, CatalogAlterRequest, CatalogApplyRequest,
-    CatalogDropRequest, DescribeCollectionRequest, DocumentGetRequest, DocumentPutRequest,
-    ErrorResponse, ExplainRequest, GoAway, HelloRequest, PingRequest, PingResponse, QueryChunk,
-    QueryRequest, QueryStreamRequest, SecurityMode, WelcomeResponse, compression_bit, feature,
-    opcode, status,
+    AggregateRequest, AuthMethod, AuthResult, BackupRequest, CatalogAlterRequest,
+    CatalogApplyRequest, CatalogDropRequest, DescribeCollectionRequest, DocumentGetRequest,
+    DocumentPutRequest, ErrorResponse, ExplainRequest, GoAway, HelloRequest, PingRequest,
+    PingResponse, QueryChunk, QueryRequest, QueryStreamRequest, SecurityMode, WelcomeResponse,
+    compression_bit, feature, opcode, status,
 };
 use recolith_security::{Principal, unix_seconds};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -134,7 +134,8 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             | feature::CATALOG_WRITE
             | feature::STREAMING
             | feature::EXPLAIN
-            | feature::AGGREGATE,
+            | feature::AGGREGATE
+            | feature::BACKUP,
         max_frame_size: u32::try_from(max_frame_size).unwrap_or(u32::MAX),
         max_batch_subframes: u32::try_from(max_batch_subframes).unwrap_or(u32::MAX),
         max_batch_bytes: u32::try_from(max_batch_bytes).unwrap_or(u32::MAX),
@@ -227,6 +228,7 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             | opcode::DESCRIBE_COLLECTION
             | opcode::EXPLAIN
             | opcode::AGGREGATE
+            | opcode::BACKUP
             | opcode::CATALOG_APPLY
             | opcode::CATALOG_DROP
             | opcode::CATALOG_ALTER => {
@@ -366,6 +368,11 @@ async fn execute<B: StorageBackend>(
             let request = AggregateRequest::decode(body.as_slice())
                 .map_err(|_| OperationError::invalid("malformed AGGREGATE payload"))?;
             operations::aggregate(&store, &principal, request)
+        }
+        opcode::BACKUP => {
+            let request = BackupRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed BACKUP payload"))?;
+            operations::backup(&store, &principal, request)
         }
         opcode::DESCRIBE_COLLECTION => {
             let request = DescribeCollectionRequest::decode(body.as_slice())
@@ -602,6 +609,7 @@ async fn handle_batch<B: StorageBackend, W: AsyncWrite + Unpin>(
             opcode::CATALOG_APPLY
                 | opcode::CATALOG_DROP
                 | opcode::CATALOG_ALTER
+                | opcode::BACKUP
                 | opcode::QUERY_STREAM
         ) {
             send_error(

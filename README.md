@@ -89,8 +89,8 @@ RecolithDB is in early single-node development. Implemented today:
 - TCP session layer: HELLO/WELCOME negotiation, bearer-token auth, compression selection, PING/PONG, BATCH dispatch, and structured errors.
 - TLS 1.3 transport with rustls and typed Rust client handshake, authentication, document, query, explain, batch, and collection-description calls.
 - Runnable `recolithd` process with TOML configuration, memory or fjall storage, optional catalog bootstrap, persisted catalog reload, runtime catalog creation, TLS, bearer auth, logging, graceful shutdown, and offline configuration validation.
-- `recolith` CLI with `ping`, RQL `query`, `explain`, `aggregate`, `describe`, schema-aware `doc get` / `doc put`, runtime `catalog` creation, alteration, file apply, and drop commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
-- Protocol document and query operations: DOC_GET, idempotent DOC_PUT with same-transaction deduplication, RQL QUERY execution, plan-only EXPLAIN, and single-partition AGGREGATE.
+- `recolith` CLI with `ping`, RQL `query`, `explain`, `aggregate`, `backup`, `describe`, schema-aware `doc get` / `doc put`, runtime `catalog` creation, alteration, file apply, and drop commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
+- Protocol document, query, and admin operations: DOC_GET, idempotent DOC_PUT with same-transaction deduplication, RQL QUERY execution, plan-only EXPLAIN, single-partition AGGREGATE, and online BACKUP.
 - Process-exit crash recovery test and a full restart test covering catalog reload, commit-clock continuity, and persisted documents.
 - Point read/write benchmark example for the fjall adapter.
 - Batched commit-timestamp allocation, parallel document writes, and document plus concurrent multi-client benchmarks.
@@ -99,7 +99,7 @@ RecolithDB is in early single-node development. Implemented today:
 - Bounded concurrent sessions with connection-limit overload rejection and rejection metrics.
 - HMAC-SHA256 opaque tokens, role-based collection permissions, token expiry, local token inspection, verification, fingerprint display, revocation file management, and principal-scoped idempotency.
 - Atomic catalog creation, alteration, and removal for keyspaces, schema versions, buckets, collections, and indexes, with generation checks, purge controls, synchronous index backfill, schema switching, declarative record migration, and persisted reload.
-- Offline logical backup, verification, and restore with checksums, entry-count validation, and bounded scan batches.
+- Offline logical backup and restore plus online snapshot backups with checksums, entry-count validation, bounded scan batches, a restricted output directory, and overwrite protection.
 
 Not yet implemented:
 
@@ -130,7 +130,20 @@ The example configuration and catalog are under [`examples/recolithd`](examples/
 
 ## Backup and Restore
 
-Stop the server before taking or restoring a backup.
+Online backups write through a configured directory and a consistent backend snapshot:
+
+```toml
+[backup]
+directory = "backups"
+```
+
+```text
+cargo run -p recolith-cli --bin recolith -- --token "$RECOLITH_TOKEN" backup game-2026-11-11.backup
+```
+
+The server creates the directory at startup when it is missing. `BACKUP` requires global admin permission on `*/*`, rejects path separators and existing files, and does not block reads or writes while the snapshot is written. The resulting file uses the same format as offline backups and can be checked with the offline tool.
+
+Offline backup and restore still require the server to be stopped:
 
 ```text
 cargo run -p recolith-server --bin recolith-backup -- backup --data-dir examples/recolithd/data --output game.backup
@@ -138,7 +151,7 @@ cargo run -p recolith-server --bin recolith-backup -- verify --input game.backup
 cargo run -p recolith-server --bin recolith-backup -- restore --data-dir restored-data --input game.backup
 ```
 
-Restore requires an empty target directory. Switch the server data path to the restored directory after verifying it.
+Restore requires an empty target directory. Switch the server data path to the restored directory after verifying it. Online restore and backup streaming to clients are not implemented.
 
 ## Authentication
 
@@ -192,7 +205,7 @@ Then pass the token to commands:
 cargo run -p recolith-cli --bin recolith -- --token "$RECOLITH_TOKEN" ping
 ```
 
-Roles grant `read`, `write`, `describe`, or `admin` actions over keyspace/collection scopes. Role changes apply after restart. `DOC_GET`, `QUERY`, `EXPLAIN`, and `AGGREGATE` require `read`; `DOC_PUT` requires `write`; `DESCRIBE_COLLECTION` requires `describe`. The example `roles.toml` includes `admin`, `game-reader`, and `game-writer` roles. Catalog changes (`CATALOG_APPLY`, `CATALOG_DROP`, `CATALOG_ALTER`) require `admin` on every affected scope; schema registration requires global admin on `*/*`.
+Roles grant `read`, `write`, `describe`, or `admin` actions over keyspace/collection scopes. Role changes apply after restart. `DOC_GET`, `QUERY`, `EXPLAIN`, and `AGGREGATE` require `read`; `DOC_PUT` requires `write`; `DESCRIBE_COLLECTION` requires `describe`. The example `roles.toml` includes `admin`, `game-reader`, and `game-writer` roles. Catalog changes (`CATALOG_APPLY`, `CATALOG_DROP`, `CATALOG_ALTER`) require `admin` on every affected scope; schema registration requires global admin on `*/*`. Online `BACKUP` requires global admin on `*/*`.
 
 ## Queries
 

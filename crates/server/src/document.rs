@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Bound;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use recolith_backend::{
@@ -28,6 +29,7 @@ use recolith_transaction::{
     BatchedCommitClock, FragmentWrite, IndexUpdate, LocalWritePath, TransactionError,
 };
 
+use crate::backup::{self, BackupError, BackupStats};
 use crate::migration::{MigrationError, SchemaMigration, migrate_record};
 
 /// One fragment record to write as part of a document.
@@ -306,6 +308,8 @@ pub struct DocumentStore<B: StorageBackend> {
     clock: BatchedCommitClock,
     data_gate: RwLock<()>,
     ddl_lock: Mutex<()>,
+    backup_directory: Option<PathBuf>,
+    backup_lock: Mutex<()>,
 }
 
 impl<B: StorageBackend> DocumentStore<B> {
@@ -318,7 +322,16 @@ impl<B: StorageBackend> DocumentStore<B> {
             clock: BatchedCommitClock::with_default_key(),
             data_gate: RwLock::new(()),
             ddl_lock: Mutex::new(()),
+            backup_directory: None,
+            backup_lock: Mutex::new(()),
         }
+    }
+
+    /// Sets the directory used by online logical backups.
+    #[must_use]
+    pub fn with_backup_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.backup_directory = Some(directory.into());
+        self
     }
 
     /// Returns the current catalog generation.
@@ -334,6 +347,34 @@ impl<B: StorageBackend> DocumentStore<B> {
     /// Returns [`DocumentError`] if an internal catalog lock is poisoned.
     pub fn catalog_snapshot(&self) -> Result<CatalogSnapshot, DocumentError> {
         Ok(self.catalog().snapshot()?)
+    }
+
+    /// Writes a consistent logical backup into the configured directory.
+    ///
+    /// The snapshot is captured under the read gate, then written without
+    /// blocking reads or writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BackupError`] when backup is not configured, the name is
+    /// invalid, the output exists, or the snapshot or file write fails.
+    pub fn backup(&self, name: &str) -> Result<(BackupStats, CatalogGeneration), BackupError> {
+        let directory = self
+            .backup_directory
+            .as_ref()
+            .ok_or(BackupError::NotConfigured)?;
+        backup::validate_name(name)?;
+        let _backup = self
+            .backup_lock
+            .lock()
+            .map_err(|_| BackupError::Unavailable)?;
+        let (generation, snapshot) = {
+            let _read = self.read_guard().map_err(|_| BackupError::Unavailable)?;
+            (self.catalog_generation(), self.backend.snapshot()?)
+        };
+        let stats = backup::backup_snapshot(&snapshot, directory.join(name))?;
+
+        Ok((stats, generation))
     }
 
     /// Creates a query engine sharing this store's catalog and backend.
