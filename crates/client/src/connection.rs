@@ -11,10 +11,11 @@ use recolith_protocol::messages::{
     AggregateRequest, AggregateResponse, AuthMethod, AuthResult, BackupRequest, BackupResponse,
     CatalogAlterRequest, CatalogAlterResponse, CatalogApplyRequest, CatalogApplyResponse,
     CatalogDropRequest, CatalogDropResponse, DescribeCollectionRequest, DescribeCollectionResponse,
-    DocumentGetRequest, DocumentGetResponse, DocumentPutRequest, DocumentPutResponse,
-    ErrorResponse, ExplainRequest, ExplainResponse, GoAway, HelloRequest, PingRequest,
-    PingResponse, QueryChunk, QueryRequest, QueryResponse, QueryStreamRequest, SecurityMode,
-    WelcomeResponse, compression_bit, encoding_bit, feature, opcode, status,
+    DocumentDeleteRequest, DocumentDeleteResponse, DocumentGetRequest, DocumentGetResponse,
+    DocumentPutRequest, DocumentPutResponse, ErrorResponse, ExplainRequest, ExplainResponse,
+    GoAway, HelloRequest, PingRequest, PingResponse, QueryChunk, QueryRequest, QueryResponse,
+    QueryStreamRequest, SecurityMode, WelcomeResponse, compression_bit, encoding_bit, feature,
+    opcode, status,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -326,6 +327,28 @@ impl Client {
             .await?;
         AggregateResponse::decode(body.as_slice())
             .map_err(|_| ClientError::UnexpectedResponse("malformed AGGREGATE response".to_owned()))
+    }
+
+    /// Deletes one document across all its fragments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn document_delete(
+        &mut self,
+        request: &DocumentDeleteRequest,
+    ) -> Result<DocumentDeleteResponse, ClientError> {
+        self.require_feature(feature::DOCUMENT_DELETE, "document deletion")?;
+        let body = self
+            .request(
+                opcode::DOC_DELETE,
+                opcode::DOC_DELETE,
+                &request.encode_to_vec(),
+            )
+            .await?;
+        DocumentDeleteResponse::decode(body.as_slice()).map_err(|_| {
+            ClientError::UnexpectedResponse("malformed DOC_DELETE response".to_owned())
+        })
     }
 
     /// Explains how a query would be planned without executing it.
@@ -764,7 +787,8 @@ fn build_hello(config: &ClientConfig) -> HelloRequest {
             | feature::CATALOG_DESCRIBE
             | feature::EXPLAIN
             | feature::AGGREGATE
-            | feature::BACKUP,
+            | feature::BACKUP
+            | feature::DOCUMENT_DELETE,
         max_frame_size: to_u32(config.max_frame_size),
         max_batch_subframes: to_u32(config.max_batch_subframes),
         max_batch_bytes: to_u32(config.max_batch_bytes),

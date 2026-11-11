@@ -17,12 +17,12 @@ use recolith_protocol::messages::{
     self, AggregateColumn, AggregateRequest, AggregateResponse, AggregateRow, BackupRequest,
     BackupResponse, BucketDefinition, CatalogAlterRequest, CatalogAlterResponse,
     CatalogApplyRequest, CatalogApplyResponse, CatalogDropRequest, CatalogDropResponse,
-    DescribeCollectionRequest, DescribeCollectionResponse, DocumentGetRequest, DocumentGetResponse,
-    DocumentPutRequest, DocumentPutResponse, DocumentResult, ExplainDocumentPlan, ExplainDrive,
-    ExplainFieldSelection, ExplainFilter, ExplainFilterOp, ExplainIndex, ExplainKeyFilter,
-    ExplainOrder, ExplainRequest, ExplainResponse, ExplainScanPlan, FragmentVersion, QueryRequest,
-    QueryResponse, RequestMeta, describe_collection_request, explain_response, opcode, status,
-    value,
+    DescribeCollectionRequest, DescribeCollectionResponse, DocumentDeleteRequest,
+    DocumentDeleteResponse, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest,
+    DocumentPutResponse, DocumentResult, ExplainDocumentPlan, ExplainDrive, ExplainFieldSelection,
+    ExplainFilter, ExplainFilterOp, ExplainIndex, ExplainKeyFilter, ExplainOrder, ExplainRequest,
+    ExplainResponse, ExplainScanPlan, FragmentVersion, QueryRequest, QueryResponse, RequestMeta,
+    describe_collection_request, explain_response, opcode, status, value,
 };
 use recolith_query::error::QueryError;
 use recolith_query::{
@@ -94,6 +94,30 @@ impl std::error::Error for OperationError {}
 pub(crate) struct OperationResponse {
     pub(crate) opcode: u16,
     pub(crate) payload: Vec<u8>,
+}
+
+pub(crate) fn document_delete<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    request: DocumentDeleteRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    let snapshot = store.catalog_snapshot().map_err(map_document)?;
+    let collection_id = CollectionId::new(request.collection_id);
+    authorize_collection(&snapshot, principal, collection_id, Action::Write)?;
+    let deleted = store
+        .delete_document(
+            collection_id,
+            PartitionId::new(request.partition),
+            &request.document_key,
+        )
+        .map_err(map_document)?;
+    let response = DocumentDeleteResponse { deleted };
+
+    Ok(OperationResponse {
+        opcode: opcode::DOC_DELETE,
+        payload: response.encode_to_vec(),
+    })
 }
 
 pub(crate) fn document_get<B: StorageBackend>(

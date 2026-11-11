@@ -84,13 +84,13 @@ RecolithDB is in early single-node development. Implemented today:
 - Lazy one/many fragment assembly, equality and range index pushdown including composite leading fields, same-fragment multi-index intersection, and range filters.
 - Local transactions, multi-fragment commits with one timestamp, optimistic `if_match`, unique reservation workflow, persistent commit clock.
 - RQL document-query subset: parser, catalog binder, document key encoding, planner, executor, single-document point reads, multi-document scans with primary-key ranges, fragment filters, limits, index pushdown, `ORDER BY`, cursor pagination, chunked streaming results, plan explanation, single-partition aggregation/grouping, and offline migration for oversized buckets.
-- In-process document service: catalog-bound multi-fragment writes, cardinality and partition validation, multi-fragment reads, and automatic index maintenance with sparse and unique indexes.
+- In-process document service: catalog-bound multi-fragment writes, atomic whole-document deletion with index and unique-claim cleanup, cardinality and partition validation, multi-fragment reads, and automatic index maintenance with sparse and unique indexes.
 - Protocol frame layer: fixed 38-byte header, CRC32C, zstd/lz4 compression, BATCH codec, Protobuf v1 messages, and collection metadata lookup.
 - TCP session layer: HELLO/WELCOME negotiation, bearer-token auth, compression selection, PING/PONG, BATCH dispatch, and structured errors.
 - TLS 1.3 transport with rustls and typed Rust client handshake, authentication, document, query, explain, batch, and collection-description calls.
 - Runnable `recolithd` process with TOML configuration, memory or fjall storage, optional catalog bootstrap, persisted catalog reload, runtime catalog creation, TLS, bearer auth, logging, graceful shutdown, and offline configuration validation.
-- `recolith` CLI with `ping`, RQL `query`, `explain`, `aggregate`, `backup`, `describe`, schema-aware `doc get` / `doc put`, runtime `catalog` creation, alteration, file apply, and drop commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
-- Protocol document, query, and admin operations: DOC_GET, idempotent DOC_PUT with same-transaction deduplication, RQL QUERY execution, plan-only EXPLAIN, single-partition AGGREGATE, and online BACKUP.
+- `recolith` CLI with `ping`, RQL `query`, `explain`, `aggregate`, `backup`, `describe`, schema-aware `doc get` / `doc put` / `doc delete`, runtime `catalog` creation, alteration, file apply, and drop commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
+- Protocol document, query, and admin operations: DOC_GET, idempotent DOC_PUT with same-transaction deduplication, atomic DOC_DELETE, RQL QUERY execution, plan-only EXPLAIN, single-partition AGGREGATE, and online BACKUP.
 - Process-exit crash recovery test and a full restart test covering catalog reload, commit-clock continuity, and persisted documents.
 - Point read/write benchmark example for the fjall adapter.
 - Batched commit-timestamp allocation, parallel document writes, and document plus concurrent multi-client benchmarks.
@@ -123,8 +123,11 @@ cargo run -p recolith-cli --bin recolith -- ping
 cargo run -p recolith-cli --bin recolith -- describe player --keyspace game
 cargo run -p recolith-cli --bin recolith -- doc put --collection player --keyspace game --key player_id=u64:1 --idempotency-key demo-1 --field profile.name=string:alex --field profile.level=u32:10
 cargo run -p recolith-cli --bin recolith -- doc get --collection player --keyspace game --key player_id=u64:1 --fragment profile
+cargo run -p recolith-cli --bin recolith -- doc delete --collection player --keyspace game --key player_id=u64:1
 cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM player WHERE player_id = :id INCLUDE FRAGMENTS profile" --param id=u64:1
 ```
+
+`doc delete` removes every fragment record, index entry, and unique claim for the document in one transaction. Deleting a missing document is idempotent and prints `deleted: false`; an existing document prints `deleted: true`.
 
 The example configuration and catalog are under [`examples/recolithd`](examples/recolithd). The bootstrap catalog is applied only when persistent metadata is empty; later starts reuse the stored catalog.
 
@@ -205,7 +208,7 @@ Then pass the token to commands:
 cargo run -p recolith-cli --bin recolith -- --token "$RECOLITH_TOKEN" ping
 ```
 
-Roles grant `read`, `write`, `describe`, or `admin` actions over keyspace/collection scopes. Role changes apply after restart. `DOC_GET`, `QUERY`, `EXPLAIN`, and `AGGREGATE` require `read`; `DOC_PUT` requires `write`; `DESCRIBE_COLLECTION` requires `describe`. The example `roles.toml` includes `admin`, `game-reader`, and `game-writer` roles. Catalog changes (`CATALOG_APPLY`, `CATALOG_DROP`, `CATALOG_ALTER`) require `admin` on every affected scope; schema registration requires global admin on `*/*`. Online `BACKUP` requires global admin on `*/*`.
+Roles grant `read`, `write`, `describe`, or `admin` actions over keyspace/collection scopes. Role changes apply after restart. `DOC_GET`, `QUERY`, `EXPLAIN`, and `AGGREGATE` require `read`; `DOC_PUT` and `DOC_DELETE` require `write`; `DESCRIBE_COLLECTION` requires `describe`. The example `roles.toml` includes `admin`, `game-reader`, and `game-writer` roles. Catalog changes (`CATALOG_APPLY`, `CATALOG_DROP`, `CATALOG_ALTER`) require `admin` on every affected scope; schema registration requires global admin on `*/*`. Online `BACKUP` requires global admin on `*/*`.
 
 ## Queries
 

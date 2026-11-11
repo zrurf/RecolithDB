@@ -1,6 +1,8 @@
 use std::fmt;
 
-use recolith_backend::{CommitInfo, StorageBackend, Transaction, TxnOptions};
+use recolith_backend::{
+    CommitInfo, KeyRange, KeyValue, ScanOptions, StorageBackend, Transaction, TxnOptions,
+};
 use recolith_common::{CommitTs, IndexId};
 use recolith_schema::RecordSchema;
 use recolith_storage::{
@@ -406,6 +408,27 @@ impl<B: StorageBackend> LocalWritePath<B> {
         schema: &RecordSchema,
     ) -> Result<Option<(RecordHeader, RecordData)>> {
         Ok(read_record_fields(&mut self.transaction, key, schema)?)
+    }
+
+    /// Scans raw keys in this transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransactionError::Backend`] if the scan fails.
+    pub fn scan_raw(&mut self, range: &KeyRange, options: ScanOptions) -> Result<Vec<KeyValue>> {
+        Ok(self.transaction.scan(range, options)?)
+    }
+
+    /// Deletes one record and its index entries in this transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransactionError`] if index key decoding or the backend fails.
+    pub fn delete_fragment(&mut self, key: &[u8], indexes: &[IndexUpdate]) -> Result<()> {
+        self.apply_indexes(key, indexes)?;
+        self.transaction.delete(key);
+
+        Ok(())
     }
 
     /// Reads raw bytes for a system key in this transaction.

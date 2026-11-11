@@ -14,11 +14,12 @@ use recolith_model::{
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN};
 use recolith_protocol::messages::{
     AggregateRequest, AggregateResponse, AuthMethod, CatalogApplyRequest,
-    DescribeCollectionRequest, DescribeCollectionResponse, DocumentGetRequest, DocumentGetResponse,
-    DocumentPutRequest, DocumentPutResponse, ExplainRequest, FieldSelection, FieldValue,
-    FragmentPayload, HelloRequest, KeyFieldType, KeyspaceDefinition, NamedParameter, QueryRequest,
-    QueryResponse, RequestMeta, SchemaScalarType, Value, WelcomeResponse,
-    describe_collection_request, explain_response, opcode, schema_type, status, value,
+    DescribeCollectionRequest, DescribeCollectionResponse, DocumentDeleteRequest,
+    DocumentDeleteResponse, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest,
+    DocumentPutResponse, ExplainRequest, FieldSelection, FieldValue, FragmentPayload, HelloRequest,
+    KeyFieldType, KeyspaceDefinition, NamedParameter, QueryRequest, QueryResponse, RequestMeta,
+    SchemaScalarType, Value, WelcomeResponse, describe_collection_request, explain_response,
+    opcode, schema_type, status, value,
 };
 use recolith_schema::{Field, RecordSchema, Type};
 use recolith_server::{DocumentStore, ServerConfig, serve};
@@ -963,4 +964,72 @@ async fn aggregates_global_and_grouped_queries() {
             kind: Some(value::Kind::U32Value(20)),
         })
     );
+}
+
+#[tokio::test]
+async fn deletes_documents_and_reports_missing_documents() {
+    let store = store();
+    let address = start_server(Arc::clone(&store)).await;
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let codec = handshake(&mut stream).await;
+    let key = document_key(1);
+
+    let put = profile_put(&key, "alex", b"delete-1");
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::DOC_PUT, 10),
+        &put.encode_to_vec(),
+    )
+    .await;
+    let (header, _) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.status(), status::OK);
+
+    for (request_id, expected) in [(20_u64, true), (21, false)] {
+        write_frame(
+            &mut stream,
+            &codec,
+            &FrameHeader::new(opcode::DOC_DELETE, request_id),
+            &DocumentDeleteRequest {
+                meta: None,
+                collection_id: 1,
+                partition: 0,
+                document_key: key.clone(),
+            }
+            .encode_to_vec(),
+        )
+        .await;
+        let (header, payload) = read_frame(&mut stream, &codec).await;
+        assert_eq!(header.opcode(), opcode::DOC_DELETE);
+        assert_eq!(header.status(), status::OK);
+        let response = DocumentDeleteResponse::decode(payload.as_slice()).expect("delete response");
+        assert_eq!(response.deleted, expected);
+    }
+
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::QUERY, 22),
+        &QueryRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT profile.name FROM player WHERE player_id = :id \
+                  INCLUDE FRAGMENTS profile"
+                .to_owned(),
+            parameters: vec![NamedParameter {
+                name: "id".to_owned(),
+                value: Some(Value {
+                    kind: Some(value::Kind::U64Value(1)),
+                }),
+            }],
+            limit: 10,
+            cursor: Vec::new(),
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.status(), status::OK);
+    let response = QueryResponse::decode(payload.as_slice()).expect("query");
+    assert!(response.documents.is_empty());
 }

@@ -180,6 +180,17 @@ message DocumentPutResponse {
   repeated FragmentVersion versions = 2;
 }
 
+message DocumentDeleteRequest {
+  RequestMeta meta = 1;
+  uint64 collection_id = 2;
+  uint32 partition = 3;
+  bytes document_key = 4;
+}
+
+message DocumentDeleteResponse {
+  bool deleted = 1;
+}
+
 message NamedParameter {
   string name = 1;
   Value value = 2;

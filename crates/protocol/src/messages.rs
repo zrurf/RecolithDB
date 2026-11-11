@@ -16,6 +16,8 @@ pub mod opcode {
     pub const DOC_GET: u16 = 0x0010;
     /// Document fragment write.
     pub const DOC_PUT: u16 = 0x0011;
+    /// Document deletion.
+    pub const DOC_DELETE: u16 = 0x0012;
     /// RQL document query.
     pub const QUERY: u16 = 0x0020;
     /// Streaming RQL document query.
@@ -114,6 +116,8 @@ pub mod feature {
     pub const AGGREGATE: u64 = 1 << 10;
     /// Online logical backups are supported.
     pub const BACKUP: u64 = 1 << 11;
+    /// Document deletion is supported.
+    pub const DOCUMENT_DELETE: u64 = 1 << 12;
 }
 
 /// Compression algorithm bits used by the handshake.

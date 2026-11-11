@@ -141,6 +141,21 @@ async fn writes_reads_and_queries_through_the_cli() {
     assert!(backup_directory.join("cli.backup").exists());
 
     run(args(
+        endpoint.clone(),
+        Command::Doc {
+            command: DocCommand::Delete {
+                collection: "player".to_owned(),
+                keyspace: Some("game".to_owned()),
+                partition: 0,
+                key_hex: None,
+                keys: vec!["player_id=u64:1".to_owned()],
+            },
+        },
+    ))
+    .await
+    .expect("delete command");
+
+    run(args(
         endpoint,
         Command::Query {
             rql: "SELECT profile.name FROM player WHERE player_id = :id INCLUDE FRAGMENTS profile"

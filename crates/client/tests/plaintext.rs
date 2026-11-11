@@ -6,10 +6,10 @@ use prost::Message;
 use recolith_client::{BatchOperation, Client, ClientConfig, ClientError};
 use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::messages::{
-    AggregateRequest, BackupRequest, DescribeCollectionRequest, DocumentGetRequest,
-    DocumentGetResponse, ExplainRequest, FieldSelection, NamedParameter, QueryRequest,
-    QueryStreamRequest, SecurityMode, Value, describe_collection_request, explain_response,
-    feature, opcode, status, value,
+    AggregateRequest, BackupRequest, DescribeCollectionRequest, DocumentDeleteRequest,
+    DocumentGetRequest, DocumentGetResponse, ExplainRequest, FieldSelection, NamedParameter,
+    QueryRequest, QueryStreamRequest, SecurityMode, Value, describe_collection_request,
+    explain_response, feature, opcode, status, value,
 };
 use recolith_server::ServerConfig;
 
@@ -344,6 +344,45 @@ async fn writes_online_backups_through_the_client() {
     assert!(directory.join("client.backup").exists());
 
     let _ = std::fs::remove_dir_all(directory);
+}
+
+#[tokio::test]
+async fn deletes_documents_through_the_client() {
+    let address = support::start_server(
+        ServerConfig::new("127.0.0.1:0".parse().expect("address")),
+        support::game_store(),
+    )
+    .await;
+    let mut client = Client::connect(ClientConfig::new(address.to_string()))
+        .await
+        .expect("connect");
+    let key = support::document_key(42);
+
+    client
+        .document_put(&support::profile_put(&key, "alex", b"delete-1"))
+        .await
+        .expect("put");
+
+    let request = DocumentDeleteRequest {
+        meta: None,
+        collection_id: 1,
+        partition: 0,
+        document_key: key.clone(),
+    };
+    assert!(
+        client
+            .document_delete(&request)
+            .await
+            .expect("delete")
+            .deleted
+    );
+    assert!(
+        !client
+            .document_delete(&request)
+            .await
+            .expect("idempotent delete")
+            .deleted
+    );
 }
 
 #[tokio::test]

@@ -11,11 +11,11 @@ use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN};
 use recolith_protocol::messages::{
     AggregateRequest, AuthMethod, AuthResult, BackupRequest, CatalogAlterRequest,
-    CatalogApplyRequest, CatalogDropRequest, DescribeCollectionRequest, DocumentGetRequest,
-    DocumentPutRequest, ErrorResponse, ExplainRequest, FieldValue, FragmentPayload, HelloRequest,
-    KeyspaceDefinition, PingRequest, RequestMeta, SetBucketSchema, Value, WelcomeResponse,
-    catalog_alter_request, catalog_drop_request, describe_collection_request, opcode, status,
-    value,
+    CatalogApplyRequest, CatalogDropRequest, DescribeCollectionRequest, DocumentDeleteRequest,
+    DocumentGetRequest, DocumentPutRequest, ErrorResponse, ExplainRequest, FieldValue,
+    FragmentPayload, HelloRequest, KeyspaceDefinition, PingRequest, RequestMeta, SetBucketSchema,
+    Value, WelcomeResponse, catalog_alter_request, catalog_drop_request,
+    describe_collection_request, opcode, status, value,
 };
 use recolith_security::{
     Authenticator, TokenClaims, TokenIssuer, fingerprint_hex, token_fingerprint, unix_seconds,
@@ -331,6 +331,23 @@ async fn roles_authorize_operations_and_return_permission_denied() {
         &BackupRequest {
             meta: None,
             name: "reader.backup".to_owned(),
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, _) = read_frame(&mut reader, &reader_codec).await;
+    assert_eq!(header.opcode(), opcode::ERROR);
+    assert_eq!(header.status(), status::PERMISSION_DENIED);
+
+    write_frame(
+        &mut reader,
+        &reader_codec,
+        &FrameHeader::new(opcode::DOC_DELETE, 9),
+        &DocumentDeleteRequest {
+            meta: None,
+            collection_id: 1,
+            partition: 0,
+            document_key: key(),
         }
         .encode_to_vec(),
     )
