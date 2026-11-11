@@ -8,12 +8,13 @@ use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::error::ProtocolError;
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN, VERSION_MAJOR, VERSION_MINOR};
 use recolith_protocol::messages::{
-    AuthMethod, AuthResult, CatalogAlterRequest, CatalogAlterResponse, CatalogApplyRequest,
-    CatalogApplyResponse, CatalogDropRequest, CatalogDropResponse, DescribeCollectionRequest,
-    DescribeCollectionResponse, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest,
-    DocumentPutResponse, ErrorResponse, GoAway, HelloRequest, PingRequest, PingResponse,
-    QueryChunk, QueryRequest, QueryResponse, QueryStreamRequest, SecurityMode, WelcomeResponse,
-    compression_bit, encoding_bit, feature, opcode, status,
+    AggregateRequest, AggregateResponse, AuthMethod, AuthResult, CatalogAlterRequest,
+    CatalogAlterResponse, CatalogApplyRequest, CatalogApplyResponse, CatalogDropRequest,
+    CatalogDropResponse, DescribeCollectionRequest, DescribeCollectionResponse, DocumentGetRequest,
+    DocumentGetResponse, DocumentPutRequest, DocumentPutResponse, ErrorResponse, ExplainRequest,
+    ExplainResponse, GoAway, HelloRequest, PingRequest, PingResponse, QueryChunk, QueryRequest,
+    QueryResponse, QueryStreamRequest, SecurityMode, WelcomeResponse, compression_bit,
+    encoding_bit, feature, opcode, status,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -290,6 +291,44 @@ impl Client {
             .await?;
         QueryResponse::decode(body.as_slice())
             .map_err(|_| ClientError::UnexpectedResponse("malformed QUERY response".to_owned()))
+    }
+
+    /// Executes an aggregate query.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn aggregate(
+        &mut self,
+        request: &AggregateRequest,
+    ) -> Result<AggregateResponse, ClientError> {
+        self.require_feature(feature::AGGREGATE, "aggregate queries")?;
+        let body = self
+            .request(
+                opcode::AGGREGATE,
+                opcode::AGGREGATE,
+                &request.encode_to_vec(),
+            )
+            .await?;
+        AggregateResponse::decode(body.as_slice())
+            .map_err(|_| ClientError::UnexpectedResponse("malformed AGGREGATE response".to_owned()))
+    }
+
+    /// Explains how a query would be planned without executing it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn explain(
+        &mut self,
+        request: &ExplainRequest,
+    ) -> Result<ExplainResponse, ClientError> {
+        self.require_feature(feature::EXPLAIN, "query explanations")?;
+        let body = self
+            .request(opcode::EXPLAIN, opcode::EXPLAIN, &request.encode_to_vec())
+            .await?;
+        ExplainResponse::decode(body.as_slice())
+            .map_err(|_| ClientError::UnexpectedResponse("malformed EXPLAIN response".to_owned()))
     }
 
     /// Describes a collection by name or identifier.
@@ -708,7 +747,9 @@ fn build_hello(config: &ClientConfig) -> HelloRequest {
             | feature::DOCUMENT_WRITE
             | feature::QUERY
             | feature::IDEMPOTENCY
-            | feature::CATALOG_DESCRIBE,
+            | feature::CATALOG_DESCRIBE
+            | feature::EXPLAIN
+            | feature::AGGREGATE,
         max_frame_size: to_u32(config.max_frame_size),
         max_batch_subframes: to_u32(config.max_batch_subframes),
         max_batch_bytes: to_u32(config.max_batch_bytes),

@@ -219,6 +219,125 @@ message QueryResponse {
   bytes next_cursor = 2;
 }
 
+message AggregateRequest {
+  RequestMeta meta = 1;
+  uint32 partition = 2;
+  string rql = 3;
+  repeated NamedParameter parameters = 4;
+  uint64 limit = 5;
+}
+
+message AggregateResponse {
+  uint64 catalog_generation = 1;
+  repeated AggregateColumn columns = 2;
+  optional uint32 group_fragment_id = 3;
+  optional uint32 group_field_id = 4;
+  repeated AggregateRow rows = 5;
+  bool truncated = 6;
+}
+
+enum AggregateFunction {
+  AGGREGATE_FUNCTION_UNSPECIFIED = 0;
+  AGGREGATE_FUNCTION_COUNT = 1;
+  AGGREGATE_FUNCTION_SUM = 2;
+  AGGREGATE_FUNCTION_MIN = 3;
+  AGGREGATE_FUNCTION_MAX = 4;
+  AGGREGATE_FUNCTION_AVG = 5;
+}
+
+message AggregateColumn {
+  AggregateFunction function = 1;
+  optional uint32 fragment_id = 2;
+  optional uint32 field_id = 3;
+}
+
+message AggregateRow {
+  optional Value group = 1;
+  repeated Value values = 2;
+}
+
+message ExplainRequest {
+  RequestMeta meta = 1;
+  uint32 partition = 2;
+  string rql = 3;
+  repeated NamedParameter parameters = 4;
+}
+
+message ExplainResponse {
+  uint64 catalog_generation = 1;
+  oneof plan {
+    ExplainDocumentPlan document = 2;
+    ExplainScanPlan scan = 3;
+  }
+}
+
+message ExplainDocumentPlan {
+  uint64 collection_id = 1;
+  bytes document_key = 2;
+  repeated uint32 fragment_ids = 3;
+  repeated ExplainFieldSelection projections = 4;
+  repeated ExplainFilter filters = 5;
+  uint32 partition = 6;
+}
+
+message ExplainScanPlan {
+  uint64 collection_id = 1;
+  uint32 partition = 2;
+  repeated uint32 fragment_ids = 3;
+  repeated ExplainDrive drives = 4;
+  repeated ExplainFilter filters = 5;
+  repeated ExplainFieldSelection projections = 6;
+  ExplainOrder order = 7;
+  repeated ExplainKeyFilter key_filters = 8;
+  uint64 candidate_limit = 9;
+}
+
+message ExplainDrive {
+  uint64 bucket_id = 1;
+  uint32 fragment_id = 2;
+  repeated ExplainIndex indexes = 3;
+  bool bucket_scan = 4;
+}
+
+message ExplainIndex {
+  uint64 index_id = 1;
+  repeated uint32 field_ids = 2;
+  IndexKind kind = 3;
+}
+
+message ExplainFilter {
+  uint32 fragment_id = 1;
+  uint32 field_id = 2;
+  ExplainFilterOp op = 3;
+}
+
+message ExplainKeyFilter {
+  uint32 field = 1;
+  ExplainFilterOp op = 2;
+}
+
+message ExplainFieldSelection {
+  uint32 fragment_id = 1;
+  uint32 field_id = 2;
+}
+
+message ExplainOrder {
+  uint32 fragment_id = 1;
+  uint32 field_id = 2;
+  bool descending = 3;
+  optional uint64 index_id = 4;
+}
+
+enum ExplainFilterOp {
+  EXPLAIN_FILTER_OP_UNSPECIFIED = 0;
+  EXPLAIN_FILTER_OP_EQ = 1;
+  EXPLAIN_FILTER_OP_NE = 2;
+  EXPLAIN_FILTER_OP_LT = 3;
+  EXPLAIN_FILTER_OP_LE = 4;
+  EXPLAIN_FILTER_OP_GT = 5;
+  EXPLAIN_FILTER_OP_GE = 6;
+}
+
 enum KeyFieldType {
   KEY_FIELD_TYPE_UNSPECIFIED = 0;
   KEY_FIELD_TYPE_U64 = 1;

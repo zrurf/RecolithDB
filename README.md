@@ -83,14 +83,14 @@ RecolithDB is in early single-node development. Implemented today:
 - Schema-aware field codec, record framing, partition-scoped record and index keys, CRC32C checks.
 - Lazy one/many fragment assembly, equality and range index pushdown including composite leading fields, same-fragment multi-index intersection, and range filters.
 - Local transactions, multi-fragment commits with one timestamp, optimistic `if_match`, unique reservation workflow, persistent commit clock.
-- RQL document-query subset: parser, catalog binder, document key encoding, planner, executor, single-document point reads, multi-document scans with primary-key ranges, fragment filters, limits, index pushdown, cursor pagination, chunked streaming results, and offline migration for oversized buckets.
+- RQL document-query subset: parser, catalog binder, document key encoding, planner, executor, single-document point reads, multi-document scans with primary-key ranges, fragment filters, limits, index pushdown, `ORDER BY`, cursor pagination, chunked streaming results, plan explanation, single-partition aggregation/grouping, and offline migration for oversized buckets.
 - In-process document service: catalog-bound multi-fragment writes, cardinality and partition validation, multi-fragment reads, and automatic index maintenance with sparse and unique indexes.
 - Protocol frame layer: fixed 38-byte header, CRC32C, zstd/lz4 compression, BATCH codec, Protobuf v1 messages, and collection metadata lookup.
 - TCP session layer: HELLO/WELCOME negotiation, bearer-token auth, compression selection, PING/PONG, BATCH dispatch, and structured errors.
-- TLS 1.3 transport with rustls and typed Rust client handshake, authentication, document, query, batch, and collection-description calls.
+- TLS 1.3 transport with rustls and typed Rust client handshake, authentication, document, query, explain, batch, and collection-description calls.
 - Runnable `recolithd` process with TOML configuration, memory or fjall storage, optional catalog bootstrap, persisted catalog reload, runtime catalog creation, TLS, bearer auth, logging, graceful shutdown, and offline configuration validation.
-- `recolith` CLI with `ping`, RQL `query`, `describe`, schema-aware `doc get` / `doc put`, runtime `catalog` creation, alteration, file apply, and drop commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
-- Protocol document and query operations: DOC_GET, idempotent DOC_PUT with same-transaction deduplication, and RQL QUERY execution.
+- `recolith` CLI with `ping`, RQL `query`, `explain`, `aggregate`, `describe`, schema-aware `doc get` / `doc put`, runtime `catalog` creation, alteration, file apply, and drop commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
+- Protocol document and query operations: DOC_GET, idempotent DOC_PUT with same-transaction deduplication, RQL QUERY execution, plan-only EXPLAIN, and single-partition AGGREGATE.
 - Process-exit crash recovery test and a full restart test covering catalog reload, commit-clock continuity, and persisted documents.
 - Point read/write benchmark example for the fjall adapter.
 - Batched commit-timestamp allocation, parallel document writes, and document plus concurrent multi-client benchmarks.
@@ -192,7 +192,7 @@ Then pass the token to commands:
 cargo run -p recolith-cli --bin recolith -- --token "$RECOLITH_TOKEN" ping
 ```
 
-Roles grant `read`, `write`, `describe`, or `admin` actions over keyspace/collection scopes. Role changes apply after restart. `DOC_GET` and `QUERY` require `read`; `DOC_PUT` requires `write`; `DESCRIBE_COLLECTION` requires `describe`. The example `roles.toml` includes `admin`, `game-reader`, and `game-writer` roles. Catalog changes (`CATALOG_APPLY`, `CATALOG_DROP`, `CATALOG_ALTER`) require `admin` on every affected scope; schema registration requires global admin on `*/*`.
+Roles grant `read`, `write`, `describe`, or `admin` actions over keyspace/collection scopes. Role changes apply after restart. `DOC_GET`, `QUERY`, `EXPLAIN`, and `AGGREGATE` require `read`; `DOC_PUT` requires `write`; `DESCRIBE_COLLECTION` requires `describe`. The example `roles.toml` includes `admin`, `game-reader`, and `game-writer` roles. Catalog changes (`CATALOG_APPLY`, `CATALOG_DROP`, `CATALOG_ALTER`) require `admin` on every affected scope; schema registration requires global admin on `*/*`.
 
 ## Queries
 
@@ -203,7 +203,15 @@ cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM play
 cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM player WHERE player_id >= 2 AND profile.name = 'alex' INCLUDE FRAGMENTS profile"
 ```
 
-Scans prefer an indexable `many`-fragment predicate; otherwise they scan the fragment bucket and post-filter. Primary-key ranges are evaluated after candidate enumeration. `LIMIT` caps returned documents, and results are ordered by document key. A scan considers at most 10,000 candidate documents.
+Scans prefer an indexable predicate on any selected fragment, whether `one` or `many`; otherwise they scan the fragment bucket and post-filter. Primary-key ranges are evaluated after candidate enumeration. `LIMIT` caps returned documents, and results are ordered by document key unless `ORDER BY` is present. A scan considers at most 10,000 candidate documents.
+
+`ORDER BY` sorts by one fragment field and accepts `ASC` (default) or `DESC`:
+
+```text
+cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM player WHERE profile.level >= 10 INCLUDE FRAGMENTS profile ORDER BY profile.level DESC LIMIT 100"
+```
+
+The ordered field must be a sortable scalar (boolean, integer, string, bytes, timestamp, duration, or enum) in an included fragment; key fields, floats, lists, maps, and nested records are rejected. For `many` fragments the minimum value in the document is used. Documents missing the field sort last in both directions, and document keys break ties in the same direction. When the ordered fragment is the only selected fragment, has `one` cardinality, requires the field in every schema version, and has a matching single-field leading index, the scan reads that index in the requested direction. Other ordered scans use the same 10,000-candidate bound and an in-memory sort; predicate indexes still narrow candidates in both cases.
 
 Paginated queries print an opaque `next_cursor` when more documents match. Pass it back with `--cursor`:
 
@@ -212,7 +220,7 @@ cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM play
 cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM player WHERE profile.level >= 10 INCLUDE FRAGMENTS profile" --limit 100 --cursor 52434c43...
 ```
 
-Cursors bind the query shape and catalog generation. Reusing a cursor with a different query returns `INVALID_REQUEST`; catalog changes return `STALE_CATALOG`. Each page uses a fresh snapshot, so concurrent writes may appear between pages.
+Cursors bind the query shape and catalog generation. Ordered cursors also carry the last ordering value and document key. Reusing a cursor with a different query returns `INVALID_REQUEST`; catalog changes return `STALE_CATALOG`. Each page uses a fresh snapshot, so concurrent writes may appear between pages. Cursors are opaque and versioned, so a server upgrade may reject cursors issued by an older binary.
 
 Large result sets can be streamed in chunks:
 
@@ -221,6 +229,23 @@ cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM play
 ```
 
 Streaming uses `QUERY_STREAM` with `QUERY_CHUNK` responses and a final-chunk marker. Each chunk uses a fresh snapshot; client-side flow control is not implemented.
+
+Inspect a plan without reading documents:
+
+```text
+cargo run -p recolith-cli --bin recolith -- explain "SELECT profile.name FROM player WHERE profile.level >= 10 INCLUDE FRAGMENTS profile ORDER BY profile.level DESC"
+```
+
+`EXPLAIN` performs parsing, binding, authorization, and planning only. The structured response reports the catalog generation, collection, partition, selected fragments, projections, filters, key filters, candidate drives with their indexes, ordering source, and the candidate limit. It does not execute the query or return document counts and timings; `EXPLAIN ANALYZE` is not implemented.
+
+Aggregate queries run on one explicit partition:
+
+```text
+cargo run -p recolith-cli --bin recolith -- aggregate "SELECT COUNT(*), SUM(profile.level), AVG(profile.level) FROM player WHERE profile.level >= 10 INCLUDE FRAGMENTS profile"
+cargo run -p recolith-cli --bin recolith -- aggregate "SELECT COUNT(*) FROM player WHERE profile.level >= 10 INCLUDE FRAGMENTS profile GROUP BY profile.level" --limit 100
+```
+
+`COUNT(*)` counts matching documents. `SUM`, `MIN`, `MAX`, and `AVG` read every record of the referenced fragment, so a `many` fragment aggregates all its records. `SUM` returns `i64` for signed fields, `u64` for unsigned fields, and `f64` for floats; `AVG` returns `f64`; empty aggregate sets return null. `GROUP BY` accepts one included, non-float fragment field, uses the minimum value for `many` fragments, and sorts groups by key with the missing-value group last. `LIMIT` bounds groups; the response reports whether groups were truncated. A query creates at most 10,000 groups and examines the same 10,000-candidate scan bound as other queries; aggregate cursors and scatter execution are not implemented.
 
 ## Catalog Changes
 

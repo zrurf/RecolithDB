@@ -5,7 +5,10 @@ mod bind;
 mod parser;
 
 pub use ast::{
-    RqlDocumentQuery, RqlLiteral, RqlOp, RqlOperand, RqlPath, RqlPredicate, RqlSelector,
+    RqlAggregate, RqlAggregateFunction, RqlAggregateQuery, RqlDocumentQuery, RqlLiteral, RqlOp,
+    RqlOperand, RqlOrder, RqlPath, RqlPredicate, RqlSelector,
 };
-pub use bind::{BindParameters, RqlBindError, bind_document_query, bind_query};
-pub use parser::{RqlError, parse_document_query};
+pub use bind::{
+    BindParameters, RqlBindError, bind_aggregate_query, bind_document_query, bind_query,
+};
+pub use parser::{RqlError, parse_aggregate_query, parse_document_query};

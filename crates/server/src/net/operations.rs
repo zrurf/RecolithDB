@@ -14,16 +14,20 @@ use recolith_model::{
     IndexDefinition, IndexKind, KeyField, KeyType, Keyspace,
 };
 use recolith_protocol::messages::{
-    self, BucketDefinition, CatalogAlterRequest, CatalogAlterResponse, CatalogApplyRequest,
-    CatalogApplyResponse, CatalogDropRequest, CatalogDropResponse, DescribeCollectionRequest,
-    DescribeCollectionResponse, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest,
-    DocumentPutResponse, DocumentResult, FragmentVersion, QueryRequest, QueryResponse, RequestMeta,
-    describe_collection_request, opcode, status, value,
+    self, AggregateColumn, AggregateRequest, AggregateResponse, AggregateRow, BucketDefinition,
+    CatalogAlterRequest, CatalogAlterResponse, CatalogApplyRequest, CatalogApplyResponse,
+    CatalogDropRequest, CatalogDropResponse, DescribeCollectionRequest, DescribeCollectionResponse,
+    DocumentGetRequest, DocumentGetResponse, DocumentPutRequest, DocumentPutResponse,
+    DocumentResult, ExplainDocumentPlan, ExplainDrive, ExplainFieldSelection, ExplainFilter,
+    ExplainFilterOp, ExplainIndex, ExplainKeyFilter, ExplainOrder, ExplainRequest, ExplainResponse,
+    ExplainScanPlan, FragmentVersion, QueryRequest, QueryResponse, RequestMeta,
+    describe_collection_request, explain_response, opcode, status, value,
 };
 use recolith_query::error::QueryError;
 use recolith_query::{
-    BindParameters, BoundQuery, DocumentQuery, FieldSelection, RqlBindError, RqlError, RqlLiteral,
-    bind_query, parse_document_query,
+    AggregateFunction as QueryAggregateFunction, BindParameters, BoundQuery, DocumentQuery,
+    FieldSelection, Filter, FilterOp, RqlBindError, RqlError, RqlLiteral, ScanDriveInfo,
+    ScanPosition, bind_aggregate_query, bind_query, parse_aggregate_query, parse_document_query,
 };
 use recolith_schema::parse_record;
 use recolith_security::{Action, AuthTarget, Principal};
@@ -789,17 +793,26 @@ pub(crate) fn query<B: StorageBackend>(
     })
 }
 
-pub(crate) fn query_page<B: StorageBackend>(
+pub(crate) fn bind_wire_query<B: StorageBackend>(
     store: &DocumentStore<B>,
     principal: &Principal,
     partition: u32,
     rql: &str,
     wire_parameters: &[messages::NamedParameter],
-    limit: usize,
-    cursor: &[u8],
-) -> Result<QueryPage, OperationError> {
-    let _read = store.read_guard().map_err(map_document)?;
+) -> Result<(CatalogSnapshot, BoundQuery), OperationError> {
     let parsed = parse_document_query(rql).map_err(map_rql)?;
+    let parameters = parse_wire_parameters(wire_parameters)?;
+    let snapshot = store.catalog_snapshot().map_err(map_document)?;
+    let query = bind_query(&snapshot, &parsed, PartitionId::new(partition), &parameters)
+        .map_err(map_bind)?;
+    authorize_collection(&snapshot, principal, query.collection_id(), Action::Read)?;
+
+    Ok((snapshot, query))
+}
+
+fn parse_wire_parameters(
+    wire_parameters: &[messages::NamedParameter],
+) -> Result<BindParameters, OperationError> {
     let mut parameters = BindParameters::new();
     for parameter in wire_parameters {
         let value = parameter.value.as_ref().ok_or_else(|| {
@@ -815,10 +828,256 @@ pub(crate) fn query_page<B: StorageBackend>(
         );
     }
 
+    Ok(parameters)
+}
+
+pub(crate) fn aggregate<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    request: AggregateRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    let _read = store.read_guard().map_err(map_document)?;
+    let parsed = parse_aggregate_query(&request.rql).map_err(map_rql)?;
+    let parameters = parse_wire_parameters(&request.parameters)?;
     let snapshot = store.catalog_snapshot().map_err(map_document)?;
-    let query = bind_query(&snapshot, &parsed, PartitionId::new(partition), &parameters)
-        .map_err(map_bind)?;
+    let query = bind_aggregate_query(
+        &snapshot,
+        &parsed,
+        PartitionId::new(request.partition),
+        &parameters,
+    )
+    .map_err(map_bind)?;
     authorize_collection(&snapshot, principal, query.collection_id(), Action::Read)?;
+    let limit = aggregate_limit(request.limit, &parsed);
+    let page = store
+        .query_engine()
+        .execute_aggregate(&query, limit)
+        .map_err(map_query)?;
+    let columns = query
+        .aggregates()
+        .iter()
+        .map(|aggregate| AggregateColumn {
+            function: wire_aggregate_function(aggregate.function()) as i32,
+            fragment_id: aggregate.fragment().map(FragmentId::get),
+            field_id: aggregate.field().map(FieldId::get),
+        })
+        .collect();
+    let rows = page
+        .rows()
+        .iter()
+        .map(|row| AggregateRow {
+            group: row.group().map(convert::value_to_wire),
+            values: row
+                .values()
+                .iter()
+                .map(|value| {
+                    value
+                        .as_ref()
+                        .map(convert::value_to_wire)
+                        .unwrap_or_default()
+                })
+                .collect(),
+        })
+        .collect();
+    let response = AggregateResponse {
+        catalog_generation: snapshot.generation.get(),
+        columns,
+        group_fragment_id: query.group().map(|group| group.fragment().get()),
+        group_field_id: query.group().map(|group| group.field().get()),
+        rows,
+        truncated: page.truncated(),
+    };
+
+    Ok(OperationResponse {
+        opcode: opcode::AGGREGATE,
+        payload: response.encode_to_vec(),
+    })
+}
+
+fn aggregate_limit(request_limit: u64, parsed: &recolith_query::RqlAggregateQuery) -> usize {
+    let limit = match parsed.limit() {
+        Some(limit) if request_limit > 0 => request_limit.min(limit),
+        Some(limit) => limit,
+        None if request_limit > 0 => request_limit,
+        None => DEFAULT_QUERY_LIMIT,
+    };
+
+    limit.min(MAX_QUERY_LIMIT) as usize
+}
+
+const fn wire_aggregate_function(function: QueryAggregateFunction) -> messages::AggregateFunction {
+    match function {
+        QueryAggregateFunction::Count => messages::AggregateFunction::Count,
+        QueryAggregateFunction::Sum => messages::AggregateFunction::Sum,
+        QueryAggregateFunction::Min => messages::AggregateFunction::Min,
+        QueryAggregateFunction::Max => messages::AggregateFunction::Max,
+        QueryAggregateFunction::Avg => messages::AggregateFunction::Avg,
+    }
+}
+
+pub(crate) fn explain<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    request: ExplainRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    let _read = store.read_guard().map_err(map_document)?;
+    let (snapshot, query) = bind_wire_query(
+        store,
+        principal,
+        request.partition,
+        &request.rql,
+        &request.parameters,
+    )?;
+    let collection_id = query.collection_id();
+    let engine = store.query_engine();
+    let plan = match query {
+        BoundQuery::Document(query) => {
+            let plan = engine.plan(&query).map_err(map_query)?;
+            explain_response::Plan::Document(explain_document_plan(
+                collection_id,
+                request.partition,
+                &plan,
+            ))
+        }
+        BoundQuery::Scan(query) => {
+            let plan = engine.plan_scan(&query).map_err(map_query)?;
+            explain_response::Plan::Scan(explain_scan_plan(
+                &snapshot,
+                collection_id,
+                request.partition,
+                &plan,
+            ))
+        }
+    };
+    let response = ExplainResponse {
+        catalog_generation: snapshot.generation.get(),
+        plan: Some(plan),
+    };
+
+    Ok(OperationResponse {
+        opcode: opcode::EXPLAIN,
+        payload: response.encode_to_vec(),
+    })
+}
+
+fn explain_document_plan(
+    collection_id: CollectionId,
+    partition: u32,
+    plan: &recolith_query::QueryPlan,
+) -> ExplainDocumentPlan {
+    ExplainDocumentPlan {
+        collection_id: collection_id.get(),
+        document_key: plan.document_key().to_vec(),
+        fragment_ids: plan.fragment_ids().iter().map(|id| id.get()).collect(),
+        projections: plan.projection().iter().map(explain_selection).collect(),
+        filters: plan.filters().iter().map(explain_filter).collect(),
+        partition,
+    }
+}
+
+fn explain_scan_plan(
+    snapshot: &CatalogSnapshot,
+    collection_id: CollectionId,
+    partition: u32,
+    plan: &recolith_query::ScanPlan,
+) -> ExplainScanPlan {
+    ExplainScanPlan {
+        collection_id: collection_id.get(),
+        partition,
+        fragment_ids: plan.fragment_ids().iter().map(|id| id.get()).collect(),
+        drives: plan
+            .drives()
+            .iter()
+            .map(|drive| explain_drive(snapshot, drive))
+            .collect(),
+        filters: plan.filters().iter().map(explain_filter).collect(),
+        projections: plan.projection().iter().map(explain_selection).collect(),
+        order: plan.order().map(|order| ExplainOrder {
+            fragment_id: order.fragment().get(),
+            field_id: order.field().get(),
+            descending: order.descending(),
+            index_id: plan.order_index().map(IndexId::get),
+        }),
+        key_filters: plan
+            .key_filters()
+            .iter()
+            .map(|filter| ExplainKeyFilter {
+                field: u32::try_from(filter.field()).unwrap_or(u32::MAX),
+                op: explain_op(filter.op()) as i32,
+            })
+            .collect(),
+        candidate_limit: u64::try_from(plan.candidate_limit()).unwrap_or(u64::MAX),
+    }
+}
+
+fn explain_drive(snapshot: &CatalogSnapshot, drive: &ScanDriveInfo) -> ExplainDrive {
+    let indexes = snapshot
+        .indexes
+        .get(&drive.bucket())
+        .map_or_else(Vec::new, |definitions| {
+            drive
+                .indexes()
+                .iter()
+                .filter_map(|index| definitions.get(index))
+                .map(explain_index)
+                .collect()
+        });
+
+    ExplainDrive {
+        bucket_id: drive.bucket().get(),
+        fragment_id: drive.fragment().get(),
+        indexes,
+        bucket_scan: drive.is_bucket_scan(),
+    }
+}
+
+fn explain_index(index: &IndexDefinition) -> ExplainIndex {
+    ExplainIndex {
+        index_id: index.id().get(),
+        field_ids: index.fields().iter().map(|field| field.get()).collect(),
+        kind: super::metadata::index_kind(index.kind()) as i32,
+    }
+}
+
+fn explain_filter(filter: &Filter) -> ExplainFilter {
+    ExplainFilter {
+        fragment_id: filter.fragment().get(),
+        field_id: filter.field().get(),
+        op: explain_op(filter.op()) as i32,
+    }
+}
+
+fn explain_selection(selection: &FieldSelection) -> ExplainFieldSelection {
+    ExplainFieldSelection {
+        fragment_id: selection.fragment().get(),
+        field_id: selection.field().get(),
+    }
+}
+
+const fn explain_op(op: FilterOp) -> ExplainFilterOp {
+    match op {
+        FilterOp::Eq => ExplainFilterOp::Eq,
+        FilterOp::Ne => ExplainFilterOp::Ne,
+        FilterOp::Lt => ExplainFilterOp::Lt,
+        FilterOp::Le => ExplainFilterOp::Le,
+        FilterOp::Gt => ExplainFilterOp::Gt,
+        FilterOp::Ge => ExplainFilterOp::Ge,
+    }
+}
+
+pub(crate) fn query_page<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    partition: u32,
+    rql: &str,
+    wire_parameters: &[messages::NamedParameter],
+    limit: usize,
+    cursor: &[u8],
+) -> Result<QueryPage, OperationError> {
+    let _read = store.read_guard().map_err(map_document)?;
+    let (snapshot, query) = bind_wire_query(store, principal, partition, rql, wire_parameters)?;
     let query_hash = query_cursor::query_hash(partition, rql, wire_parameters);
     let cursor = if cursor.is_empty() {
         None
@@ -862,7 +1121,10 @@ pub(crate) fn query_page<B: StorageBackend>(
                 .execute_scan_page(
                     &plan,
                     limit,
-                    cursor.as_ref().map(|cursor| cursor.last_key.as_slice()),
+                    cursor.as_ref().map(|cursor| ScanPosition {
+                        document_key: &cursor.last_key,
+                        order_value: cursor.order_value.as_deref(),
+                    }),
                 )
                 .map_err(map_query)?;
             let documents = page
@@ -881,6 +1143,7 @@ pub(crate) fn query_page<B: StorageBackend>(
                     .clone();
                 query_cursor::encode(&query_cursor::QueryCursor {
                     last_key,
+                    order_value: page.last_order_value,
                     catalog_generation: snapshot.generation.get(),
                     query_hash,
                 })
@@ -1085,6 +1348,9 @@ fn map_query(error: QueryError) -> OperationError {
         QueryError::InvalidRequest(_) => {
             OperationError::new(status::INVALID_REQUEST, error.to_string())
         }
+        QueryError::ResourceExhausted(_) | QueryError::AggregateOverflow(_) => {
+            OperationError::new(status::RESOURCE_EXHAUSTED, error.to_string())
+        }
         QueryError::Storage(StorageError::SchemaMismatch { .. }) => {
             OperationError::new(status::SCHEMA_MISMATCH, error.to_string())
         }
@@ -1104,6 +1370,11 @@ fn map_bind(error: RqlBindError) -> OperationError {
         | RqlBindError::MissingParameter(_)
         | RqlBindError::InvalidLiteral { .. }
         | RqlBindError::UnqualifiedPath(_)
+        | RqlBindError::InvalidOrder(_)
+        | RqlBindError::UnsortableField(_)
+        | RqlBindError::InvalidAggregate(_)
+        | RqlBindError::UnsortableGroup(_)
+        | RqlBindError::InvalidAggregateType { .. }
         | RqlBindError::FragmentNotIncluded(_)
         | RqlBindError::Key(_) => status::INVALID_REQUEST,
         RqlBindError::MissingMetadata(_) => status::INTERNAL,

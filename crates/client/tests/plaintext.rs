@@ -4,9 +4,9 @@ use prost::Message;
 use recolith_client::{BatchOperation, Client, ClientConfig, ClientError};
 use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::messages::{
-    DescribeCollectionRequest, DocumentGetRequest, DocumentGetResponse, FieldSelection,
-    NamedParameter, QueryRequest, QueryStreamRequest, SecurityMode, Value,
-    describe_collection_request, feature, opcode, status, value,
+    AggregateRequest, DescribeCollectionRequest, DocumentGetRequest, DocumentGetResponse,
+    ExplainRequest, FieldSelection, NamedParameter, QueryRequest, QueryStreamRequest, SecurityMode,
+    Value, describe_collection_request, explain_response, feature, opcode, status, value,
 };
 use recolith_server::ServerConfig;
 
@@ -169,6 +169,137 @@ async fn writes_reads_and_queries_documents() {
         3
     );
     assert!(chunks.last().expect("chunks").r#final);
+}
+
+#[tokio::test]
+async fn explains_queries_without_executing_them() {
+    let address = support::start_server(
+        ServerConfig::new("127.0.0.1:0".parse().expect("address")),
+        support::game_store(),
+    )
+    .await;
+    let mut client = Client::connect(ClientConfig::new(address.to_string()))
+        .await
+        .expect("connect");
+
+    let point = client
+        .explain(&ExplainRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT profile.name FROM player WHERE player_id = :id \
+                  INCLUDE FRAGMENTS profile"
+                .to_owned(),
+            parameters: vec![NamedParameter {
+                name: "id".to_owned(),
+                value: Some(Value {
+                    kind: Some(value::Kind::U64Value(42)),
+                }),
+            }],
+        })
+        .await
+        .expect("explain point");
+    let Some(explain_response::Plan::Document(plan)) = point.plan else {
+        panic!("expected document plan");
+    };
+    assert_eq!(plan.document_key, support::document_key(42));
+    assert_eq!(plan.fragment_ids, vec![1]);
+
+    let scan = client
+        .explain(&ExplainRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT profile.name FROM player WHERE profile.level >= 10 \
+                  INCLUDE FRAGMENTS profile ORDER BY profile.level DESC"
+                .to_owned(),
+            parameters: Vec::new(),
+        })
+        .await
+        .expect("explain scan");
+    let Some(explain_response::Plan::Scan(plan)) = scan.plan else {
+        panic!("expected scan plan");
+    };
+    assert_eq!(plan.collection_id, 1);
+    assert_eq!(plan.fragment_ids, vec![1]);
+    assert!(plan.drives[0].bucket_scan);
+    let order = plan.order.expect("order");
+    assert_eq!(order.field_id, 2);
+    assert!(order.descending);
+    assert_eq!(order.index_id, None);
+}
+
+#[tokio::test]
+async fn aggregates_documents_through_the_client() {
+    let address = support::start_server(
+        ServerConfig::new("127.0.0.1:0".parse().expect("address")),
+        support::game_store(),
+    )
+    .await;
+    let mut client = Client::connect(ClientConfig::new(address.to_string()))
+        .await
+        .expect("connect");
+
+    for (index, player) in [42_u64, 43, 44].into_iter().enumerate() {
+        client
+            .document_put(&support::profile_put(
+                &support::document_key(player),
+                "alex",
+                format!("aggregate-{index}").as_bytes(),
+            ))
+            .await
+            .expect("put");
+    }
+
+    let response = client
+        .aggregate(&AggregateRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT COUNT(*), SUM(profile.level), AVG(profile.level) \
+                  FROM player WHERE profile.level >= 0 INCLUDE FRAGMENTS profile"
+                .to_owned(),
+            parameters: Vec::new(),
+            limit: 10,
+        })
+        .await
+        .expect("aggregate");
+    assert_eq!(response.columns.len(), 3);
+    assert_eq!(response.rows.len(), 1);
+    assert_eq!(
+        response.rows[0].values,
+        vec![
+            Value {
+                kind: Some(value::Kind::U64Value(3)),
+            },
+            Value {
+                kind: Some(value::Kind::U64Value(30)),
+            },
+            Value {
+                kind: Some(value::Kind::F64Value(10.0)),
+            },
+        ]
+    );
+
+    let grouped = client
+        .aggregate(&AggregateRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT COUNT(*) FROM player WHERE profile.level >= 0 \
+                  INCLUDE FRAGMENTS profile GROUP BY profile.level"
+                .to_owned(),
+            parameters: Vec::new(),
+            limit: 10,
+        })
+        .await
+        .expect("grouped aggregate");
+    assert_eq!(grouped.group_fragment_id, Some(1));
+    assert_eq!(grouped.group_field_id, Some(2));
+    assert_eq!(grouped.rows.len(), 1);
+    assert!(!grouped.truncated);
+    assert_eq!(
+        grouped.rows[0].values,
+        vec![Value {
+            kind: Some(value::Kind::U64Value(3)),
+        }]
+    );
 }
 
 #[tokio::test]

@@ -10,11 +10,11 @@ use recolith_protocol::batch::{BatchLimits, SubFrame, encode_batch};
 use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN};
 use recolith_protocol::messages::{
-    AuthMethod, AuthResult, CatalogAlterRequest, CatalogApplyRequest, CatalogDropRequest,
-    DescribeCollectionRequest, DocumentGetRequest, DocumentPutRequest, ErrorResponse, FieldValue,
-    FragmentPayload, HelloRequest, KeyspaceDefinition, PingRequest, RequestMeta, SetBucketSchema,
-    Value, WelcomeResponse, catalog_alter_request, catalog_drop_request,
-    describe_collection_request, opcode, status, value,
+    AggregateRequest, AuthMethod, AuthResult, CatalogAlterRequest, CatalogApplyRequest,
+    CatalogDropRequest, DescribeCollectionRequest, DocumentGetRequest, DocumentPutRequest,
+    ErrorResponse, ExplainRequest, FieldValue, FragmentPayload, HelloRequest, KeyspaceDefinition,
+    PingRequest, RequestMeta, SetBucketSchema, Value, WelcomeResponse, catalog_alter_request,
+    catalog_drop_request, describe_collection_request, opcode, status, value,
 };
 use recolith_security::{
     Authenticator, TokenClaims, TokenIssuer, fingerprint_hex, token_fingerprint, unix_seconds,
@@ -282,6 +282,45 @@ async fn roles_authorize_operations_and_return_permission_denied() {
     .await;
     let (header, _) = read_frame(&mut reader, &reader_codec).await;
     assert_eq!(header.opcode(), opcode::DOC_GET);
+    assert_eq!(header.status(), status::OK);
+
+    write_frame(
+        &mut reader,
+        &reader_codec,
+        &FrameHeader::new(opcode::EXPLAIN, 6),
+        &ExplainRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT profile.name FROM player WHERE profile.level >= 0 \
+                  INCLUDE FRAGMENTS profile"
+                .to_owned(),
+            parameters: Vec::new(),
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, _) = read_frame(&mut reader, &reader_codec).await;
+    assert_eq!(header.opcode(), opcode::EXPLAIN);
+    assert_eq!(header.status(), status::OK);
+
+    write_frame(
+        &mut reader,
+        &reader_codec,
+        &FrameHeader::new(opcode::AGGREGATE, 7),
+        &AggregateRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT COUNT(*) FROM player WHERE profile.level >= 0 \
+                  INCLUDE FRAGMENTS profile"
+                .to_owned(),
+            parameters: Vec::new(),
+            limit: 10,
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, _) = read_frame(&mut reader, &reader_codec).await;
+    assert_eq!(header.opcode(), opcode::AGGREGATE);
     assert_eq!(header.status(), status::OK);
 
     write_frame(

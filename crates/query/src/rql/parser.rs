@@ -5,7 +5,8 @@ use pest::iterators::{Pair, Pairs};
 use pest_derive::Parser;
 
 use super::ast::{
-    RqlDocumentQuery, RqlLiteral, RqlOp, RqlOperand, RqlPath, RqlPredicate, RqlSelector,
+    RqlAggregate, RqlAggregateFunction, RqlAggregateQuery, RqlDocumentQuery, RqlLiteral, RqlOp,
+    RqlOperand, RqlOrder, RqlPath, RqlPredicate, RqlSelector,
 };
 
 #[derive(Parser)]
@@ -66,8 +67,8 @@ type ParseResult<T> = std::result::Result<T, RqlError>;
 /// Parses a document read query.
 ///
 /// The grammar is a strict subset of the RQL surface: projections, fragment
-/// paths, inline `many` selectors, conjunctive predicates, bind parameters, and
-/// the mandatory `INCLUDE FRAGMENTS` clause.
+/// paths, inline `many` selectors, conjunctive predicates, bind parameters,
+/// the mandatory `INCLUDE FRAGMENTS` clause, and optional `ORDER BY`/`LIMIT`.
 ///
 /// # Errors
 ///
@@ -82,24 +83,125 @@ pub fn parse_document_query(input: &str) -> ParseResult<RqlDocumentQuery> {
     let collection = expect(&mut inner, Rule::ident)?.as_str().to_owned();
     let predicates = parse_predicates(expect(&mut inner, Rule::predicate_list)?)?;
     let fragments = parse_fragments(expect(&mut inner, Rule::fragment_list)?);
-    let limit = match next_significant(&mut inner) {
-        Some(pair) if pair.as_rule() == Rule::integer => Some(parse_limit(pair.as_str())?),
-        Some(pair) => {
-            return Err(invalid(format!(
-                "unexpected query suffix: {:?}",
-                pair.as_rule()
-            )));
+    let mut order = None;
+    let mut limit = None;
+    while let Some(pair) = next_significant(&mut inner) {
+        match pair.as_rule() {
+            Rule::order_clause if order.is_none() => order = Some(parse_order(pair)?),
+            Rule::integer if limit.is_none() => limit = Some(parse_limit(pair.as_str())?),
+            other => {
+                return Err(invalid(format!("unexpected query suffix: {other:?}")));
+            }
         }
-        None => None,
-    };
+    }
 
     Ok(RqlDocumentQuery::new(
         projections,
         collection,
         predicates,
         fragments,
+        order,
         limit,
     ))
+}
+
+/// Parses an aggregate query.
+///
+/// Aggregate queries support `COUNT(*)`, `SUM`, `MIN`, `MAX`, and `AVG`,
+/// optional single-field `GROUP BY`, and `LIMIT` over groups.
+///
+/// # Errors
+///
+/// Returns [`RqlError::Syntax`] for malformed text and [`RqlError::Invalid`] for
+/// malformed aggregate expressions.
+pub fn parse_aggregate_query(input: &str) -> ParseResult<RqlAggregateQuery> {
+    let mut pairs = RqlParser::parse(Rule::aggregate_query, input)?;
+    let query = pairs.next().ok_or_else(|| invalid("query is empty"))?;
+    let mut inner = query.into_inner();
+
+    let aggregates = parse_aggregates(expect(&mut inner, Rule::aggregate_list)?)?;
+    let collection = expect(&mut inner, Rule::ident)?.as_str().to_owned();
+    let predicates = parse_predicates(expect(&mut inner, Rule::predicate_list)?)?;
+    let fragments = parse_fragments(expect(&mut inner, Rule::fragment_list)?);
+    let mut group_by = None;
+    let mut limit = None;
+    while let Some(pair) = next_significant(&mut inner) {
+        match pair.as_rule() {
+            Rule::group_clause if group_by.is_none() => group_by = Some(parse_group(pair)?),
+            Rule::integer if limit.is_none() => limit = Some(parse_limit(pair.as_str())?),
+            other => {
+                return Err(invalid(format!("unexpected query suffix: {other:?}")));
+            }
+        }
+    }
+
+    Ok(RqlAggregateQuery::new(
+        aggregates, collection, predicates, fragments, group_by, limit,
+    ))
+}
+
+fn parse_aggregates(pair: Pair<'_, Rule>) -> ParseResult<Vec<RqlAggregate>> {
+    pair.into_inner()
+        .map(|aggregate| {
+            let part = aggregate
+                .into_inner()
+                .next()
+                .ok_or_else(|| invalid("aggregate expression is empty"))?;
+            match part.as_rule() {
+                Rule::aggregate_count => Ok(RqlAggregate::new(RqlAggregateFunction::Count, None)),
+                Rule::aggregate_call => {
+                    let mut inner = part.into_inner();
+                    let name = inner
+                        .next()
+                        .ok_or_else(|| invalid("aggregate name is missing"))?;
+                    let keyword = name
+                        .into_inner()
+                        .next()
+                        .ok_or_else(|| invalid("aggregate name is empty"))?;
+                    let function = match keyword.as_rule() {
+                        Rule::keyword_sum => RqlAggregateFunction::Sum,
+                        Rule::keyword_min => RqlAggregateFunction::Min,
+                        Rule::keyword_max => RqlAggregateFunction::Max,
+                        Rule::keyword_avg => RqlAggregateFunction::Avg,
+                        other => {
+                            return Err(invalid(format!("unknown aggregate function: {other:?}")));
+                        }
+                    };
+                    let path = parse_path(expect(&mut inner, Rule::path)?, false)?;
+                    Ok(RqlAggregate::new(function, Some(path)))
+                }
+                other => Err(invalid(format!("unexpected aggregate part: {other:?}"))),
+            }
+        })
+        .collect()
+}
+
+fn parse_group(pair: Pair<'_, Rule>) -> ParseResult<RqlPath> {
+    let mut inner = pair.into_inner();
+    parse_path(expect(&mut inner, Rule::path)?, false)
+}
+
+fn parse_order(pair: Pair<'_, Rule>) -> ParseResult<RqlOrder> {
+    let mut inner = pair.into_inner();
+    let path = parse_path(expect(&mut inner, Rule::path)?, false)?;
+    let descending = match inner.find(|part| part.as_rule() == Rule::order_direction) {
+        Some(direction) => {
+            let keyword = direction
+                .into_inner()
+                .next()
+                .ok_or_else(|| invalid("order direction is empty"))?;
+            match keyword.as_rule() {
+                Rule::keyword_desc => true,
+                Rule::keyword_asc => false,
+                other => {
+                    return Err(invalid(format!("unexpected order direction: {other:?}")));
+                }
+            }
+        }
+        None => false,
+    };
+
+    Ok(RqlOrder::new(path, descending))
 }
 
 fn parse_projections(pair: Pair<'_, Rule>) -> ParseResult<Vec<RqlPath>> {
@@ -296,6 +398,11 @@ fn is_keyword(rule: Rule) -> bool {
             | Rule::keyword_include
             | Rule::keyword_fragments
             | Rule::keyword_limit
+            | Rule::keyword_order
+            | Rule::keyword_by
+            | Rule::keyword_asc
+            | Rule::keyword_desc
+            | Rule::keyword_group
     )
 }
 

@@ -6,18 +6,20 @@ use std::sync::Arc;
 
 use recolith_backend::{KeyRange, ScanOptions, Snapshot, StorageBackend};
 use recolith_catalog::Catalog;
-use recolith_common::{BucketId, FieldId, FragmentId, PartitionId};
-use recolith_model::{DocumentKeySchema, Fragment, FragmentCardinality};
+use recolith_common::{BucketId, FieldId, FragmentId, IndexId, PartitionId};
+use recolith_model::{Collection, DocumentKeySchema, Fragment, FragmentCardinality};
 use recolith_storage::{
     DocumentFragments, FragmentData, FragmentMode, FragmentReader, IndexBound, IndexFilter,
     RecordData, StorageError, Value, decode_record_key, encode_bucket_prefix, encode_index_value,
     read_document, scan_index, scan_index_components, scan_index_range,
 };
 
+use crate::aggregate::{AggregateBuilder, AggregatePage, AggregateQuery};
+use crate::compare::compare_values;
 use crate::error::{QueryError, Result};
 use crate::ir::{DocumentQuery, FieldSelection, Filter, FilterOp};
 use crate::request::DocumentReadRequest;
-use crate::scan::{DocumentScan, KeyFilter};
+use crate::scan::{DocumentScan, KeyFilter, ScanOrder};
 
 /// Bound document read plan.
 #[derive(Clone, Debug)]
@@ -34,6 +36,33 @@ impl QueryPlan {
     pub fn readers(&self) -> &[FragmentReader] {
         &self.fragments
     }
+
+    /// Returns the document key.
+    #[must_use]
+    pub fn document_key(&self) -> &[u8] {
+        &self.document_key
+    }
+
+    /// Returns the selected fragment identifiers.
+    #[must_use]
+    pub fn fragment_ids(&self) -> Vec<FragmentId> {
+        self.fragments
+            .iter()
+            .map(FragmentReader::fragment_id)
+            .collect()
+    }
+
+    /// Returns fragment filters.
+    #[must_use]
+    pub fn filters(&self) -> &[Filter] {
+        &self.filters
+    }
+
+    /// Returns the projection.
+    #[must_use]
+    pub fn projection(&self) -> &[FieldSelection] {
+        &self.projection
+    }
 }
 
 /// Bound multi-document scan plan.
@@ -45,6 +74,110 @@ pub struct ScanPlan {
     drives: Vec<ScanDrive>,
     filters: Vec<Filter>,
     projection: Vec<FieldSelection>,
+    order: Option<ScanOrder>,
+    order_index: Option<IndexId>,
+}
+
+impl ScanPlan {
+    /// Returns the index used as the ordering source, if any.
+    #[must_use]
+    pub const fn order_index(&self) -> Option<IndexId> {
+        self.order_index
+    }
+
+    /// Returns whether candidate enumeration uses an index.
+    #[must_use]
+    pub fn uses_index_scan(&self) -> bool {
+        self.drives
+            .iter()
+            .any(|drive| !drive.index_filters.is_empty())
+    }
+
+    /// Returns the selected fragment identifiers.
+    #[must_use]
+    pub fn fragment_ids(&self) -> Vec<FragmentId> {
+        self.fragments
+            .iter()
+            .map(FragmentReader::fragment_id)
+            .collect()
+    }
+
+    /// Returns fragment filters.
+    #[must_use]
+    pub fn filters(&self) -> &[Filter] {
+        &self.filters
+    }
+
+    /// Returns the projection.
+    #[must_use]
+    pub fn projection(&self) -> &[FieldSelection] {
+        &self.projection
+    }
+
+    /// Returns document key filters.
+    #[must_use]
+    pub fn key_filters(&self) -> &[KeyFilter] {
+        &self.key_filters
+    }
+
+    /// Returns the ordering, if any.
+    #[must_use]
+    pub fn order(&self) -> Option<&ScanOrder> {
+        self.order.as_ref()
+    }
+
+    /// Returns the candidate document limit.
+    #[must_use]
+    pub const fn candidate_limit(&self) -> usize {
+        MAX_SCAN_DOCUMENTS
+    }
+
+    /// Returns the candidate sources used by the plan.
+    #[must_use]
+    pub fn drives(&self) -> Vec<ScanDriveInfo> {
+        self.drives
+            .iter()
+            .map(|drive| ScanDriveInfo {
+                bucket: drive.bucket,
+                fragment: drive.fragment,
+                indexes: drive.index_filters.iter().map(IndexFilter::index).collect(),
+            })
+            .collect()
+    }
+}
+
+/// Candidate source in a scan plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScanDriveInfo {
+    bucket: BucketId,
+    fragment: FragmentId,
+    indexes: Vec<IndexId>,
+}
+
+impl ScanDriveInfo {
+    /// Returns the bucket identifier.
+    #[must_use]
+    pub const fn bucket(&self) -> BucketId {
+        self.bucket
+    }
+
+    /// Returns the fragment identifier.
+    #[must_use]
+    pub const fn fragment(&self) -> FragmentId {
+        self.fragment
+    }
+
+    /// Returns index identifiers used by the candidate source.
+    #[must_use]
+    pub fn indexes(&self) -> &[IndexId] {
+        &self.indexes
+    }
+
+    /// Returns whether the candidate source is a bucket scan.
+    #[must_use]
+    pub fn is_bucket_scan(&self) -> bool {
+        self.indexes.is_empty()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -243,6 +376,8 @@ impl<B: StorageBackend> QueryEngine<B> {
         };
 
         let mut readers = Vec::with_capacity(selected.len());
+        let selected_len = selected.len();
+        let selected_fragment = selected.first().map(|fragment| fragment.id());
         let mut schemas = BTreeMap::new();
         let mut drives = Vec::new();
         let mut indexed_drive = None;
@@ -280,42 +415,39 @@ impl<B: StorageBackend> QueryEngine<B> {
             schemas.insert(fragment.id(), schema.clone());
 
             let mut index_filters = Vec::new();
-            if mode == FragmentMode::Many {
-                for filter in query
-                    .filters()
-                    .iter()
-                    .filter(|filter| filter.fragment() == fragment.id())
-                {
-                    let Some(index) = leading_field_index(&catalog, bucket.id(), filter.field())
-                    else {
-                        continue;
-                    };
-                    match filter.op() {
-                        FilterOp::Eq => {
-                            index_filters.push(IndexFilter::new_with_components(
-                                index.id(),
-                                encode_index_value(filter.value())?,
-                                index.fields().len(),
-                            ));
-                        }
-                        FilterOp::Lt | FilterOp::Le | FilterOp::Gt | FilterOp::Ge => {
-                            let encoded = encode_index_value(filter.value())?;
-                            let (lower, upper) = match filter.op() {
-                                FilterOp::Lt => (None, Some(IndexBound::new(encoded, false))),
-                                FilterOp::Le => (None, Some(IndexBound::new(encoded, true))),
-                                FilterOp::Gt => (Some(IndexBound::new(encoded, false)), None),
-                                FilterOp::Ge => (Some(IndexBound::new(encoded, true)), None),
-                                FilterOp::Eq | FilterOp::Ne => unreachable!(),
-                            };
-                            index_filters.push(IndexFilter::range_with_components(
-                                index.id(),
-                                lower,
-                                upper,
-                                index.fields().len(),
-                            ));
-                        }
-                        FilterOp::Ne => {}
+            for filter in query
+                .filters()
+                .iter()
+                .filter(|filter| filter.fragment() == fragment.id())
+            {
+                let Some(index) = leading_field_index(&catalog, bucket.id(), filter.field()) else {
+                    continue;
+                };
+                match filter.op() {
+                    FilterOp::Eq => {
+                        index_filters.push(IndexFilter::new_with_components(
+                            index.id(),
+                            encode_index_value(filter.value())?,
+                            index.fields().len(),
+                        ));
                     }
+                    FilterOp::Lt | FilterOp::Le | FilterOp::Gt | FilterOp::Ge => {
+                        let encoded = encode_index_value(filter.value())?;
+                        let (lower, upper) = match filter.op() {
+                            FilterOp::Lt => (None, Some(IndexBound::new(encoded, false))),
+                            FilterOp::Le => (None, Some(IndexBound::new(encoded, true))),
+                            FilterOp::Gt => (Some(IndexBound::new(encoded, false)), None),
+                            FilterOp::Ge => (Some(IndexBound::new(encoded, true)), None),
+                            FilterOp::Eq | FilterOp::Ne => unreachable!(),
+                        };
+                        index_filters.push(IndexFilter::range_with_components(
+                            index.id(),
+                            lower,
+                            upper,
+                            index.fields().len(),
+                        ));
+                    }
+                    FilterOp::Ne => {}
                 }
             }
 
@@ -340,12 +472,23 @@ impl<B: StorageBackend> QueryEngine<B> {
         }
         let mut seen = BTreeSet::new();
         drives.retain(|drive| seen.insert((drive.bucket, drive.fragment)));
+        let order_index = order_index_source(
+            &catalog,
+            collection,
+            query.order(),
+            selected_len,
+            selected_fragment,
+            &drives,
+        );
 
         for filter in query.filters() {
             validate_field(&schemas, filter.fragment(), filter.field())?;
         }
         for selection in query.projection() {
             validate_field(&schemas, selection.fragment(), selection.field())?;
+        }
+        if let Some(order) = query.order() {
+            validate_field(&schemas, order.fragment(), order.field())?;
         }
 
         Ok(ScanPlan {
@@ -355,6 +498,8 @@ impl<B: StorageBackend> QueryEngine<B> {
             drives,
             filters: query.filters().to_vec(),
             projection: query.projection().to_vec(),
+            order: query.order().cloned(),
+            order_index,
         })
     }
 
@@ -371,7 +516,12 @@ impl<B: StorageBackend> QueryEngine<B> {
         Ok(self.execute_scan_page(plan, limit, None)?.documents)
     }
 
-    /// Executes one scan page after an optional document key.
+    /// Executes one scan page after an optional position.
+    ///
+    /// Ordered scans read a single-field leading index when the plan is
+    /// eligible; otherwise they sort every matching candidate in memory. Both
+    /// paths then apply the cursor position and limit. Unordered scans keep
+    /// document-key order and stop at the first document beyond the limit.
     ///
     /// # Errors
     ///
@@ -380,32 +530,34 @@ impl<B: StorageBackend> QueryEngine<B> {
         &self,
         plan: &ScanPlan,
         limit: usize,
-        after: Option<&[u8]>,
+        after: Option<ScanPosition<'_>>,
     ) -> Result<ScanPage> {
         if limit == 0 {
             return Ok(ScanPage {
                 documents: Vec::new(),
                 has_more: false,
+                last_order_value: None,
             });
         }
 
         let snapshot = self.backend.snapshot()?;
-        let mut candidates = BTreeSet::new();
-        for drive in &plan.drives {
-            if drive.index_filters.is_empty() {
-                collect_bucket_candidates(&snapshot, drive, &mut candidates)?;
-            } else {
-                collect_index_candidates(&snapshot, drive, &mut candidates)?;
-            }
-            if candidates.len() >= MAX_SCAN_DOCUMENTS {
-                break;
-            }
+        if let (Some(order), Some(index)) = (&plan.order, plan.order_index)
+            && let Some(page) =
+                execute_index_ordered_page(plan, &snapshot, order, index, limit, after)?
+        {
+            return Ok(page);
+        }
+        let candidates = collect_candidates(plan, &snapshot)?;
+
+        if let Some(order) = &plan.order {
+            return execute_ordered_page(plan, &snapshot, order, candidates, limit, after);
         }
 
+        let after_key = after.map(|position| position.document_key);
         let mut documents = Vec::new();
         let mut has_more = false;
         for key in candidates {
-            if after.is_some_and(|after| key.as_slice() <= after) {
+            if after_key.is_some_and(|after| key.as_slice() <= after) {
                 continue;
             }
             if !key_matches(&plan.key_schema, &plan.key_filters, &key)? {
@@ -427,17 +579,254 @@ impl<B: StorageBackend> QueryEngine<B> {
         Ok(ScanPage {
             documents,
             has_more,
+            last_order_value: None,
         })
+    }
+
+    /// Executes an aggregate query over at most `limit` groups.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QueryError`] for backend, storage, group-limit, or aggregate
+    /// overflow failures.
+    pub fn execute_aggregate(&self, query: &AggregateQuery, limit: usize) -> Result<AggregatePage> {
+        let scan = query.as_scan();
+        let plan = self.plan_scan(&scan)?;
+        let snapshot = self.backend.snapshot()?;
+        let mut builder = AggregateBuilder::new(query.group().cloned(), query.aggregates());
+
+        if let Some(document_key) = query.document_key() {
+            if key_matches(&plan.key_schema, &plan.key_filters, document_key)? {
+                let assembled = read_document(&snapshot, document_key, &plan.fragments)?;
+                if let Some(fragments) = apply_scan_filters(assembled, &plan.filters, &[]) {
+                    builder.add_document(&fragments)?;
+                }
+            }
+        } else {
+            for key in collect_candidates(&plan, &snapshot)? {
+                if !key_matches(&plan.key_schema, &plan.key_filters, &key)? {
+                    continue;
+                }
+                let assembled = read_document(&snapshot, &key, &plan.fragments)?;
+                let Some(fragments) = apply_scan_filters(assembled, &plan.filters, &[]) else {
+                    continue;
+                };
+                builder.add_document(&fragments)?;
+            }
+        }
+
+        builder.finish(limit)
     }
 }
 
 /// One scan result page.
 #[derive(Clone, Debug)]
 pub struct ScanPage {
-    /// Documents in document-key order.
+    /// Documents in document-key or ordered-value order.
     pub documents: Vec<(Vec<u8>, DocumentFragments)>,
     /// Whether another matching document exists after this page.
     pub has_more: bool,
+    /// Encoded ordering value of the last document, if the scan is ordered.
+    pub last_order_value: Option<Vec<u8>>,
+}
+
+/// Resume position for one scan page.
+#[derive(Clone, Copy, Debug)]
+pub struct ScanPosition<'a> {
+    /// Document key of the last returned document.
+    pub document_key: &'a [u8],
+    /// Encoded ordering value of the last returned document.
+    pub order_value: Option<&'a [u8]>,
+}
+
+struct OrderedDocument {
+    key: Vec<u8>,
+    order_value: Option<Vec<u8>>,
+    fragments: DocumentFragments,
+}
+
+fn execute_index_ordered_page<S: Snapshot>(
+    plan: &ScanPlan,
+    snapshot: &S,
+    order: &ScanOrder,
+    index: IndexId,
+    limit: usize,
+    after: Option<ScanPosition<'_>>,
+) -> Result<Option<ScanPage>> {
+    let Some(drive) = plan.drives.first() else {
+        return Ok(None);
+    };
+    let record_keys = scan_index_range(
+        snapshot,
+        drive.bucket,
+        drive.partition,
+        index,
+        None,
+        None,
+        1,
+        ScanOptions {
+            limit: Some(MAX_SCAN_DOCUMENTS),
+            reverse: order.descending(),
+        },
+    )?;
+
+    let mut documents = Vec::new();
+    let mut last_order_value = None;
+    let mut has_more = false;
+    let mut seen = BTreeSet::new();
+    for record_key in record_keys {
+        let Ok(decoded) = decode_record_key(&record_key) else {
+            continue;
+        };
+        if decoded.head().partition() != drive.partition || decoded.fragment() != drive.fragment {
+            continue;
+        }
+        let key = decoded.document_key().to_vec();
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        if !key_matches(&plan.key_schema, &plan.key_filters, &key)? {
+            continue;
+        }
+        let assembled = read_document(snapshot, &key, &plan.fragments)?;
+        let Some(order_value) = scan_order_value(&assembled, order)? else {
+            return Ok(None);
+        };
+        if let Some(position) = after {
+            let ordering = compare_ordered(
+                Some(&order_value),
+                &key,
+                position.order_value,
+                position.document_key,
+                order.descending(),
+            );
+            if ordering != Ordering::Greater {
+                continue;
+            }
+        }
+        let Some(fragments) = apply_scan_filters(assembled, &plan.filters, &plan.projection) else {
+            continue;
+        };
+        if documents.len() == limit {
+            has_more = true;
+            break;
+        }
+        last_order_value = Some(order_value);
+        documents.push((key, fragments));
+    }
+
+    Ok(Some(ScanPage {
+        documents,
+        has_more,
+        last_order_value,
+    }))
+}
+
+fn execute_ordered_page<S: Snapshot>(
+    plan: &ScanPlan,
+    snapshot: &S,
+    order: &ScanOrder,
+    candidates: BTreeSet<Vec<u8>>,
+    limit: usize,
+    after: Option<ScanPosition<'_>>,
+) -> Result<ScanPage> {
+    let mut matched = Vec::new();
+    for key in candidates {
+        if !key_matches(&plan.key_schema, &plan.key_filters, &key)? {
+            continue;
+        }
+        let assembled = read_document(snapshot, &key, &plan.fragments)?;
+        let order_value = scan_order_value(&assembled, order)?;
+        let Some(fragments) = apply_scan_filters(assembled, &plan.filters, &plan.projection) else {
+            continue;
+        };
+        matched.push(OrderedDocument {
+            key,
+            order_value,
+            fragments,
+        });
+    }
+
+    matched.sort_by(|left, right| {
+        compare_ordered(
+            left.order_value.as_deref(),
+            &left.key,
+            right.order_value.as_deref(),
+            &right.key,
+            order.descending(),
+        )
+    });
+
+    let start = after.map_or(0, |position| {
+        matched.partition_point(|document| {
+            compare_ordered(
+                document.order_value.as_deref(),
+                &document.key,
+                position.order_value,
+                position.document_key,
+                order.descending(),
+            ) != Ordering::Greater
+        })
+    });
+    let end = start.saturating_add(limit).min(matched.len());
+    let has_more = end < matched.len();
+    let mut documents = Vec::with_capacity(end.saturating_sub(start));
+    let mut last_order_value = None;
+    for document in matched.drain(start..end) {
+        last_order_value = document.order_value;
+        documents.push((document.key, document.fragments));
+    }
+
+    Ok(ScanPage {
+        documents,
+        has_more,
+        last_order_value,
+    })
+}
+
+fn scan_order_value(assembled: &DocumentFragments, order: &ScanOrder) -> Result<Option<Vec<u8>>> {
+    let Some(records) = assembled.get(&order.fragment()) else {
+        return Ok(None);
+    };
+    let mut selected: Option<&Value> = None;
+    for record in records {
+        let Some(value) = record.data().get(order.field()) else {
+            continue;
+        };
+        if selected.is_none_or(|current| compare_values(value, current) == Some(Ordering::Less)) {
+            selected = Some(value);
+        }
+    }
+
+    Ok(selected.map(encode_index_value).transpose()?)
+}
+
+fn compare_ordered(
+    left_value: Option<&[u8]>,
+    left_key: &[u8],
+    right_value: Option<&[u8]>,
+    right_key: &[u8],
+    descending: bool,
+) -> Ordering {
+    let ordering = match (left_value, right_value) {
+        (Some(left), Some(right)) => {
+            let ordering = left.cmp(right);
+            if descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    };
+    if ordering == Ordering::Equal {
+        let keys = left_key.cmp(right_key);
+        if descending { keys.reverse() } else { keys }
+    } else {
+        ordering
+    }
 }
 
 impl<B: StorageBackend> fmt::Debug for QueryEngine<B> {
@@ -456,6 +845,51 @@ fn leading_field_index(
         .get(&bucket)?
         .values()
         .find(|index| index.leading_field() == Some(field))
+}
+
+fn order_index_source(
+    catalog: &recolith_catalog::CatalogSnapshot,
+    collection: &Collection,
+    order: Option<&ScanOrder>,
+    selected_len: usize,
+    selected_fragment: Option<FragmentId>,
+    drives: &[ScanDrive],
+) -> Option<IndexId> {
+    let order = order?;
+    if selected_len != 1 || selected_fragment != Some(order.fragment()) {
+        return None;
+    }
+    let drive = drives.first()?;
+    if drives.len() != 1 || !drive.index_filters.is_empty() || drive.fragment != order.fragment() {
+        return None;
+    }
+    let fragment = collection
+        .fragments()
+        .iter()
+        .find(|fragment| fragment.id() == order.fragment())?;
+    if fragment.cardinality() != FragmentCardinality::One {
+        return None;
+    }
+    let bucket = catalog.buckets.get(&fragment.bucket_id())?;
+    let mut versions = catalog
+        .schemas
+        .schemas
+        .iter()
+        .filter(|((schema_id, _), _)| *schema_id == bucket.schema_id())
+        .peekable();
+    versions.peek()?;
+    for (_, schema) in versions {
+        match schema.field(order.field()) {
+            Some(field) if !field.optional() => {}
+            _ => return None,
+        }
+    }
+    catalog
+        .indexes
+        .get(&bucket.id())?
+        .values()
+        .find(|index| index.fields().len() == 1 && index.leading_field() == Some(order.field()))
+        .map(|index| index.id())
 }
 
 fn validate_field(
@@ -535,32 +969,28 @@ fn filter_matches(filter: &Filter, data: &RecordData) -> bool {
     }
 }
 
-fn compare_values(left: &Value, right: &Value) -> Option<Ordering> {
-    match (left, right) {
-        (Value::Bool(left), Value::Bool(right)) => left.partial_cmp(right),
-        (Value::I32(left), Value::I32(right)) => left.partial_cmp(right),
-        (Value::I64(left), Value::I64(right)) => left.partial_cmp(right),
-        (Value::U32(left), Value::U32(right)) => left.partial_cmp(right),
-        (Value::U64(left), Value::U64(right)) => left.partial_cmp(right),
-        (Value::F32(left), Value::F32(right)) => left.partial_cmp(right),
-        (Value::F64(left), Value::F64(right)) => left.partial_cmp(right),
-        (Value::String(left), Value::String(right)) => left.partial_cmp(right),
-        (Value::Bytes(left), Value::Bytes(right)) => left.partial_cmp(right),
-        (Value::Timestamp(left), Value::Timestamp(right)) => {
-            left.as_micros().partial_cmp(&right.as_micros())
-        }
-        (Value::Duration(left), Value::Duration(right)) => left.partial_cmp(right),
-        (Value::Enum(left), Value::Enum(right)) => left.partial_cmp(right),
-        _ => None,
-    }
-}
-
 fn project_record(record: FragmentData, fields: &BTreeSet<FieldId>) -> FragmentData {
     if fields.is_empty() {
         record
     } else {
         record.project(fields)
     }
+}
+
+fn collect_candidates<S: Snapshot>(plan: &ScanPlan, snapshot: &S) -> Result<BTreeSet<Vec<u8>>> {
+    let mut candidates = BTreeSet::new();
+    for drive in &plan.drives {
+        if drive.index_filters.is_empty() {
+            collect_bucket_candidates(snapshot, drive, &mut candidates)?;
+        } else {
+            collect_index_candidates(snapshot, drive, &mut candidates)?;
+        }
+        if candidates.len() >= MAX_SCAN_DOCUMENTS {
+            break;
+        }
+    }
+
+    Ok(candidates)
 }
 
 fn collect_bucket_candidates<S: Snapshot>(

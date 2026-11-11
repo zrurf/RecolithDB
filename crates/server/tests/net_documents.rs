@@ -5,19 +5,20 @@ use prost::Message;
 use recolith_backend_memory::MemoryBackend;
 use recolith_catalog::Catalog;
 use recolith_common::{
-    BucketId, CollectionId, FieldId, FragmentId, KeyspaceId, SchemaId, SchemaVersion,
+    BucketId, CollectionId, FieldId, FragmentId, IndexId, KeyspaceId, SchemaId, SchemaVersion,
 };
 use recolith_model::{
-    Bucket, BucketPolicy, Collection, DocumentKeySchema, Fragment, FragmentCardinality, KeyField,
-    KeyType, KeyValue, Keyspace,
+    Bucket, BucketPolicy, Collection, DocumentKeySchema, Fragment, FragmentCardinality,
+    IndexDefinition, IndexKind, KeyField, KeyType, KeyValue, Keyspace,
 };
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN};
 use recolith_protocol::messages::{
-    AuthMethod, CatalogApplyRequest, DescribeCollectionRequest, DescribeCollectionResponse,
-    DocumentGetRequest, DocumentGetResponse, DocumentPutRequest, DocumentPutResponse,
-    FieldSelection, FieldValue, FragmentPayload, HelloRequest, KeyFieldType, KeyspaceDefinition,
-    NamedParameter, QueryRequest, QueryResponse, RequestMeta, SchemaScalarType, Value,
-    WelcomeResponse, describe_collection_request, opcode, schema_type, status, value,
+    AggregateRequest, AggregateResponse, AuthMethod, CatalogApplyRequest,
+    DescribeCollectionRequest, DescribeCollectionResponse, DocumentGetRequest, DocumentGetResponse,
+    DocumentPutRequest, DocumentPutResponse, ExplainRequest, FieldSelection, FieldValue,
+    FragmentPayload, HelloRequest, KeyFieldType, KeyspaceDefinition, NamedParameter, QueryRequest,
+    QueryResponse, RequestMeta, SchemaScalarType, Value, WelcomeResponse,
+    describe_collection_request, explain_response, opcode, schema_type, status, value,
 };
 use recolith_schema::{Field, RecordSchema, Type};
 use recolith_server::{DocumentStore, ServerConfig, serve};
@@ -75,6 +76,17 @@ fn store() -> Arc<DocumentStore<MemoryBackend>> {
             )],
         ))
         .expect("collection");
+    catalog
+        .create_index(
+            BucketId::new(1),
+            IndexDefinition::new(
+                IndexId::new(1),
+                "by-level",
+                IndexKind::Range,
+                vec![FieldId::new(2)],
+            ),
+        )
+        .expect("index");
 
     Arc::new(DocumentStore::new(
         Arc::new(catalog),
@@ -164,6 +176,10 @@ fn document_key(player: u64) -> Vec<u8> {
 }
 
 fn profile_put(key: &[u8], name: &str, idempotency: &[u8]) -> DocumentPutRequest {
+    profile_put_level(key, name, 10, idempotency)
+}
+
+fn profile_put_level(key: &[u8], name: &str, level: u32, idempotency: &[u8]) -> DocumentPutRequest {
     DocumentPutRequest {
         meta: Some(RequestMeta {
             idempotency_key: idempotency.to_vec(),
@@ -185,7 +201,7 @@ fn profile_put(key: &[u8], name: &str, idempotency: &[u8]) -> DocumentPutRequest
                 FieldValue {
                     field_id: 2,
                     value: Some(Value {
-                        kind: Some(value::Kind::U32Value(10)),
+                        kind: Some(value::Kind::U32Value(level)),
                     }),
                 },
             ],
@@ -641,4 +657,310 @@ async fn scans_multiple_documents_without_a_key_predicate() {
     let (header, _) = read_frame(&mut stream, &codec).await;
     assert_eq!(header.opcode(), opcode::ERROR);
     assert_eq!(header.status(), status::STALE_CATALOG);
+}
+
+#[tokio::test]
+async fn orders_and_paginates_scans() {
+    let store = store();
+    let address = start_server(Arc::clone(&store)).await;
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let codec = handshake(&mut stream).await;
+
+    for (index, (player, level)) in [(1_u64, 30_u32), (2, 10), (3, 30)].into_iter().enumerate() {
+        let put = profile_put_level(
+            &document_key(player),
+            &format!("player-{player}"),
+            level,
+            format!("order-{index}").as_bytes(),
+        );
+        write_frame(
+            &mut stream,
+            &codec,
+            &FrameHeader::new(opcode::DOC_PUT, 10 + index as u64),
+            &put.encode_to_vec(),
+        )
+        .await;
+        let (header, _) = read_frame(&mut stream, &codec).await;
+        assert_eq!(header.status(), status::OK);
+    }
+
+    const RQL: &str = "SELECT profile.name FROM player WHERE player_id >= 0 \
+                       INCLUDE FRAGMENTS profile ORDER BY profile.level DESC";
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::QUERY, 20),
+        &QueryRequest {
+            meta: None,
+            partition: 0,
+            rql: RQL.to_owned(),
+            parameters: Vec::new(),
+            limit: 2,
+            cursor: Vec::new(),
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.status(), status::OK);
+    let response = QueryResponse::decode(payload.as_slice()).expect("query");
+    let keys: Vec<_> = response
+        .documents
+        .iter()
+        .map(|document| document.document_key.clone())
+        .collect();
+    assert_eq!(keys, vec![document_key(3), document_key(1)]);
+    assert!(!response.next_cursor.is_empty());
+
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::QUERY, 21),
+        &QueryRequest {
+            meta: None,
+            partition: 0,
+            rql: RQL.to_owned(),
+            parameters: Vec::new(),
+            limit: 2,
+            cursor: response.next_cursor,
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.status(), status::OK);
+    let response = QueryResponse::decode(payload.as_slice()).expect("query");
+    let keys: Vec<_> = response
+        .documents
+        .iter()
+        .map(|document| document.document_key.clone())
+        .collect();
+    assert_eq!(keys, vec![document_key(2)]);
+    assert!(response.next_cursor.is_empty());
+
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::QUERY, 22),
+        &QueryRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT profile.name FROM player WHERE player_id >= 0 \
+                  INCLUDE FRAGMENTS profile ORDER BY player_id"
+                .to_owned(),
+            parameters: Vec::new(),
+            limit: 2,
+            cursor: Vec::new(),
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, _) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.opcode(), opcode::ERROR);
+    assert_eq!(header.status(), status::INVALID_REQUEST);
+}
+
+#[tokio::test]
+async fn explains_point_and_scan_queries() {
+    let store = store();
+    let address = start_server(Arc::clone(&store)).await;
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let codec = handshake(&mut stream).await;
+
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::EXPLAIN, 10),
+        &ExplainRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT profile.name FROM player WHERE player_id = :id \
+                  INCLUDE FRAGMENTS profile"
+                .to_owned(),
+            parameters: vec![NamedParameter {
+                name: "id".to_owned(),
+                value: Some(Value {
+                    kind: Some(value::Kind::U64Value(42)),
+                }),
+            }],
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.opcode(), opcode::EXPLAIN);
+    assert_eq!(header.status(), status::OK);
+    let response = recolith_protocol::messages::ExplainResponse::decode(payload.as_slice())
+        .expect("explain response");
+    assert!(response.catalog_generation > 0);
+    let Some(explain_response::Plan::Document(plan)) = response.plan else {
+        panic!("expected document plan");
+    };
+    assert_eq!(plan.collection_id, 1);
+    assert_eq!(plan.document_key, document_key(42));
+    assert_eq!(plan.fragment_ids, vec![1]);
+    assert_eq!(plan.projections[0].field_id, 1);
+
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::EXPLAIN, 11),
+        &ExplainRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT profile.name FROM player WHERE profile.level >= 10 \
+                  INCLUDE FRAGMENTS profile ORDER BY profile.level DESC"
+                .to_owned(),
+            parameters: Vec::new(),
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.status(), status::OK);
+    let response = recolith_protocol::messages::ExplainResponse::decode(payload.as_slice())
+        .expect("explain response");
+    let Some(explain_response::Plan::Scan(plan)) = response.plan else {
+        panic!("expected scan plan");
+    };
+    assert_eq!(plan.collection_id, 1);
+    assert_eq!(plan.partition, 0);
+    assert_eq!(plan.fragment_ids, vec![1]);
+    assert_eq!(plan.candidate_limit, 10_000);
+    assert_eq!(plan.drives.len(), 1);
+    assert!(!plan.drives[0].bucket_scan);
+    assert_eq!(plan.drives[0].indexes[0].index_id, 1);
+    assert_eq!(plan.drives[0].indexes[0].field_ids, vec![2]);
+    assert_eq!(plan.filters[0].field_id, 2);
+    assert_eq!(plan.order.as_ref().expect("order").index_id, None);
+
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::EXPLAIN, 12),
+        &ExplainRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT profile.name FROM player WHERE player_id >= 0 \
+                  INCLUDE FRAGMENTS profile ORDER BY profile.level DESC"
+                .to_owned(),
+            parameters: Vec::new(),
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.status(), status::OK);
+    let response = recolith_protocol::messages::ExplainResponse::decode(payload.as_slice())
+        .expect("explain response");
+    let Some(explain_response::Plan::Scan(plan)) = response.plan else {
+        panic!("expected scan plan");
+    };
+    assert!(plan.drives[0].bucket_scan);
+    let order = plan.order.expect("order");
+    assert_eq!(order.fragment_id, 1);
+    assert_eq!(order.field_id, 2);
+    assert!(order.descending);
+    assert_eq!(order.index_id, Some(1));
+    assert_eq!(plan.key_filters[0].field, 0);
+}
+
+#[tokio::test]
+async fn aggregates_global_and_grouped_queries() {
+    let store = store();
+    let address = start_server(Arc::clone(&store)).await;
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let codec = handshake(&mut stream).await;
+
+    for (index, (player, level)) in [(1_u64, 10_u32), (2, 20), (3, 30)].into_iter().enumerate() {
+        let put = profile_put_level(
+            &document_key(player),
+            &format!("player-{player}"),
+            level,
+            format!("aggregate-{index}").as_bytes(),
+        );
+        write_frame(
+            &mut stream,
+            &codec,
+            &FrameHeader::new(opcode::DOC_PUT, 10 + index as u64),
+            &put.encode_to_vec(),
+        )
+        .await;
+        let (header, _) = read_frame(&mut stream, &codec).await;
+        assert_eq!(header.status(), status::OK);
+    }
+
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::AGGREGATE, 20),
+        &AggregateRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT COUNT(*), SUM(profile.level), AVG(profile.level) \
+                  FROM player WHERE profile.level >= 0 INCLUDE FRAGMENTS profile"
+                .to_owned(),
+            parameters: Vec::new(),
+            limit: 10,
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.opcode(), opcode::AGGREGATE);
+    assert_eq!(header.status(), status::OK);
+    let response = AggregateResponse::decode(payload.as_slice()).expect("aggregate response");
+    assert_eq!(response.columns.len(), 3);
+    assert_eq!(response.group_fragment_id, None);
+    assert_eq!(response.rows.len(), 1);
+    assert_eq!(
+        response.rows[0].values,
+        vec![
+            Value {
+                kind: Some(value::Kind::U64Value(3)),
+            },
+            Value {
+                kind: Some(value::Kind::U64Value(60)),
+            },
+            Value {
+                kind: Some(value::Kind::F64Value(20.0)),
+            },
+        ]
+    );
+
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::AGGREGATE, 21),
+        &AggregateRequest {
+            meta: None,
+            partition: 0,
+            rql: "SELECT COUNT(*) FROM player WHERE profile.level >= 0 \
+                  INCLUDE FRAGMENTS profile GROUP BY profile.level LIMIT 2"
+                .to_owned(),
+            parameters: Vec::new(),
+            limit: 10,
+        }
+        .encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.status(), status::OK);
+    let response = AggregateResponse::decode(payload.as_slice()).expect("aggregate response");
+    assert_eq!(response.group_fragment_id, Some(1));
+    assert_eq!(response.group_field_id, Some(2));
+    assert_eq!(response.rows.len(), 2);
+    assert!(response.truncated);
+    assert_eq!(
+        response.rows[0].group,
+        Some(Value {
+            kind: Some(value::Kind::U32Value(10)),
+        })
+    );
+    assert_eq!(
+        response.rows[1].group,
+        Some(Value {
+            kind: Some(value::Kind::U32Value(20)),
+        })
+    );
 }

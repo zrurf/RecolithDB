@@ -1,9 +1,47 @@
 //! Multi-document scan queries.
 
-use recolith_common::{CollectionId, FragmentId, PartitionId};
+use recolith_common::{CollectionId, FieldId, FragmentId, PartitionId};
 use recolith_model::{DocumentKeySchema, KeyValue};
 
 use crate::ir::{DocumentQuery, FieldSelection, Filter, FilterOp};
+
+/// Ordering over one fragment field.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScanOrder {
+    fragment: FragmentId,
+    field: FieldId,
+    descending: bool,
+}
+
+impl ScanOrder {
+    /// Creates a scan ordering.
+    #[must_use]
+    pub const fn new(fragment: FragmentId, field: FieldId, descending: bool) -> Self {
+        Self {
+            fragment,
+            field,
+            descending,
+        }
+    }
+
+    /// Returns the ordered fragment.
+    #[must_use]
+    pub const fn fragment(&self) -> FragmentId {
+        self.fragment
+    }
+
+    /// Returns the ordered field.
+    #[must_use]
+    pub const fn field(&self) -> FieldId {
+        self.field
+    }
+
+    /// Returns whether ordering is descending.
+    #[must_use]
+    pub const fn descending(&self) -> bool {
+        self.descending
+    }
+}
 
 /// Predicate over a document key component.
 #[derive(Clone, Debug, PartialEq)]
@@ -49,6 +87,7 @@ pub struct DocumentScan {
     filters: Vec<Filter>,
     key_filters: Vec<KeyFilter>,
     projection: Vec<FieldSelection>,
+    order: Option<ScanOrder>,
 }
 
 impl DocumentScan {
@@ -67,6 +106,7 @@ impl DocumentScan {
             filters: Vec::new(),
             key_filters: Vec::new(),
             projection: Vec::new(),
+            order: None,
         }
     }
 
@@ -95,6 +135,13 @@ impl DocumentScan {
     #[must_use]
     pub fn with_projection(mut self, selection: FieldSelection) -> Self {
         self.projection.push(selection);
+        self
+    }
+
+    /// Sets the result ordering.
+    #[must_use]
+    pub fn with_order(mut self, order: ScanOrder) -> Self {
+        self.order = Some(order);
         self
     }
 
@@ -138,6 +185,12 @@ impl DocumentScan {
     #[must_use]
     pub fn projection(&self) -> &[FieldSelection] {
         &self.projection
+    }
+
+    /// Returns the result ordering, if any.
+    #[must_use]
+    pub fn order(&self) -> Option<&ScanOrder> {
+        self.order.as_ref()
     }
 }
 

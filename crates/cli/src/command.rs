@@ -2,13 +2,15 @@ use std::time::Duration;
 
 use recolith_client::{Client, ClientConfig};
 use recolith_protocol::messages::{
-    CollectionMetadata, DocumentGetRequest, DocumentPutRequest, NamedParameter, QueryRequest,
-    QueryStreamRequest, RequestMeta, Value, value,
+    AggregateRequest, CollectionMetadata, DocumentGetRequest, DocumentPutRequest, ExplainRequest,
+    NamedParameter, QueryRequest, QueryStreamRequest, RequestMeta, Value, value,
 };
 
 use crate::args::{Args, Command, DocCommand, TokenCommand};
 use crate::error::CliError;
-use crate::format::{format_collection, format_document, format_fragments_named};
+use crate::format::{
+    format_aggregate, format_collection, format_document, format_explain, format_fragments_named,
+};
 use crate::hex;
 use crate::metadata;
 
@@ -143,6 +145,46 @@ pub async fn run(args: Args) -> Result<(), CliError> {
                     println!("next_cursor: {}", crate::hex::encode(&response.next_cursor));
                 }
             }
+        }
+        Command::Explain {
+            rql,
+            partition,
+            parameters,
+        } => {
+            let parameters = parameters
+                .iter()
+                .map(|parameter| parse_parameter(parameter))
+                .collect::<Result<Vec<_>, _>>()?;
+            let response = client
+                .explain(&ExplainRequest {
+                    meta: None,
+                    partition,
+                    rql,
+                    parameters,
+                })
+                .await?;
+            print!("{}", format_explain(&response));
+        }
+        Command::Aggregate {
+            rql,
+            partition,
+            parameters,
+            limit,
+        } => {
+            let parameters = parameters
+                .iter()
+                .map(|parameter| parse_parameter(parameter))
+                .collect::<Result<Vec<_>, _>>()?;
+            let response = client
+                .aggregate(&AggregateRequest {
+                    meta: None,
+                    partition,
+                    rql,
+                    parameters,
+                    limit,
+                })
+                .await?;
+            print!("{}", format_aggregate(&response));
         }
         Command::Describe {
             collection,
