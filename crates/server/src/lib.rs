@@ -11,11 +11,11 @@ pub mod net;
 pub mod offline_migration;
 mod query_cursor;
 
-pub use backup::{BackupError, BackupStats, backup, restore, verify};
+pub use backup::{BackupError, BackupStats, backup, backup_snapshot, restore, verify};
 pub use bootstrap::{BootstrapError, load_bootstrap, parse_bootstrap};
 pub use config::{
-    AuthSettings, CatalogSettings, Config, ConfigError, ServerSettings, StorageSettings,
-    TlsSettings,
+    AuthSettings, BackupSettings, CatalogSettings, Config, ConfigError, ServerSettings,
+    StorageSettings, TlsSettings,
 };
 pub use document::{
     DocumentError, DocumentStore, DocumentWrite, FragmentWriteRequest, Idempotency,

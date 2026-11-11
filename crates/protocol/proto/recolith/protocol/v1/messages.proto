@@ -256,6 +256,18 @@ message AggregateRow {
   repeated Value values = 2;
 }
 
+message BackupRequest {
+  RequestMeta meta = 1;
+  string name = 2;
+}
+
+message BackupResponse {
+  uint64 catalog_generation = 1;
+  string file_name = 2;
+  uint64 entries = 3;
+  uint64 bytes = 4;
+}
+
 message ExplainRequest {
   RequestMeta meta = 1;
   uint32 partition = 2;

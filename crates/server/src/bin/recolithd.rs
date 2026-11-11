@@ -110,7 +110,13 @@ async fn run_backend<B: StorageBackend>(
         catalog
     };
 
-    let store = Arc::new(DocumentStore::new(Arc::new(catalog), backend));
+    let mut store = DocumentStore::new(Arc::new(catalog), backend);
+    if let Some(directory) = &config.backup.directory {
+        std::fs::create_dir_all(directory)?;
+        tracing::info!(path = %directory.display(), "online backup directory ready");
+        store = store.with_backup_directory(directory.clone());
+    }
+    let store = Arc::new(store);
     let listener = TcpListener::bind(server_config.listen).await?;
     let address = listener.local_addr()?;
     let metrics = server_config.metrics();

@@ -8,13 +8,13 @@ use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::error::ProtocolError;
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN, VERSION_MAJOR, VERSION_MINOR};
 use recolith_protocol::messages::{
-    AggregateRequest, AggregateResponse, AuthMethod, AuthResult, CatalogAlterRequest,
-    CatalogAlterResponse, CatalogApplyRequest, CatalogApplyResponse, CatalogDropRequest,
-    CatalogDropResponse, DescribeCollectionRequest, DescribeCollectionResponse, DocumentGetRequest,
-    DocumentGetResponse, DocumentPutRequest, DocumentPutResponse, ErrorResponse, ExplainRequest,
-    ExplainResponse, GoAway, HelloRequest, PingRequest, PingResponse, QueryChunk, QueryRequest,
-    QueryResponse, QueryStreamRequest, SecurityMode, WelcomeResponse, compression_bit,
-    encoding_bit, feature, opcode, status,
+    AggregateRequest, AggregateResponse, AuthMethod, AuthResult, BackupRequest, BackupResponse,
+    CatalogAlterRequest, CatalogAlterResponse, CatalogApplyRequest, CatalogApplyResponse,
+    CatalogDropRequest, CatalogDropResponse, DescribeCollectionRequest, DescribeCollectionResponse,
+    DocumentGetRequest, DocumentGetResponse, DocumentPutRequest, DocumentPutResponse,
+    ErrorResponse, ExplainRequest, ExplainResponse, GoAway, HelloRequest, PingRequest,
+    PingResponse, QueryChunk, QueryRequest, QueryResponse, QueryStreamRequest, SecurityMode,
+    WelcomeResponse, compression_bit, encoding_bit, feature, opcode, status,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -291,6 +291,20 @@ impl Client {
             .await?;
         QueryResponse::decode(body.as_slice())
             .map_err(|_| ClientError::UnexpectedResponse("malformed QUERY response".to_owned()))
+    }
+
+    /// Writes a consistent logical backup on the server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn backup(&mut self, request: &BackupRequest) -> Result<BackupResponse, ClientError> {
+        self.require_feature(feature::BACKUP, "online backups")?;
+        let body = self
+            .request(opcode::BACKUP, opcode::BACKUP, &request.encode_to_vec())
+            .await?;
+        BackupResponse::decode(body.as_slice())
+            .map_err(|_| ClientError::UnexpectedResponse("malformed BACKUP response".to_owned()))
     }
 
     /// Executes an aggregate query.
@@ -749,7 +763,8 @@ fn build_hello(config: &ClientConfig) -> HelloRequest {
             | feature::IDEMPOTENCY
             | feature::CATALOG_DESCRIBE
             | feature::EXPLAIN
-            | feature::AGGREGATE,
+            | feature::AGGREGATE
+            | feature::BACKUP,
         max_frame_size: to_u32(config.max_frame_size),
         max_batch_subframes: to_u32(config.max_batch_subframes),
         max_batch_bytes: to_u32(config.max_batch_bytes),

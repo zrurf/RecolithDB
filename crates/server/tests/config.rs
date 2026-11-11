@@ -33,6 +33,9 @@ private_key = "certs/server.key"
 
 [catalog]
 bootstrap = "catalog.toml"
+
+[backup]
+directory = "backups"
 "#,
     )
     .expect("write config");
@@ -52,6 +55,10 @@ bootstrap = "catalog.toml"
     assert_eq!(
         config.catalog.bootstrap.as_ref().expect("bootstrap"),
         &dir.join("catalog.toml")
+    );
+    assert_eq!(
+        config.backup.directory.as_ref().expect("backup directory"),
+        &dir.join("backups")
     );
 
     assert_eq!(config.server.max_connections, 32);
@@ -178,6 +185,34 @@ revoked_tokens_file = "revoked.toml"
     );
     let server = config.server_config().expect("server config");
     assert!(server.auth.is_some());
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn rejects_backup_directory_that_is_a_file() {
+    let dir = temp_dir("backup-file");
+    let config_path = dir.join("recolith.toml");
+    fs::write(dir.join("backups"), b"file").expect("backup path");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+listen = "127.0.0.1:7420"
+
+[storage]
+backend = "memory"
+
+[backup]
+directory = "backups"
+"#,
+    )
+    .expect("write config");
+
+    assert!(matches!(
+        Config::load(&config_path),
+        Err(ConfigError::Invalid(_))
+    ));
 
     let _ = fs::remove_dir_all(dir);
 }

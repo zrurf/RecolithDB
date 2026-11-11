@@ -98,6 +98,11 @@ pub enum Command {
         #[arg(long, default_value_t = 1000)]
         limit: u64,
     },
+    /// Writes an online logical backup on the server.
+    Backup {
+        /// Backup file name inside the configured server directory.
+        name: String,
+    },
     /// Reads or writes documents.
     Doc {
         /// Document command.

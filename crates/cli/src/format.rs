@@ -1,7 +1,8 @@
 use recolith_protocol::messages::{
-    AggregateColumn, AggregateFunction, AggregateResponse, CollectionMetadata, DocumentResult,
-    ExplainFilterOp, ExplainResponse, FragmentCardinality, FragmentMetadata, FragmentResult,
-    IndexKind, SchemaScalarType, SchemaType, Value, explain_response, schema_type, value,
+    AggregateColumn, AggregateFunction, AggregateResponse, BackupResponse, CollectionMetadata,
+    DocumentResult, ExplainFilterOp, ExplainResponse, FragmentCardinality, FragmentMetadata,
+    FragmentResult, IndexKind, SchemaScalarType, SchemaType, Value, explain_response, schema_type,
+    value,
 };
 
 use crate::hex;
@@ -237,6 +238,15 @@ fn explain_index_kind(kind: i32) -> &'static str {
         Ok(IndexKind::Unique) => "unique",
         Ok(IndexKind::Unspecified) | Err(_) => "unknown",
     }
+}
+
+/// Formats an online backup result.
+#[must_use]
+pub fn format_backup(response: &BackupResponse) -> String {
+    format!(
+        "backup: {}\ncatalog generation: {}\nentries: {}\nbytes: {}\n",
+        response.file_name, response.catalog_generation, response.entries, response.bytes
+    )
 }
 
 /// Formats aggregate query results.

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use recolith_backend::{KeyRange, ScanOptions, Snapshot, StorageBackend, Transaction, TxnOptions};
 use recolith_backend_memory::MemoryBackend;
-use recolith_server::{BackupError, backup, restore, verify};
+use recolith_server::{BackupError, backup, backup_snapshot, restore, verify};
 
 #[test]
 fn backup_verify_restore_roundtrip() {
@@ -36,6 +36,36 @@ fn backup_verify_restore_roundtrip() {
         .scan(&KeyRange::prefix(b""), ScanOptions::default())
         .expect("target scan");
     assert_eq!(target_entries, source_entries);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn snapshot_backup_excludes_later_writes() {
+    let dir = temp_dir("snapshot");
+    let output = dir.join("snapshot.backup");
+    let source = MemoryBackend::new();
+    let mut transaction = source.begin(TxnOptions::default()).expect("begin");
+    transaction.put(b"alpha", b"one".to_vec());
+    transaction.commit().expect("commit");
+
+    let snapshot = source.snapshot().expect("snapshot");
+    let mut transaction = source.begin(TxnOptions::default()).expect("begin");
+    transaction.put(b"beta", b"two".to_vec());
+    transaction.commit().expect("commit");
+
+    let backed_up = backup_snapshot(&snapshot, &output).expect("snapshot backup");
+    assert_eq!(backed_up.entries, 1);
+
+    let target = MemoryBackend::new();
+    restore(&target, &output).expect("restore");
+    let entries = target
+        .snapshot()
+        .expect("target snapshot")
+        .scan(&KeyRange::prefix(b""), ScanOptions::default())
+        .expect("target scan");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, b"alpha");
 
     let _ = fs::remove_dir_all(dir);
 }

@@ -1,4 +1,4 @@
-//! Offline logical backup and restore over the storage backend.
+//! Logical backup and restore over the storage backend.
 
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -68,6 +68,44 @@ pub enum BackupError {
     /// Restore target is not empty.
     #[error("restore target is not empty")]
     TargetNotEmpty,
+    /// Online backup is not configured.
+    #[error("online backup is not configured")]
+    NotConfigured,
+    /// Backup file name is invalid.
+    #[error("invalid backup file name: {0}")]
+    InvalidName(String),
+    /// Backup state is unavailable.
+    #[error("backup state is unavailable")]
+    Unavailable,
+}
+
+/// Writes all entries from a snapshot to a backup file.
+///
+/// Existing output paths are rejected.
+///
+/// # Errors
+///
+/// Returns [`BackupError`] for backend, I/O, or output-path failures.
+pub fn backup_snapshot<S: Snapshot>(
+    snapshot: &S,
+    output: impl AsRef<Path>,
+) -> Result<BackupStats, BackupError> {
+    let output = output.as_ref();
+    if output.exists() {
+        return Err(BackupError::OutputExists(output.to_path_buf()));
+    }
+    let mut temporary = output.as_os_str().to_os_string();
+    temporary.push(".tmp");
+    let temporary = PathBuf::from(temporary);
+
+    let result = write_snapshot(snapshot, &temporary);
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+        return result;
+    }
+    fs::rename(&temporary, output)?;
+
+    result
 }
 
 /// Writes all backend entries to an offline backup file.
@@ -82,22 +120,9 @@ pub fn backup<B: StorageBackend>(
     backend: &B,
     output: impl AsRef<Path>,
 ) -> Result<BackupStats, BackupError> {
-    let output = output.as_ref();
-    if output.exists() {
-        return Err(BackupError::OutputExists(output.to_path_buf()));
-    }
-    let mut temporary = output.as_os_str().to_os_string();
-    temporary.push(".tmp");
-    let temporary = PathBuf::from(temporary);
+    let snapshot = backend.snapshot()?;
 
-    let result = write_backup(backend, &temporary);
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-        return result;
-    }
-    fs::rename(&temporary, output)?;
-
-    result
+    backup_snapshot(&snapshot, output)
 }
 
 /// Reads all entries from an offline backup file.
@@ -158,8 +183,7 @@ pub fn restore<B: StorageBackend>(
     Ok(reader.stats)
 }
 
-fn write_backup<B: StorageBackend>(backend: &B, path: &Path) -> Result<BackupStats, BackupError> {
-    let snapshot = backend.snapshot()?;
+fn write_snapshot<S: Snapshot>(snapshot: &S, path: &Path) -> Result<BackupStats, BackupError> {
     let file = File::create(path)?;
     let mut writer = BufWriter::new(file);
     writer.write_all(BACKUP_MAGIC)?;
@@ -201,8 +225,22 @@ fn write_backup<B: StorageBackend>(backend: &B, path: &Path) -> Result<BackupSta
     Ok(stats)
 }
 
-type BackupEntry = (Vec<u8>, Vec<u8>);
+pub(crate) fn validate_name(name: &str) -> Result<(), BackupError> {
+    if name.is_empty()
+        || name.len() > 255
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\', ':', '\0'])
+        || Path::new(name).is_absolute()
+        || Path::new(name).components().count() != 1
+    {
+        return Err(BackupError::InvalidName(name.to_owned()));
+    }
 
+    Ok(())
+}
+
+type BackupEntry = (Vec<u8>, Vec<u8>);
 struct BackupReader {
     reader: BufReader<File>,
     stats: BackupStats,

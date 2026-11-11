@@ -13,3 +13,6 @@ bootstrap = "catalog.toml"
 # secret_file = "secret.hex"
 # roles_file = "roles.toml"
 # revoked_tokens_file = "revoked.toml"
+
+# [backup]
+# directory = "backups"

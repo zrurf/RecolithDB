@@ -1,17 +1,18 @@
 use prost::Message;
 use recolith_protocol::messages::{
     AggregateColumn, AggregateFunction, AggregateRequest, AggregateResponse, AggregateRow,
-    AuthMethod, BucketDefinition, BucketPolicy, CatalogAlterRequest, CatalogApplyRequest,
-    CatalogDropRequest, CatalogIndexTarget, CollectionDefinition, CollectionMetadata,
-    DescribeCollectionRequest, DescribeCollectionResponse, DocumentPutRequest, ExplainDrive,
-    ExplainFieldSelection, ExplainFilter, ExplainFilterOp, ExplainIndex, ExplainKeyFilter,
-    ExplainOrder, ExplainRequest, ExplainResponse, ExplainScanPlan, FieldConversion, FieldMapping,
-    FieldValue, FragmentDefinition, FragmentMetadata, FragmentPayload, HelloRequest,
-    IndexDefinition, IndexKind, KeyFieldDefinition, KeyFieldMetadata, KeyFieldType,
-    KeyspaceDefinition, NamedParameter, QueryRequest, QueryStreamRequest, RequestMeta,
-    SchemaDefinition, SchemaField, SchemaList, SchemaMigration, SchemaScalarType, SchemaType,
-    SetBucketSchema, Value, catalog_alter_request, catalog_drop_request, compression_bit,
-    describe_collection_request, explain_response, feature, field_mapping, schema_type, value,
+    AuthMethod, BackupRequest, BackupResponse, BucketDefinition, BucketPolicy, CatalogAlterRequest,
+    CatalogApplyRequest, CatalogDropRequest, CatalogIndexTarget, CollectionDefinition,
+    CollectionMetadata, DescribeCollectionRequest, DescribeCollectionResponse, DocumentPutRequest,
+    ExplainDrive, ExplainFieldSelection, ExplainFilter, ExplainFilterOp, ExplainIndex,
+    ExplainKeyFilter, ExplainOrder, ExplainRequest, ExplainResponse, ExplainScanPlan,
+    FieldConversion, FieldMapping, FieldValue, FragmentDefinition, FragmentMetadata,
+    FragmentPayload, HelloRequest, IndexDefinition, IndexKind, KeyFieldDefinition,
+    KeyFieldMetadata, KeyFieldType, KeyspaceDefinition, NamedParameter, QueryRequest,
+    QueryStreamRequest, RequestMeta, SchemaDefinition, SchemaField, SchemaList, SchemaMigration,
+    SchemaScalarType, SchemaType, SetBucketSchema, Value, catalog_alter_request,
+    catalog_drop_request, compression_bit, describe_collection_request, explain_response, feature,
+    field_mapping, schema_type, value,
 };
 
 #[test]
@@ -383,6 +384,30 @@ fn roundtrips_aggregate_request_and_response() {
     };
     let encoded = response.encode_to_vec();
     let decoded = AggregateResponse::decode(encoded.as_slice()).expect("decode response");
+    assert_eq!(decoded, response);
+}
+
+#[test]
+fn roundtrips_backup_request_and_response() {
+    let request = BackupRequest {
+        meta: Some(RequestMeta {
+            catalog_generation: 8,
+            ..Default::default()
+        }),
+        name: "game-2026-11-11.backup".to_owned(),
+    };
+    let encoded = request.encode_to_vec();
+    let decoded = BackupRequest::decode(encoded.as_slice()).expect("decode request");
+    assert_eq!(decoded, request);
+
+    let response = BackupResponse {
+        catalog_generation: 8,
+        file_name: "game-2026-11-11.backup".to_owned(),
+        entries: 42,
+        bytes: 4096,
+    };
+    let encoded = response.encode_to_vec();
+    let decoded = BackupResponse::decode(encoded.as_slice()).expect("decode response");
     assert_eq!(decoded, response);
 }
 

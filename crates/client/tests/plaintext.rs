@@ -1,12 +1,15 @@
 mod support;
 
+use std::sync::Arc;
+
 use prost::Message;
 use recolith_client::{BatchOperation, Client, ClientConfig, ClientError};
 use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::messages::{
-    AggregateRequest, DescribeCollectionRequest, DocumentGetRequest, DocumentGetResponse,
-    ExplainRequest, FieldSelection, NamedParameter, QueryRequest, QueryStreamRequest, SecurityMode,
-    Value, describe_collection_request, explain_response, feature, opcode, status, value,
+    AggregateRequest, BackupRequest, DescribeCollectionRequest, DocumentGetRequest,
+    DocumentGetResponse, ExplainRequest, FieldSelection, NamedParameter, QueryRequest,
+    QueryStreamRequest, SecurityMode, Value, describe_collection_request, explain_response,
+    feature, opcode, status, value,
 };
 use recolith_server::ServerConfig;
 
@@ -300,6 +303,47 @@ async fn aggregates_documents_through_the_client() {
             kind: Some(value::Kind::U64Value(3)),
         }]
     );
+}
+
+#[tokio::test]
+async fn writes_online_backups_through_the_client() {
+    let directory =
+        std::env::temp_dir().join(format!("recolith-client-backup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("backup directory");
+    let store = Arc::try_unwrap(support::game_store())
+        .expect("unique store")
+        .with_backup_directory(directory.clone());
+    let address = support::start_server(
+        ServerConfig::new("127.0.0.1:0".parse().expect("address")),
+        Arc::new(store),
+    )
+    .await;
+    let mut client = Client::connect(ClientConfig::new(address.to_string()))
+        .await
+        .expect("connect");
+
+    client
+        .document_put(&support::profile_put(
+            &support::document_key(42),
+            "alex",
+            b"backup-document",
+        ))
+        .await
+        .expect("put");
+
+    let response = client
+        .backup(&BackupRequest {
+            meta: None,
+            name: "client.backup".to_owned(),
+        })
+        .await
+        .expect("backup");
+    assert_eq!(response.file_name, "client.backup");
+    assert!(response.entries > 0);
+    assert!(directory.join("client.backup").exists());
+
+    let _ = std::fs::remove_dir_all(directory);
 }
 
 #[tokio::test]

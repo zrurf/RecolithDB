@@ -9,10 +9,15 @@ use tokio::net::TcpListener;
 
 #[tokio::test]
 async fn writes_reads_and_queries_through_the_cli() {
+    let backup_directory =
+        std::env::temp_dir().join(format!("recolith-cli-backup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&backup_directory);
+    std::fs::create_dir_all(&backup_directory).expect("backup directory");
     let store = DocumentStore::new(
         Arc::new(recolith_testkit::game_catalog()),
         Arc::new(MemoryBackend::new()),
-    );
+    )
+    .with_backup_directory(backup_directory.clone());
     let key = encode_document_key(
         &DocumentKeySchema::new(vec![KeyField::new("player_id", KeyType::U64)]),
         &[KeyValue::U64(1)],
@@ -126,6 +131,16 @@ async fn writes_reads_and_queries_through_the_cli() {
     .expect("aggregate command");
 
     run(args(
+        endpoint.clone(),
+        Command::Backup {
+            name: "cli.backup".to_owned(),
+        },
+    ))
+    .await
+    .expect("backup command");
+    assert!(backup_directory.join("cli.backup").exists());
+
+    run(args(
         endpoint,
         Command::Query {
             rql: "SELECT profile.name FROM player WHERE player_id = :id INCLUDE FRAGMENTS profile"
@@ -140,6 +155,8 @@ async fn writes_reads_and_queries_through_the_cli() {
     ))
     .await
     .expect("query command");
+
+    let _ = std::fs::remove_dir_all(backup_directory);
 }
 
 fn args(endpoint: String, command: Command) -> Args {

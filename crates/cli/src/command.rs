@@ -2,14 +2,15 @@ use std::time::Duration;
 
 use recolith_client::{Client, ClientConfig};
 use recolith_protocol::messages::{
-    AggregateRequest, CollectionMetadata, DocumentGetRequest, DocumentPutRequest, ExplainRequest,
-    NamedParameter, QueryRequest, QueryStreamRequest, RequestMeta, Value, value,
+    AggregateRequest, BackupRequest, CollectionMetadata, DocumentGetRequest, DocumentPutRequest,
+    ExplainRequest, NamedParameter, QueryRequest, QueryStreamRequest, RequestMeta, Value, value,
 };
 
 use crate::args::{Args, Command, DocCommand, TokenCommand};
 use crate::error::CliError;
 use crate::format::{
-    format_aggregate, format_collection, format_document, format_explain, format_fragments_named,
+    format_aggregate, format_backup, format_collection, format_document, format_explain,
+    format_fragments_named,
 };
 use crate::hex;
 use crate::metadata;
@@ -185,6 +186,10 @@ pub async fn run(args: Args) -> Result<(), CliError> {
                 })
                 .await?;
             print!("{}", format_aggregate(&response));
+        }
+        Command::Backup { name } => {
+            let response = client.backup(&BackupRequest { meta: None, name }).await?;
+            print!("{}", format_backup(&response));
         }
         Command::Describe {
             collection,
