@@ -154,6 +154,144 @@ impl RqlPredicate {
     }
 }
 
+/// Ordering clause over one fragment field.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RqlOrder {
+    path: RqlPath,
+    descending: bool,
+}
+
+impl RqlOrder {
+    /// Creates an ordering clause.
+    #[must_use]
+    pub fn new(path: RqlPath, descending: bool) -> Self {
+        Self { path, descending }
+    }
+
+    /// Returns the ordered path.
+    #[must_use]
+    pub fn path(&self) -> &RqlPath {
+        &self.path
+    }
+
+    /// Returns whether ordering is descending.
+    #[must_use]
+    pub fn descending(&self) -> bool {
+        self.descending
+    }
+}
+
+/// Aggregate function in RQL text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RqlAggregateFunction {
+    /// Counts matching documents.
+    Count,
+    /// Sums numeric field values.
+    Sum,
+    /// Returns the minimum comparable field value.
+    Min,
+    /// Returns the maximum comparable field value.
+    Max,
+    /// Returns the arithmetic mean of numeric field values.
+    Avg,
+}
+
+/// One aggregate expression.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RqlAggregate {
+    function: RqlAggregateFunction,
+    path: Option<RqlPath>,
+}
+
+impl RqlAggregate {
+    /// Creates an aggregate expression.
+    #[must_use]
+    pub fn new(function: RqlAggregateFunction, path: Option<RqlPath>) -> Self {
+        Self { function, path }
+    }
+
+    /// Returns the aggregate function.
+    #[must_use]
+    pub const fn function(&self) -> RqlAggregateFunction {
+        self.function
+    }
+
+    /// Returns the aggregated path; `COUNT(*)` has none.
+    #[must_use]
+    pub fn path(&self) -> Option<&RqlPath> {
+        self.path.as_ref()
+    }
+}
+
+/// Parsed aggregate query.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RqlAggregateQuery {
+    aggregates: Vec<RqlAggregate>,
+    collection: String,
+    predicates: Vec<RqlPredicate>,
+    fragments: Vec<String>,
+    group_by: Option<RqlPath>,
+    limit: Option<u64>,
+}
+
+impl RqlAggregateQuery {
+    /// Creates an aggregate query.
+    #[must_use]
+    pub fn new(
+        aggregates: Vec<RqlAggregate>,
+        collection: impl Into<String>,
+        predicates: Vec<RqlPredicate>,
+        fragments: Vec<String>,
+        group_by: Option<RqlPath>,
+        limit: Option<u64>,
+    ) -> Self {
+        Self {
+            aggregates,
+            collection: collection.into(),
+            predicates,
+            fragments,
+            group_by,
+            limit,
+        }
+    }
+
+    /// Returns the aggregate expressions.
+    #[must_use]
+    pub fn aggregates(&self) -> &[RqlAggregate] {
+        &self.aggregates
+    }
+
+    /// Returns the collection name.
+    #[must_use]
+    pub fn collection(&self) -> &str {
+        &self.collection
+    }
+
+    /// Returns the predicates.
+    #[must_use]
+    pub fn predicates(&self) -> &[RqlPredicate] {
+        &self.predicates
+    }
+
+    /// Returns the included fragment names.
+    #[must_use]
+    pub fn fragments(&self) -> &[String] {
+        &self.fragments
+    }
+
+    /// Returns the grouping path, if any.
+    #[must_use]
+    pub fn group_by(&self) -> Option<&RqlPath> {
+        self.group_by.as_ref()
+    }
+
+    /// Returns the group limit.
+    #[must_use]
+    pub fn limit(&self) -> Option<u64> {
+        self.limit
+    }
+}
+
 /// Parsed document query.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RqlDocumentQuery {
@@ -161,6 +299,7 @@ pub struct RqlDocumentQuery {
     collection: String,
     predicates: Vec<RqlPredicate>,
     fragments: Vec<String>,
+    order: Option<RqlOrder>,
     limit: Option<u64>,
 }
 
@@ -172,6 +311,7 @@ impl RqlDocumentQuery {
         collection: impl Into<String>,
         predicates: Vec<RqlPredicate>,
         fragments: Vec<String>,
+        order: Option<RqlOrder>,
         limit: Option<u64>,
     ) -> Self {
         Self {
@@ -179,6 +319,7 @@ impl RqlDocumentQuery {
             collection: collection.into(),
             predicates,
             fragments,
+            order,
             limit,
         }
     }
@@ -205,6 +346,12 @@ impl RqlDocumentQuery {
     #[must_use]
     pub fn fragments(&self) -> &[String] {
         &self.fragments
+    }
+
+    /// Returns the ordering clause, if any.
+    #[must_use]
+    pub fn order(&self) -> Option<&RqlOrder> {
+        self.order.as_ref()
     }
 
     /// Returns the result limit.

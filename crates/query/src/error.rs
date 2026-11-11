@@ -17,6 +17,10 @@ pub enum QueryError {
     NotFound(&'static str),
     /// Request is internally inconsistent.
     InvalidRequest(String),
+    /// Aggregate groups or resources exceed a configured limit.
+    ResourceExhausted(String),
+    /// An aggregate integer result exceeds its output type.
+    AggregateOverflow(String),
 }
 
 impl fmt::Display for QueryError {
@@ -27,6 +31,10 @@ impl fmt::Display for QueryError {
             Self::Storage(error) => write!(formatter, "storage error: {error}"),
             Self::NotFound(kind) => write!(formatter, "missing {kind}"),
             Self::InvalidRequest(message) => write!(formatter, "invalid request: {message}"),
+            Self::ResourceExhausted(message) => {
+                write!(formatter, "resource exhausted: {message}")
+            }
+            Self::AggregateOverflow(message) => write!(formatter, "aggregate overflow: {message}"),
         }
     }
 }

@@ -1,14 +1,17 @@
 use prost::Message;
 use recolith_protocol::messages::{
+    AggregateColumn, AggregateFunction, AggregateRequest, AggregateResponse, AggregateRow,
     AuthMethod, BucketDefinition, BucketPolicy, CatalogAlterRequest, CatalogApplyRequest,
     CatalogDropRequest, CatalogIndexTarget, CollectionDefinition, CollectionMetadata,
-    DescribeCollectionRequest, DescribeCollectionResponse, DocumentPutRequest, FieldConversion,
-    FieldMapping, FieldValue, FragmentDefinition, FragmentMetadata, FragmentPayload, HelloRequest,
+    DescribeCollectionRequest, DescribeCollectionResponse, DocumentPutRequest, ExplainDrive,
+    ExplainFieldSelection, ExplainFilter, ExplainFilterOp, ExplainIndex, ExplainKeyFilter,
+    ExplainOrder, ExplainRequest, ExplainResponse, ExplainScanPlan, FieldConversion, FieldMapping,
+    FieldValue, FragmentDefinition, FragmentMetadata, FragmentPayload, HelloRequest,
     IndexDefinition, IndexKind, KeyFieldDefinition, KeyFieldMetadata, KeyFieldType,
     KeyspaceDefinition, NamedParameter, QueryRequest, QueryStreamRequest, RequestMeta,
     SchemaDefinition, SchemaField, SchemaList, SchemaMigration, SchemaScalarType, SchemaType,
     SetBucketSchema, Value, catalog_alter_request, catalog_drop_request, compression_bit,
-    describe_collection_request, feature, field_mapping, schema_type, value,
+    describe_collection_request, explain_response, feature, field_mapping, schema_type, value,
 };
 
 #[test]
@@ -267,6 +270,120 @@ fn roundtrips_catalog_alter_request() {
     let decoded = CatalogAlterRequest::decode(encoded.as_slice()).expect("decode");
 
     assert_eq!(decoded, request);
+}
+
+#[test]
+fn roundtrips_explain_request_and_response() {
+    let request = ExplainRequest {
+        meta: Some(RequestMeta {
+            catalog_generation: 5,
+            ..Default::default()
+        }),
+        partition: 3,
+        rql: "SELECT profile.name FROM player WHERE profile.level >= 10 \
+              INCLUDE FRAGMENTS profile ORDER BY profile.level DESC"
+            .to_owned(),
+        parameters: Vec::new(),
+    };
+    let encoded = request.encode_to_vec();
+    let decoded = ExplainRequest::decode(encoded.as_slice()).expect("decode request");
+    assert_eq!(decoded, request);
+
+    let response = ExplainResponse {
+        catalog_generation: 7,
+        plan: Some(explain_response::Plan::Scan(ExplainScanPlan {
+            collection_id: 1,
+            partition: 3,
+            fragment_ids: vec![1],
+            drives: vec![ExplainDrive {
+                bucket_id: 1,
+                fragment_id: 1,
+                indexes: vec![ExplainIndex {
+                    index_id: 2,
+                    field_ids: vec![2],
+                    kind: IndexKind::Range as i32,
+                }],
+                bucket_scan: false,
+            }],
+            filters: vec![ExplainFilter {
+                fragment_id: 1,
+                field_id: 2,
+                op: ExplainFilterOp::Ge as i32,
+            }],
+            projections: vec![ExplainFieldSelection {
+                fragment_id: 1,
+                field_id: 1,
+            }],
+            order: Some(ExplainOrder {
+                fragment_id: 1,
+                field_id: 2,
+                descending: true,
+                index_id: Some(2),
+            }),
+            key_filters: vec![ExplainKeyFilter {
+                field: 0,
+                op: ExplainFilterOp::Eq as i32,
+            }],
+            candidate_limit: 10_000,
+        })),
+    };
+    let encoded = response.encode_to_vec();
+    let decoded = ExplainResponse::decode(encoded.as_slice()).expect("decode response");
+    assert_eq!(decoded, response);
+}
+
+#[test]
+fn roundtrips_aggregate_request_and_response() {
+    let request = AggregateRequest {
+        meta: Some(RequestMeta {
+            catalog_generation: 3,
+            ..Default::default()
+        }),
+        partition: 2,
+        rql: "SELECT COUNT(*), SUM(profile.level) FROM player \
+              WHERE profile.level >= 10 INCLUDE FRAGMENTS profile GROUP BY profile.level"
+            .to_owned(),
+        parameters: Vec::new(),
+        limit: 25,
+    };
+    let encoded = request.encode_to_vec();
+    let decoded = AggregateRequest::decode(encoded.as_slice()).expect("decode request");
+    assert_eq!(decoded, request);
+
+    let response = AggregateResponse {
+        catalog_generation: 4,
+        columns: vec![
+            AggregateColumn {
+                function: AggregateFunction::Count as i32,
+                fragment_id: None,
+                field_id: None,
+            },
+            AggregateColumn {
+                function: AggregateFunction::Sum as i32,
+                fragment_id: Some(1),
+                field_id: Some(2),
+            },
+        ],
+        group_fragment_id: Some(1),
+        group_field_id: Some(2),
+        rows: vec![AggregateRow {
+            group: Some(Value {
+                kind: Some(value::Kind::U32Value(10)),
+            }),
+            values: vec![
+                Value {
+                    kind: Some(value::Kind::U64Value(2)),
+                },
+                Value {
+                    kind: Some(value::Kind::U64Value(30)),
+                },
+            ],
+        }],
+        truncated: false,
+    };
+    let encoded = response.encode_to_vec();
+    let decoded = AggregateResponse::decode(encoded.as_slice()).expect("decode response");
+    assert_eq!(decoded, response);
 }
 
 #[test]

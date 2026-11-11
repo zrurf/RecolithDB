@@ -6,13 +6,17 @@ use recolith_storage::crc32c;
 use sha2::{Digest, Sha256};
 
 const MAGIC: &[u8; 4] = b"RCLC";
-const VERSION: u8 = 1;
-const FIXED_LEN: usize = 4 + 1 + 2 + 8 + 32 + 4;
+const VERSION: u8 = 2;
+const HEADER_LEN: usize = 4 + 1;
+const PREFIX_LEN: usize = HEADER_LEN + 4;
+const MIN_LEN: usize = PREFIX_LEN + 4 + 8 + 32 + 4;
+const NO_ORDER_VALUE: u32 = u32::MAX;
 
 /// Decoded pagination cursor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct QueryCursor {
     pub(crate) last_key: Vec<u8>,
+    pub(crate) order_value: Option<Vec<u8>>,
     pub(crate) catalog_generation: u64,
     pub(crate) query_hash: [u8; 32],
 }
@@ -27,11 +31,22 @@ pub(crate) enum CursorError {
 }
 
 pub(crate) fn encode(cursor: &QueryCursor) -> Vec<u8> {
-    let mut output = Vec::with_capacity(FIXED_LEN + cursor.last_key.len());
+    let mut output = Vec::with_capacity(
+        MIN_LEN + cursor.last_key.len() + cursor.order_value.as_ref().map_or(0, Vec::len),
+    );
     output.extend_from_slice(MAGIC);
     output.push(VERSION);
-    output.extend_from_slice(&(cursor.last_key.len() as u16).to_be_bytes());
+    let key_len = u32::try_from(cursor.last_key.len()).expect("cursor key fits in u32");
+    output.extend_from_slice(&key_len.to_be_bytes());
     output.extend_from_slice(&cursor.last_key);
+    match &cursor.order_value {
+        Some(value) => {
+            let order_len = u32::try_from(value.len()).expect("order value fits in u32");
+            output.extend_from_slice(&order_len.to_be_bytes());
+            output.extend_from_slice(value);
+        }
+        None => output.extend_from_slice(&NO_ORDER_VALUE.to_be_bytes()),
+    }
     output.extend_from_slice(&cursor.catalog_generation.to_be_bytes());
     output.extend_from_slice(&cursor.query_hash);
     let checksum = crc32c(&output);
@@ -41,7 +56,7 @@ pub(crate) fn encode(cursor: &QueryCursor) -> Vec<u8> {
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<QueryCursor, CursorError> {
-    if bytes.len() < FIXED_LEN {
+    if bytes.len() < MIN_LEN {
         return Err(CursorError::Malformed);
     }
     let (body, checksum) = bytes.split_at(bytes.len() - 4);
@@ -55,28 +70,41 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<QueryCursor, CursorError> {
     if body.get(4) != Some(&VERSION) {
         return Err(CursorError::UnsupportedVersion);
     }
-    let key_len = u16::from_be_bytes(
-        body.get(5..7)
-            .ok_or(CursorError::Malformed)?
-            .try_into()
-            .expect("two bytes"),
-    ) as usize;
-    let key_start: usize = 7;
-    let key_end = key_start
-        .checked_add(key_len)
-        .ok_or(CursorError::Malformed)?;
+
+    let mut offset = HEADER_LEN;
+    let key_len = read_u32(body, offset)? as usize;
+    offset += 4;
+    let key_end = offset.checked_add(key_len).ok_or(CursorError::Malformed)?;
     let last_key = body
-        .get(key_start..key_end)
+        .get(offset..key_end)
         .ok_or(CursorError::Malformed)?
         .to_vec();
-    let generation = body
-        .get(key_end..key_end + 8)
-        .ok_or(CursorError::Malformed)?;
+    offset = key_end;
+
+    let order_len = read_u32(body, offset)?;
+    offset += 4;
+    let order_value = if order_len == NO_ORDER_VALUE {
+        None
+    } else {
+        let order_end = offset
+            .checked_add(order_len as usize)
+            .ok_or(CursorError::Malformed)?;
+        let value = body
+            .get(offset..order_end)
+            .ok_or(CursorError::Malformed)?
+            .to_vec();
+        offset = order_end;
+        Some(value)
+    };
+
+    let generation = body.get(offset..offset + 8).ok_or(CursorError::Malformed)?;
     let catalog_generation = u64::from_be_bytes(generation.try_into().expect("eight bytes"));
+    offset += 8;
     let query_hash = body
-        .get(key_end + 8..key_end + 40)
+        .get(offset..offset + 32)
         .ok_or(CursorError::Malformed)?;
-    if body.len() != key_end + 40 {
+    offset += 32;
+    if body.len() != offset {
         return Err(CursorError::Malformed);
     }
     let mut hash = [0_u8; 32];
@@ -84,9 +112,18 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<QueryCursor, CursorError> {
 
     Ok(QueryCursor {
         last_key,
+        order_value,
         catalog_generation,
         query_hash: hash,
     })
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, CursorError> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or(CursorError::Malformed)?;
+
+    Ok(u32::from_be_bytes(value.try_into().expect("four bytes")))
 }
 
 /// Hashes the query shape that a cursor may resume.

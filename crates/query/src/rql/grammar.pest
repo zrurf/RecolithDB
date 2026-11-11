@@ -11,6 +11,16 @@ keyword_and = @{ ^"and" ~ !ident_char }
 keyword_include = @{ ^"include" ~ !ident_char }
 keyword_fragments = @{ ^"fragments" ~ !ident_char }
 keyword_limit = @{ ^"limit" ~ !ident_char }
+keyword_order = @{ ^"order" ~ !ident_char }
+keyword_by = @{ ^"by" ~ !ident_char }
+keyword_asc = @{ ^"asc" ~ !ident_char }
+keyword_desc = @{ ^"desc" ~ !ident_char }
+keyword_group = @{ ^"group" ~ !ident_char }
+keyword_count = @{ ^"count" ~ !ident_char }
+keyword_sum = @{ ^"sum" ~ !ident_char }
+keyword_min = @{ ^"min" ~ !ident_char }
+keyword_max = @{ ^"max" ~ !ident_char }
+keyword_avg = @{ ^"avg" ~ !ident_char }
 
 document_query = {
     SOI
@@ -18,10 +28,33 @@ document_query = {
     ~ keyword_from ~ ident
     ~ keyword_where ~ predicate_list
     ~ keyword_include ~ keyword_fragments ~ fragment_list
+    ~ order_clause?
     ~ (keyword_limit ~ integer)?
     ~ ";"?
     ~ EOI
 }
+
+aggregate_query = {
+    SOI
+    ~ keyword_select ~ aggregate_list
+    ~ keyword_from ~ ident
+    ~ keyword_where ~ predicate_list
+    ~ keyword_include ~ keyword_fragments ~ fragment_list
+    ~ group_clause?
+    ~ (keyword_limit ~ integer)?
+    ~ ";"?
+    ~ EOI
+}
+
+aggregate_list = { aggregate ~ ("," ~ aggregate)* }
+aggregate = { aggregate_count | aggregate_call }
+aggregate_count = { keyword_count ~ "(" ~ "*" ~ ")" }
+aggregate_call = { aggregate_name ~ "(" ~ path ~ ")" }
+aggregate_name = { keyword_sum | keyword_min | keyword_max | keyword_avg }
+group_clause = { keyword_group ~ keyword_by ~ path }
+
+order_clause = { keyword_order ~ keyword_by ~ path ~ order_direction? }
+order_direction = { keyword_asc | keyword_desc }
 
 projection_list = { projection ~ ("," ~ projection)* }
 projection = { path }

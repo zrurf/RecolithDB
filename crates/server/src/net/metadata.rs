@@ -149,7 +149,7 @@ const fn fragment_cardinality(cardinality: FragmentCardinality) -> messages::Fra
     }
 }
 
-const fn index_kind(kind: IndexKind) -> messages::IndexKind {
+pub(crate) const fn index_kind(kind: IndexKind) -> messages::IndexKind {
     match kind {
         IndexKind::Equality => messages::IndexKind::Equality,
         IndexKind::Range => messages::IndexKind::Range,

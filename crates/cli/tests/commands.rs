@@ -100,6 +100,32 @@ async fn writes_reads_and_queries_through_the_cli() {
     .expect("numeric put command");
 
     run(args(
+        endpoint.clone(),
+        Command::Explain {
+            rql: "SELECT profile.name FROM player WHERE player_id = :id INCLUDE FRAGMENTS profile"
+                .to_owned(),
+            partition: 0,
+            parameters: vec!["id=u64:1".to_owned()],
+        },
+    ))
+    .await
+    .expect("explain command");
+
+    run(args(
+        endpoint.clone(),
+        Command::Aggregate {
+            rql: "SELECT COUNT(*), SUM(profile.level) FROM player \
+                  WHERE profile.level >= 0 INCLUDE FRAGMENTS profile"
+                .to_owned(),
+            partition: 0,
+            parameters: Vec::new(),
+            limit: 10,
+        },
+    ))
+    .await
+    .expect("aggregate command");
+
+    run(args(
         endpoint,
         Command::Query {
             rql: "SELECT profile.name FROM player WHERE player_id = :id INCLUDE FRAGMENTS profile"

@@ -73,6 +73,31 @@ pub enum Command {
         #[arg(long)]
         keyspace: Option<String>,
     },
+    /// Explains how a query would be planned without executing it.
+    Explain {
+        /// RQL query text.
+        rql: String,
+        /// Partition used for planning.
+        #[arg(long, default_value_t = 0)]
+        partition: u32,
+        /// Named parameter in `name=type:value` form.
+        #[arg(long = "param", value_name = "NAME=TYPE:VALUE")]
+        parameters: Vec<String>,
+    },
+    /// Executes an RQL aggregate query.
+    Aggregate {
+        /// RQL aggregate query text.
+        rql: String,
+        /// Partition to aggregate.
+        #[arg(long, default_value_t = 0)]
+        partition: u32,
+        /// Named parameter in `name=type:value` form.
+        #[arg(long = "param", value_name = "NAME=TYPE:VALUE")]
+        parameters: Vec<String>,
+        /// Maximum number of groups.
+        #[arg(long, default_value_t = 1000)]
+        limit: u64,
+    },
     /// Reads or writes documents.
     Doc {
         /// Document command.

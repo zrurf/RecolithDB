@@ -22,6 +22,10 @@ pub mod opcode {
     pub const QUERY_STREAM: u16 = 0x0021;
     /// Streaming query result chunk.
     pub const QUERY_CHUNK: u16 = 0x0022;
+    /// Query plan explanation.
+    pub const EXPLAIN: u16 = 0x0023;
+    /// Aggregate query.
+    pub const AGGREGATE: u16 = 0x0024;
     /// Batched unary requests.
     pub const BATCH: u16 = 0x0030;
     /// Collection metadata lookup.
@@ -102,6 +106,10 @@ pub mod feature {
     pub const CATALOG_DESCRIBE: u64 = 1 << 7;
     /// Catalog definition changes are supported.
     pub const CATALOG_WRITE: u64 = 1 << 8;
+    /// Query plan explanation is supported.
+    pub const EXPLAIN: u64 = 1 << 9;
+    /// Aggregate queries are supported.
+    pub const AGGREGATE: u64 = 1 << 10;
 }
 
 /// Compression algorithm bits used by the handshake.

@@ -1,6 +1,7 @@
 use recolith_protocol::messages::{
-    CollectionMetadata, DocumentResult, FragmentCardinality, FragmentMetadata, FragmentResult,
-    SchemaScalarType, SchemaType, Value, schema_type, value,
+    AggregateColumn, AggregateFunction, AggregateResponse, CollectionMetadata, DocumentResult,
+    ExplainFilterOp, ExplainResponse, FragmentCardinality, FragmentMetadata, FragmentResult,
+    IndexKind, SchemaScalarType, SchemaType, Value, explain_response, schema_type, value,
 };
 
 use crate::hex;
@@ -97,6 +98,197 @@ pub fn format_collection(collection: &CollectionMetadata) -> String {
     }
 
     output
+}
+
+/// Formats a query plan explanation.
+#[must_use]
+pub fn format_explain(response: &ExplainResponse) -> String {
+    let mut output = format!("catalog generation: {}\n", response.catalog_generation);
+    match &response.plan {
+        Some(explain_response::Plan::Document(plan)) => {
+            output.push_str("plan: document\n");
+            output.push_str(&format!("collection: {}\n", plan.collection_id));
+            output.push_str(&format!("partition: {}\n", plan.partition));
+            output.push_str(&format!(
+                "document key: 0x{}\n",
+                hex::encode(&plan.document_key)
+            ));
+            output.push_str(&format!("fragments: {}\n", join_ids(&plan.fragment_ids)));
+            append_explain_fields(&mut output, &plan.projections, &plan.filters);
+        }
+        Some(explain_response::Plan::Scan(plan)) => {
+            output.push_str("plan: scan\n");
+            output.push_str(&format!("collection: {}\n", plan.collection_id));
+            output.push_str(&format!("partition: {}\n", plan.partition));
+            output.push_str(&format!("fragments: {}\n", join_ids(&plan.fragment_ids)));
+            output.push_str(&format!("candidate limit: {}\n", plan.candidate_limit));
+            output.push_str("drives:\n");
+            for drive in &plan.drives {
+                if drive.bucket_scan {
+                    output.push_str(&format!(
+                        "  bucket {} fragment {} bucket scan\n",
+                        drive.bucket_id, drive.fragment_id
+                    ));
+                } else {
+                    let indexes = drive
+                        .indexes
+                        .iter()
+                        .map(|index| {
+                            format!(
+                                "{}[fields {} kind {}]",
+                                index.index_id,
+                                join_ids(&index.field_ids),
+                                explain_index_kind(index.kind)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    output.push_str(&format!(
+                        "  bucket {} fragment {} indexes: {}\n",
+                        drive.bucket_id, drive.fragment_id, indexes
+                    ));
+                }
+            }
+            if !plan.key_filters.is_empty() {
+                output.push_str("key filters:\n");
+                for filter in &plan.key_filters {
+                    output.push_str(&format!(
+                        "  key[{}] {}\n",
+                        filter.field,
+                        explain_op(filter.op)
+                    ));
+                }
+            }
+            append_explain_fields(&mut output, &plan.projections, &plan.filters);
+            if let Some(order) = &plan.order {
+                let mode = order
+                    .index_id
+                    .map_or_else(|| "sorted".to_owned(), |index| format!("index {index}"));
+                output.push_str(&format!(
+                    "order: fragment {} field {} {} ({})\n",
+                    order.fragment_id,
+                    order.field_id,
+                    if order.descending { "DESC" } else { "ASC" },
+                    mode
+                ));
+            }
+        }
+        None => output.push_str("plan: none\n"),
+    }
+
+    output
+}
+
+fn append_explain_fields(
+    output: &mut String,
+    projections: &[recolith_protocol::messages::ExplainFieldSelection],
+    filters: &[recolith_protocol::messages::ExplainFilter],
+) {
+    if !projections.is_empty() {
+        output.push_str("projection:\n");
+        for selection in projections {
+            output.push_str(&format!(
+                "  fragment {} field {}\n",
+                selection.fragment_id, selection.field_id
+            ));
+        }
+    }
+    if !filters.is_empty() {
+        output.push_str("filters:\n");
+        for filter in filters {
+            output.push_str(&format!(
+                "  fragment {} field {} {}\n",
+                filter.fragment_id,
+                filter.field_id,
+                explain_op(filter.op)
+            ));
+        }
+    }
+}
+
+fn join_ids(ids: &[u32]) -> String {
+    if ids.is_empty() {
+        "-".to_owned()
+    } else {
+        ids.iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+fn explain_op(op: i32) -> &'static str {
+    match ExplainFilterOp::try_from(op) {
+        Ok(ExplainFilterOp::Eq) => "=",
+        Ok(ExplainFilterOp::Ne) => "!=",
+        Ok(ExplainFilterOp::Lt) => "<",
+        Ok(ExplainFilterOp::Le) => "<=",
+        Ok(ExplainFilterOp::Gt) => ">",
+        Ok(ExplainFilterOp::Ge) => ">=",
+        Ok(ExplainFilterOp::Unspecified) | Err(_) => "?",
+    }
+}
+
+fn explain_index_kind(kind: i32) -> &'static str {
+    match IndexKind::try_from(kind) {
+        Ok(IndexKind::Equality) => "equality",
+        Ok(IndexKind::Range) => "range",
+        Ok(IndexKind::Composite) => "composite",
+        Ok(IndexKind::Unique) => "unique",
+        Ok(IndexKind::Unspecified) | Err(_) => "unknown",
+    }
+}
+
+/// Formats aggregate query results.
+#[must_use]
+pub fn format_aggregate(response: &AggregateResponse) -> String {
+    let mut output = format!("catalog generation: {}\n", response.catalog_generation);
+    if let Some(fragment_id) = response.group_fragment_id {
+        output.push_str(&format!(
+            "group: fragment {} field {}\n",
+            fragment_id,
+            response.group_field_id.unwrap_or(0)
+        ));
+    }
+    output.push_str(&format!(
+        "rows: {} (truncated: {})\n",
+        response.rows.len(),
+        response.truncated
+    ));
+    for (index, row) in response.rows.iter().enumerate() {
+        output.push_str(&format!("row {index}:\n"));
+        if let Some(group) = &row.group {
+            output.push_str(&format!("  group = {}\n", format_value(group)));
+        }
+        for (column, value) in response.columns.iter().zip(&row.values) {
+            output.push_str(&format!(
+                "  {} = {}\n",
+                aggregate_label(column),
+                format_value(value)
+            ));
+        }
+    }
+
+    output
+}
+
+fn aggregate_label(column: &AggregateColumn) -> String {
+    let function = match AggregateFunction::try_from(column.function) {
+        Ok(AggregateFunction::Count) => "count(*)".to_owned(),
+        Ok(AggregateFunction::Sum) => "sum".to_owned(),
+        Ok(AggregateFunction::Min) => "min".to_owned(),
+        Ok(AggregateFunction::Max) => "max".to_owned(),
+        Ok(AggregateFunction::Avg) => "avg".to_owned(),
+        Ok(AggregateFunction::Unspecified) | Err(_) => "aggregate".to_owned(),
+    };
+    match (column.fragment_id, column.field_id) {
+        (Some(fragment_id), Some(field_id))
+            if AggregateFunction::try_from(column.function) != Ok(AggregateFunction::Count) =>
+        {
+            format!("{function}(fragment {fragment_id} field {field_id})")
+        }
+        _ => function,
+    }
 }
 
 /// Formats a dynamic value.
