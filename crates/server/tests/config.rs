@@ -36,6 +36,10 @@ bootstrap = "catalog.toml"
 
 [backup]
 directory = "backups"
+
+[ttl]
+sweep_interval_secs = 5
+batch_size = 25
 "#,
     )
     .expect("write config");
@@ -60,6 +64,8 @@ directory = "backups"
         config.backup.directory.as_ref().expect("backup directory"),
         &dir.join("backups")
     );
+    assert_eq!(config.ttl.sweep_interval_secs, 5);
+    assert_eq!(config.ttl.batch_size, 25);
 
     assert_eq!(config.server.max_connections, 32);
     let server = config.server_config().expect("server config");
@@ -185,6 +191,34 @@ revoked_tokens_file = "revoked.toml"
     );
     let server = config.server_config().expect("server config");
     assert!(server.auth.is_some());
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn rejects_zero_ttl_batch_size_when_sweeping() {
+    let dir = temp_dir("ttl-batch");
+    let config_path = dir.join("recolith.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+listen = "127.0.0.1:7420"
+
+[storage]
+backend = "memory"
+
+[ttl]
+sweep_interval_secs = 60
+batch_size = 0
+"#,
+    )
+    .expect("write config");
+
+    assert!(matches!(
+        Config::load(&config_path),
+        Err(ConfigError::Invalid(_))
+    ));
 
     let _ = fs::remove_dir_all(dir);
 }

@@ -16,3 +16,7 @@ bootstrap = "catalog.toml"
 
 # [backup]
 # directory = "backups"
+
+# [ttl]
+# sweep_interval_secs = 60
+# batch_size = 1000

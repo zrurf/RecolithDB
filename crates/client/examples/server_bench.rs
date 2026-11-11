@@ -196,6 +196,7 @@ fn put_request(id: u64) -> DocumentPutRequest {
             ],
             if_match: None,
         }],
+        ttl_seconds: None,
     }
 }
 

@@ -273,6 +273,9 @@ impl Client {
         request: &DocumentPutRequest,
     ) -> Result<DocumentPutResponse, ClientError> {
         self.require_feature(feature::DOCUMENT_WRITE, "document writes")?;
+        if request.ttl_seconds.is_some() {
+            self.require_feature(feature::TTL, "document TTL")?;
+        }
         let body = self
             .request(opcode::DOC_PUT, opcode::DOC_PUT, &request.encode_to_vec())
             .await?;
@@ -788,7 +791,8 @@ fn build_hello(config: &ClientConfig) -> HelloRequest {
             | feature::EXPLAIN
             | feature::AGGREGATE
             | feature::BACKUP
-            | feature::DOCUMENT_DELETE,
+            | feature::DOCUMENT_DELETE
+            | feature::TTL,
         max_frame_size: to_u32(config.max_frame_size),
         max_batch_subframes: to_u32(config.max_batch_subframes),
         max_batch_bytes: to_u32(config.max_batch_bytes),

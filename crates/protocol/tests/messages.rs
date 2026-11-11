@@ -64,6 +64,7 @@ fn roundtrips_document_put_request() {
             }],
             if_match: Some(41),
         }],
+        ttl_seconds: Some(3600),
     };
 
     let encoded = put.encode_to_vec();

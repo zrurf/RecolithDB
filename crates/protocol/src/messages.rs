@@ -118,6 +118,8 @@ pub mod feature {
     pub const BACKUP: u64 = 1 << 11;
     /// Document deletion is supported.
     pub const DOCUMENT_DELETE: u64 = 1 << 12;
+    /// Document TTL expiry is supported.
+    pub const TTL: u64 = 1 << 13;
 }
 
 /// Compression algorithm bits used by the handshake.

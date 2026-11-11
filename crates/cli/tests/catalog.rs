@@ -120,6 +120,7 @@ async fn applies_a_catalog_definition_file() {
                 key_hex: None,
                 keys: vec!["player_id=u64:1".to_owned()],
                 idempotency_key: "apply-file-1".to_owned(),
+                ttl_seconds: None,
                 fields: vec![
                     "profile.name=string:alex".to_owned(),
                     "profile.level=u32:10".to_owned(),
@@ -316,6 +317,7 @@ record Profile {
                 key_hex: None,
                 keys: vec!["player_id=u64:1".to_owned()],
                 idempotency_key: "catalog-cli-1".to_owned(),
+                ttl_seconds: None,
                 fields: vec![
                     "profile.name=string:alex".to_owned(),
                     "profile.level=u32:10".to_owned(),

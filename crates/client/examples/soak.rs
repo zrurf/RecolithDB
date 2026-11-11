@@ -234,6 +234,7 @@ fn put_request(id: u64, worker: u64, sequence: u64) -> DocumentPutRequest {
             ],
             if_match: None,
         }],
+        ttl_seconds: None,
     }
 }
 

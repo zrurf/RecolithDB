@@ -136,7 +136,8 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             | feature::EXPLAIN
             | feature::AGGREGATE
             | feature::BACKUP
-            | feature::DOCUMENT_DELETE,
+            | feature::DOCUMENT_DELETE
+            | feature::TTL,
         max_frame_size: u32::try_from(max_frame_size).unwrap_or(u32::MAX),
         max_batch_subframes: u32::try_from(max_batch_subframes).unwrap_or(u32::MAX),
         max_batch_bytes: u32::try_from(max_batch_bytes).unwrap_or(u32::MAX),

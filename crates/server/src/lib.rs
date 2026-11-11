@@ -10,15 +10,16 @@ pub mod migration;
 pub mod net;
 pub mod offline_migration;
 mod query_cursor;
+pub mod reaper;
 
 pub use backup::{BackupError, BackupStats, backup, backup_snapshot, restore, verify};
 pub use bootstrap::{BootstrapError, load_bootstrap, parse_bootstrap};
 pub use config::{
     AuthSettings, BackupSettings, CatalogSettings, Config, ConfigError, ServerSettings,
-    StorageSettings, TlsSettings,
+    StorageSettings, TlsSettings, TtlSettings,
 };
 pub use document::{
-    DocumentError, DocumentStore, DocumentWrite, FragmentWriteRequest, Idempotency,
+    DocumentError, DocumentStore, DocumentWrite, FragmentWriteRequest, Idempotency, TtlSweep,
 };
 pub use metrics::{MetricsSnapshot, ServerMetrics};
 pub use migration::{
@@ -30,3 +31,4 @@ pub use offline_migration::{
     DEFAULT_MIGRATION_BATCH, MigrationBatch, MigrationStats, OfflineMigration,
     OfflineMigrationError, migration_in_progress,
 };
+pub use reaper::run_ttl_reaper;

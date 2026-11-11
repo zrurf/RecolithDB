@@ -59,6 +59,7 @@ async fn writes_reads_and_queries_through_the_cli() {
                 key_hex: None,
                 keys: vec!["player_id=u64:1".to_owned()],
                 idempotency_key: "cli-idempotency-1".to_owned(),
+                ttl_seconds: Some(60),
                 fields: vec![
                     "profile.name=string:alex".to_owned(),
                     "profile.level=u32:10".to_owned(),
@@ -96,6 +97,7 @@ async fn writes_reads_and_queries_through_the_cli() {
                 key_hex: Some(key_hex),
                 keys: Vec::new(),
                 idempotency_key: "cli-idempotency-2".to_owned(),
+                ttl_seconds: None,
                 fields: vec!["1:1=string:alex".to_owned(), "1:2=u32:11".to_owned()],
                 subkeys: Vec::new(),
             },

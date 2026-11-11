@@ -271,6 +271,7 @@ pub async fn run(args: Args) -> Result<(), CliError> {
                 key_hex,
                 keys,
                 idempotency_key,
+                ttl_seconds,
                 fields,
                 subkeys,
             } => {
@@ -287,6 +288,7 @@ pub async fn run(args: Args) -> Result<(), CliError> {
                     partition,
                     document_key: metadata::document_key(&keys, key_hex.as_deref(), &collection)?,
                     fragments: metadata::fragments(&fields, &subkeys, &collection)?,
+                    ttl_seconds,
                 };
                 let response = client.document_put(&request).await?;
                 println!("commit_ts: {}", response.commit_ts);

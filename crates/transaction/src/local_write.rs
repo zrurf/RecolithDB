@@ -440,6 +440,11 @@ impl<B: StorageBackend> LocalWritePath<B> {
         Ok(self.transaction.get(key)?)
     }
 
+    /// Stages a raw key deletion in this transaction.
+    pub fn delete_raw(&mut self, key: &[u8]) {
+        self.transaction.delete(key);
+    }
+
     /// Stages raw bytes for a system key in this transaction.
     pub fn put_raw(&mut self, key: &[u8], value: Vec<u8>) {
         self.transaction.put(key, value);
