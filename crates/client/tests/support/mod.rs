@@ -120,5 +120,6 @@ pub fn profile_put(key: &[u8], name: &str, idempotency: &[u8]) -> DocumentPutReq
             ],
             if_match: None,
         }],
+        ttl_seconds: None,
     }
 }

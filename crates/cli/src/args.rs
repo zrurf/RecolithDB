@@ -459,6 +459,9 @@ pub enum DocCommand {
         /// Caller-provided idempotency key.
         #[arg(long)]
         idempotency_key: String,
+        /// Document TTL in seconds. Omit to preserve, `0` clears.
+        #[arg(long)]
+        ttl_seconds: Option<u64>,
         /// Field value in `fragment.field=type:value` or `fragment:field=type:value` form.
         #[arg(
             long = "field",

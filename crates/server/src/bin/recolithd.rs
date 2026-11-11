@@ -8,7 +8,8 @@ use recolith_backend::StorageBackend;
 use recolith_catalog::{Catalog, CatalogError, load_catalog, save_catalog};
 use recolith_server::{
     BootstrapError, Config, ConfigError, DocumentStore, MetricsSnapshot, ServerConfig,
-    ServerMetrics, StorageSettings, load_bootstrap, migration_in_progress, serve_with_shutdown,
+    ServerMetrics, StorageSettings, load_bootstrap, migration_in_progress, run_ttl_reaper,
+    serve_with_shutdown,
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -122,6 +123,12 @@ async fn run_backend<B: StorageBackend>(
     let metrics = server_config.metrics();
     tracing::info!(%address, "server listening");
     let metrics_logger = tokio::spawn(periodic_metrics(Arc::clone(&metrics)));
+    let ttl_reaper = tokio::spawn(run_ttl_reaper(
+        Arc::clone(&store),
+        config.ttl.sweep_interval_secs,
+        config.ttl.batch_size,
+        Arc::clone(&metrics),
+    ));
 
     let result = serve_with_shutdown(listener, server_config, store, async {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -130,6 +137,7 @@ async fn run_backend<B: StorageBackend>(
     })
     .await;
     metrics_logger.abort();
+    ttl_reaper.abort();
 
     log_metrics(&metrics.snapshot());
     result?;
@@ -203,6 +211,9 @@ fn log_metrics(snapshot: &MetricsSnapshot) {
         query_p99_us = snapshot.query_latency.p99_micros,
         metadata_p50_us = snapshot.metadata_latency.p50_micros,
         metadata_p99_us = snapshot.metadata_latency.p99_micros,
+        ttl_sweeps = snapshot.ttl_sweeps,
+        expired_documents = snapshot.expired_documents,
+        ttl_errors = snapshot.ttl_errors,
         "server metrics"
     );
 }

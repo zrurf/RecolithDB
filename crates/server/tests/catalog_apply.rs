@@ -293,6 +293,7 @@ async fn put_document(
                 ],
                 if_match: None,
             }],
+            ttl_seconds: None,
         }
         .encode_to_vec(),
     )
@@ -462,6 +463,7 @@ async fn applies_catalog_atomically_and_serves_new_collection() {
                 ],
                 if_match: None,
             }],
+            ttl_seconds: None,
         }
         .encode_to_vec(),
     )

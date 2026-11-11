@@ -5,6 +5,7 @@ use std::fmt;
 use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use recolith_backend::{
     BackendError, KeyRange, ScanOptions, Snapshot, StorageBackend, Transaction, TxnOptions,
@@ -21,9 +22,10 @@ use recolith_query::{DocumentReadRequest, QueryEngine, QueryError};
 use recolith_schema::{Compatibility, RecordSchema, check_compatibility};
 use recolith_storage::{
     DocumentFragments, MAX_DOCUMENT_KEY_LEN, RecordData, RecordHeader, StorageError, decode_fields,
-    decode_record, decode_record_key, delete_index_entry, encode_bucket_prefix,
-    encode_document_prefix, encode_fields, encode_index_prefix, encode_index_value, encode_record,
-    encode_record_key, put_index_entry, put_unique_index_entry,
+    decode_record, decode_record_key, decode_ttl_index_key, decode_ttl_value, delete_index_entry,
+    encode_bucket_prefix, encode_document_prefix, encode_fields, encode_index_prefix,
+    encode_index_value, encode_record, encode_record_key, encode_ttl_index_key, encode_ttl_key,
+    encode_ttl_value, put_index_entry, put_unique_index_entry, ttl_index_prefix,
 };
 use recolith_transaction::{
     BatchedCommitClock, FragmentWrite, IndexUpdate, LocalWritePath, TransactionError,
@@ -124,6 +126,7 @@ pub struct DocumentWrite {
     partition: PartitionId,
     fragments: Vec<FragmentWriteRequest>,
     idempotency: Option<Idempotency>,
+    ttl_seconds: Option<u64>,
 }
 
 impl DocumentWrite {
@@ -140,6 +143,7 @@ impl DocumentWrite {
             partition,
             fragments: Vec::new(),
             idempotency: None,
+            ttl_seconds: None,
         }
     }
 
@@ -185,6 +189,22 @@ impl DocumentWrite {
     #[must_use]
     pub fn idempotency(&self) -> Option<&Idempotency> {
         self.idempotency.as_ref()
+    }
+
+    /// Sets the document TTL in seconds.
+    ///
+    /// `None` preserves an existing expiry, `Some(0)` clears it, and positive
+    /// values replace it.
+    #[must_use]
+    pub fn with_ttl_seconds(mut self, ttl_seconds: Option<u64>) -> Self {
+        self.ttl_seconds = ttl_seconds;
+        self
+    }
+
+    /// Returns the requested TTL update.
+    #[must_use]
+    pub const fn ttl_seconds(&self) -> Option<u64> {
+        self.ttl_seconds
     }
 }
 
@@ -299,6 +319,15 @@ impl From<MigrationError> for DocumentError {
     fn from(error: MigrationError) -> Self {
         Self::Migration(error)
     }
+}
+
+/// One TTL reaper pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TtlSweep {
+    /// Expired index entries examined.
+    pub scanned: u64,
+    /// Documents deleted.
+    pub deleted: u64,
 }
 
 /// Document service bound to a local catalog and backend.
@@ -756,6 +785,16 @@ impl<B: StorageBackend> DocumentStore<B> {
         }
         let commit_ts = self.clock.reserve(self.backend.as_ref())?;
         path.write_fragments_at(&writes, commit_ts)?;
+        if request.ttl_seconds().is_some() {
+            apply_ttl(
+                &mut path,
+                request.collection,
+                request.partition,
+                &request.document_key,
+                request.ttl_seconds(),
+                current_micros(),
+            )?;
+        }
         if let Some(idempotency) = request.idempotency() {
             path.put_raw(
                 idempotency.key(),
@@ -781,6 +820,38 @@ impl<B: StorageBackend> DocumentStore<B> {
         collection_id: CollectionId,
         partition: PartitionId,
         document_key: &[u8],
+    ) -> Result<bool, DocumentError> {
+        self.delete_document_inner(collection_id, partition, document_key, None)
+    }
+
+    /// Deletes a document only when its expiry still matches and has passed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] for metadata, key, storage, or transaction
+    /// failures.
+    pub fn delete_expired_document(
+        &self,
+        collection_id: CollectionId,
+        partition: PartitionId,
+        document_key: &[u8],
+        expected_expiry_micros: u64,
+        now_micros: u64,
+    ) -> Result<bool, DocumentError> {
+        self.delete_document_inner(
+            collection_id,
+            partition,
+            document_key,
+            Some((expected_expiry_micros, now_micros)),
+        )
+    }
+
+    fn delete_document_inner(
+        &self,
+        collection_id: CollectionId,
+        partition: PartitionId,
+        document_key: &[u8],
+        expiration: Option<(u64, u64)>,
     ) -> Result<bool, DocumentError> {
         let _gate = self.data_gate.read().map_err(|_| lock_error())?;
         let snapshot = self.catalog().snapshot()?;
@@ -821,6 +892,27 @@ impl<B: StorageBackend> DocumentStore<B> {
 
         let mut path =
             LocalWritePath::begin_unclocked(self.backend.as_ref(), TxnOptions::default())?;
+        if let Some((expected, now)) = expiration {
+            let actual = read_ttl(&mut path, collection_id, partition, document_key)?;
+            match actual {
+                Some(actual) if actual == expected && actual <= now => {}
+                Some(actual) if actual == expected => {
+                    path.rollback();
+                    return Ok(false);
+                }
+                _ => {
+                    path.delete_raw(&encode_ttl_index_key(
+                        expected,
+                        collection_id,
+                        partition,
+                        document_key,
+                    ));
+                    path.commit()?;
+                    return Ok(false);
+                }
+            }
+        }
+
         let mut deleted = false;
         for fragment in collection.fragments() {
             let bucket = snapshot
@@ -871,13 +963,88 @@ impl<B: StorageBackend> DocumentStore<B> {
                 deleted = true;
             }
         }
-        if deleted {
+        let ttl_removed = clear_ttl(&mut path, collection_id, partition, document_key)?.is_some();
+        let removed = deleted || ttl_removed;
+        if removed {
             path.commit()?;
         } else {
             path.rollback();
         }
 
-        Ok(deleted)
+        Ok(removed)
+    }
+
+    /// Deletes a bounded batch of expired documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] for backend or deletion failures.
+    pub fn sweep_expired(&self, now_micros: u64, limit: usize) -> Result<TtlSweep, DocumentError> {
+        if limit == 0 {
+            return Ok(TtlSweep::default());
+        }
+        let snapshot = self.backend.snapshot()?;
+        let entries = snapshot.scan(
+            &KeyRange::prefix(ttl_index_prefix()),
+            ScanOptions {
+                limit: Some(limit),
+                reverse: false,
+            },
+        )?;
+        let mut sweep = TtlSweep::default();
+        for (key, _) in entries {
+            let Some(entry) = decode_ttl_index_key(&key) else {
+                continue;
+            };
+            if entry.expires_at_micros() > now_micros {
+                break;
+            }
+            sweep.scanned = sweep.scanned.saturating_add(1);
+            match self.delete_expired_document(
+                entry.collection(),
+                entry.partition(),
+                entry.document_key(),
+                entry.expires_at_micros(),
+                now_micros,
+            ) {
+                Ok(true) => sweep.deleted = sweep.deleted.saturating_add(1),
+                Ok(false) => {}
+                Err(
+                    DocumentError::UnknownCollection(_)
+                    | DocumentError::UnknownFragment(_)
+                    | DocumentError::MissingMetadata(_),
+                ) => self.remove_expiry_entry(
+                    entry.collection(),
+                    entry.partition(),
+                    entry.document_key(),
+                    entry.expires_at_micros(),
+                )?,
+                Err(error) => return Err(error),
+            }
+        }
+
+        Ok(sweep)
+    }
+
+    fn remove_expiry_entry(
+        &self,
+        collection: CollectionId,
+        partition: PartitionId,
+        document_key: &[u8],
+        expires_at_micros: u64,
+    ) -> Result<(), DocumentError> {
+        let mut path =
+            LocalWritePath::begin_unclocked(self.backend.as_ref(), TxnOptions::default())?;
+        path.delete_raw(&encode_ttl_index_key(
+            expires_at_micros,
+            collection,
+            partition,
+            document_key,
+        ));
+        path.delete_raw(&encode_ttl_key(collection, partition, document_key));
+        path.commit()?;
+
+        Ok(())
     }
 
     /// Reads selected fragments of one document.
@@ -1356,6 +1523,90 @@ struct Target {
     data: RecordData,
     if_match: Option<CommitTs>,
     indexes: Vec<IndexDefinition>,
+}
+
+fn current_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+        })
+}
+
+fn ttl_expiry(now_micros: u64, ttl_seconds: u64) -> Result<u64, DocumentError> {
+    let ttl_micros = ttl_seconds
+        .checked_mul(1_000_000)
+        .ok_or_else(|| DocumentError::InvalidRequest("ttl_seconds is too large".to_owned()))?;
+
+    now_micros
+        .checked_add(ttl_micros)
+        .ok_or_else(|| DocumentError::InvalidRequest("ttl_seconds is too large".to_owned()))
+}
+
+fn read_ttl<B: StorageBackend>(
+    path: &mut LocalWritePath<B>,
+    collection: CollectionId,
+    partition: PartitionId,
+    document_key: &[u8],
+) -> Result<Option<u64>, DocumentError> {
+    let key = encode_ttl_key(collection, partition, document_key);
+    let Some(value) = path.get_raw(&key)? else {
+        return Ok(None);
+    };
+
+    decode_ttl_value(&value).map(Some).ok_or_else(|| {
+        DocumentError::Storage(StorageError::InvalidValue(
+            "malformed document expiry record".to_owned(),
+        ))
+    })
+}
+
+fn clear_ttl<B: StorageBackend>(
+    path: &mut LocalWritePath<B>,
+    collection: CollectionId,
+    partition: PartitionId,
+    document_key: &[u8],
+) -> Result<Option<u64>, DocumentError> {
+    let expiry = read_ttl(path, collection, partition, document_key)?;
+    if let Some(expiry) = expiry {
+        path.delete_raw(&encode_ttl_index_key(
+            expiry,
+            collection,
+            partition,
+            document_key,
+        ));
+    }
+    path.delete_raw(&encode_ttl_key(collection, partition, document_key));
+
+    Ok(expiry)
+}
+
+fn apply_ttl<B: StorageBackend>(
+    path: &mut LocalWritePath<B>,
+    collection: CollectionId,
+    partition: PartitionId,
+    document_key: &[u8],
+    ttl_seconds: Option<u64>,
+    now_micros: u64,
+) -> Result<(), DocumentError> {
+    let Some(ttl_seconds) = ttl_seconds else {
+        return Ok(());
+    };
+    let _ = clear_ttl(path, collection, partition, document_key)?;
+    if ttl_seconds == 0 {
+        return Ok(());
+    }
+    let expires_at = ttl_expiry(now_micros, ttl_seconds)?;
+    path.put_raw(
+        &encode_ttl_key(collection, partition, document_key),
+        encode_ttl_value(expires_at).to_vec(),
+    );
+    path.put_raw(
+        &encode_ttl_index_key(expires_at, collection, partition, document_key),
+        Vec::new(),
+    );
+
+    Ok(())
 }
 
 fn encoded_index_values(

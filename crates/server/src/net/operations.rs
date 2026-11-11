@@ -765,6 +765,7 @@ pub(crate) fn document_put<B: StorageBackend>(
         write = write.with_fragment(fragment_write);
     }
     write = write.with_idempotency(Idempotency::new(record_key, request_hash));
+    write = write.with_ttl_seconds(request.ttl_seconds);
 
     let commit_ts = store.write(&write).map_err(map_document)?;
     let versions = request

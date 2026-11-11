@@ -29,6 +29,9 @@ pub struct Config {
     /// Optional online backup settings.
     #[serde(default)]
     pub backup: BackupSettings,
+    /// Document expiry reaper settings.
+    #[serde(default)]
+    pub ttl: TtlSettings,
 }
 
 /// Listener and protocol settings.
@@ -118,6 +121,27 @@ pub struct BackupSettings {
     /// Directory that may receive online logical backups.
     #[serde(default)]
     pub directory: Option<PathBuf>,
+}
+
+/// Document expiry reaper settings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TtlSettings {
+    /// Sweep interval in seconds. Zero disables the reaper.
+    #[serde(default = "default_ttl_sweep_interval")]
+    pub sweep_interval_secs: u64,
+    /// Maximum expired documents processed per sweep.
+    #[serde(default = "default_ttl_batch_size")]
+    pub batch_size: usize,
+}
+
+impl Default for TtlSettings {
+    fn default() -> Self {
+        Self {
+            sweep_interval_secs: default_ttl_sweep_interval(),
+            batch_size: default_ttl_batch_size(),
+        }
+    }
 }
 
 /// Configuration loading or validation failure.
@@ -303,6 +327,11 @@ impl Config {
                 )));
             }
         }
+        if self.ttl.sweep_interval_secs > 0 && self.ttl.batch_size == 0 {
+            return Err(ConfigError::Invalid(
+                "ttl.batch_size must be greater than zero".to_owned(),
+            ));
+        }
 
         Ok(())
     }
@@ -336,4 +365,12 @@ const fn default_max_decompressed_size() -> usize {
 
 const fn default_compression_threshold() -> usize {
     512
+}
+
+const fn default_ttl_sweep_interval() -> u64 {
+    60
+}
+
+const fn default_ttl_batch_size() -> usize {
+    1_000
 }

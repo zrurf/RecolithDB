@@ -84,13 +84,13 @@ RecolithDB is in early single-node development. Implemented today:
 - Lazy one/many fragment assembly, equality and range index pushdown including composite leading fields, same-fragment multi-index intersection, and range filters.
 - Local transactions, multi-fragment commits with one timestamp, optimistic `if_match`, unique reservation workflow, persistent commit clock.
 - RQL document-query subset: parser, catalog binder, document key encoding, planner, executor, single-document point reads, multi-document scans with primary-key ranges, fragment filters, limits, index pushdown, `ORDER BY`, cursor pagination, chunked streaming results, plan explanation, single-partition aggregation/grouping, and offline migration for oversized buckets.
-- In-process document service: catalog-bound multi-fragment writes, atomic whole-document deletion with index and unique-claim cleanup, cardinality and partition validation, multi-fragment reads, and automatic index maintenance with sparse and unique indexes.
+- In-process document service: catalog-bound multi-fragment writes, document TTL and expiry filtering, atomic whole-document deletion with index and unique-claim cleanup, cardinality and partition validation, multi-fragment reads, and automatic index maintenance with sparse and unique indexes.
 - Protocol frame layer: fixed 38-byte header, CRC32C, zstd/lz4 compression, BATCH codec, Protobuf v1 messages, and collection metadata lookup.
 - TCP session layer: HELLO/WELCOME negotiation, bearer-token auth, compression selection, PING/PONG, BATCH dispatch, and structured errors.
 - TLS 1.3 transport with rustls and typed Rust client handshake, authentication, document, query, explain, batch, and collection-description calls.
 - Runnable `recolithd` process with TOML configuration, memory or fjall storage, optional catalog bootstrap, persisted catalog reload, runtime catalog creation, TLS, bearer auth, logging, graceful shutdown, and offline configuration validation.
 - `recolith` CLI with `ping`, RQL `query`, `explain`, `aggregate`, `backup`, `describe`, schema-aware `doc get` / `doc put` / `doc delete`, runtime `catalog` creation, alteration, file apply, and drop commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
-- Protocol document, query, and admin operations: DOC_GET, idempotent DOC_PUT with same-transaction deduplication, atomic DOC_DELETE, RQL QUERY execution, plan-only EXPLAIN, single-partition AGGREGATE, and online BACKUP.
+- Protocol document, query, and admin operations: DOC_GET, idempotent DOC_PUT with document TTL and same-transaction deduplication, atomic DOC_DELETE, RQL QUERY execution, plan-only EXPLAIN, single-partition AGGREGATE, and online BACKUP.
 - Process-exit crash recovery test and a full restart test covering catalog reload, commit-clock continuity, and persisted documents.
 - Point read/write benchmark example for the fjall adapter.
 - Batched commit-timestamp allocation, parallel document writes, and document plus concurrent multi-client benchmarks.
@@ -128,6 +128,22 @@ cargo run -p recolith-cli --bin recolith -- query "SELECT profile.name FROM play
 ```
 
 `doc delete` removes every fragment record, index entry, and unique claim for the document in one transaction. Deleting a missing document is idempotent and prints `deleted: false`; an existing document prints `deleted: true`.
+
+Documents can carry a relative TTL in seconds:
+
+```text
+cargo run -p recolith-cli --bin recolith -- doc put --collection player --keyspace game --key player_id=u64:1 --idempotency-key demo-2 --ttl-seconds 3600 --field profile.name=string:alex --field profile.level=u32:10
+```
+
+The server converts `ttl_seconds` to an absolute expiry using its own clock. Omitting the field preserves an existing expiry; `0` clears it; a positive value replaces it. Expired documents are hidden from `DOC_GET`, `QUERY`, and `AGGREGATE` immediately. A background reaper deletes expired documents in bounded batches using the document deletion path; unique index claims remain held until the reaper removes the document. TTL is document-scoped; fragment-level TTL and raw-bucket TTL are not implemented.
+
+```toml
+[ttl]
+sweep_interval_secs = 60
+batch_size = 1000
+```
+
+Set `sweep_interval_secs = 0` to disable the reaper. Lazy expiry filtering still applies when the reaper is disabled.
 
 The example configuration and catalog are under [`examples/recolithd`](examples/recolithd). The bootstrap catalog is applied only when persistent metadata is empty; later starts reuse the stored catalog.
 

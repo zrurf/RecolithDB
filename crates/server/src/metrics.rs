@@ -52,6 +52,12 @@ pub struct MetricsSnapshot {
     pub queries: u64,
     /// DESCRIBE_COLLECTION requests.
     pub metadata_requests: u64,
+    /// Completed TTL reaper sweeps.
+    pub ttl_sweeps: u64,
+    /// Expired documents deleted by the reaper.
+    pub expired_documents: u64,
+    /// TTL reaper failures.
+    pub ttl_errors: u64,
     /// PING latency.
     pub ping_latency: LatencySnapshot,
     /// DOC_GET latency.
@@ -149,6 +155,9 @@ pub struct ServerMetrics {
     document_writes: AtomicU64,
     queries: AtomicU64,
     metadata_requests: AtomicU64,
+    ttl_sweeps: AtomicU64,
+    expired_documents: AtomicU64,
+    ttl_errors: AtomicU64,
     latency: OperationLatency,
 }
 
@@ -222,6 +231,17 @@ impl ServerMetrics {
         self.errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one completed TTL sweep.
+    pub fn ttl_sweep(&self, deleted: u64) {
+        self.ttl_sweeps.fetch_add(1, Ordering::Relaxed);
+        add_saturating(&self.expired_documents, deleted);
+    }
+
+    /// Records a failed TTL sweep.
+    pub fn ttl_error(&self) {
+        self.ttl_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Takes a consistent-enough point-in-time snapshot.
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -237,6 +257,9 @@ impl ServerMetrics {
             document_writes: self.document_writes.load(Ordering::Relaxed),
             queries: self.queries.load(Ordering::Relaxed),
             metadata_requests: self.metadata_requests.load(Ordering::Relaxed),
+            ttl_sweeps: self.ttl_sweeps.load(Ordering::Relaxed),
+            expired_documents: self.expired_documents.load(Ordering::Relaxed),
+            ttl_errors: self.ttl_errors.load(Ordering::Relaxed),
             ping_latency: self.latency.ping.snapshot(),
             document_read_latency: self.latency.document_read.snapshot(),
             document_write_latency: self.latency.document_write.snapshot(),

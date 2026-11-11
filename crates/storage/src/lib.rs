@@ -9,6 +9,7 @@ pub mod error;
 pub mod index;
 pub mod record;
 pub mod store;
+pub mod ttl;
 pub mod value;
 
 pub use codec::{decode_fields, encode_fields};
@@ -31,5 +32,9 @@ pub use store::{
     StoredRecord, delete_index_entry, delete_record, get_record, get_record_from_snapshot,
     put_index_entry, put_unique_index_entry, read_fields, read_fields_from_snapshot, scan_index,
     scan_index_components, scan_index_range, write_fields,
+};
+pub use ttl::{
+    TtlIndexEntry, decode_ttl_index_key, decode_ttl_value, encode_ttl_index_key, encode_ttl_key,
+    encode_ttl_value, is_expired, ttl_index_prefix,
 };
 pub use value::{RecordData, Value};

@@ -208,6 +208,7 @@ fn profile_put_level(key: &[u8], name: &str, level: u32, idempotency: &[u8]) -> 
             ],
             if_match: None,
         }],
+        ttl_seconds: None,
     }
 }
 
@@ -1032,4 +1033,67 @@ async fn deletes_documents_and_reports_missing_documents() {
     assert_eq!(header.status(), status::OK);
     let response = QueryResponse::decode(payload.as_slice()).expect("query");
     assert!(response.documents.is_empty());
+}
+
+#[tokio::test]
+async fn hides_expired_documents_after_ttl() {
+    let store = store();
+    let address = start_server(Arc::clone(&store)).await;
+    let mut stream = TcpStream::connect(address).await.expect("connect");
+    let codec = handshake(&mut stream).await;
+    let key = document_key(1);
+    let mut put = profile_put(&key, "alex", b"ttl-1");
+    put.ttl_seconds = Some(1);
+
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::DOC_PUT, 10),
+        &put.encode_to_vec(),
+    )
+    .await;
+    let (header, _) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.status(), status::OK);
+
+    let get = DocumentGetRequest {
+        meta: None,
+        collection_id: 1,
+        partition: 0,
+        document_key: key.clone(),
+        fragments: vec![1],
+        projection: Vec::new(),
+    };
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::DOC_GET, 11),
+        &get.encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.status(), status::OK);
+    assert!(
+        !DocumentGetResponse::decode(payload.as_slice())
+            .expect("get")
+            .fragments
+            .is_empty()
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+
+    write_frame(
+        &mut stream,
+        &codec,
+        &FrameHeader::new(opcode::DOC_GET, 12),
+        &get.encode_to_vec(),
+    )
+    .await;
+    let (header, payload) = read_frame(&mut stream, &codec).await;
+    assert_eq!(header.status(), status::OK);
+    assert!(
+        DocumentGetResponse::decode(payload.as_slice())
+            .expect("get")
+            .fragments
+            .is_empty()
+    );
 }

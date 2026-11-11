@@ -3,15 +3,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Bound;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use recolith_backend::{KeyRange, ScanOptions, Snapshot, StorageBackend};
 use recolith_catalog::Catalog;
-use recolith_common::{BucketId, FieldId, FragmentId, IndexId, PartitionId};
+use recolith_common::{BucketId, CollectionId, FieldId, FragmentId, IndexId, PartitionId};
 use recolith_model::{Collection, DocumentKeySchema, Fragment, FragmentCardinality};
 use recolith_storage::{
     DocumentFragments, FragmentData, FragmentMode, FragmentReader, IndexBound, IndexFilter,
     RecordData, StorageError, Value, decode_record_key, encode_bucket_prefix, encode_index_value,
-    read_document, scan_index, scan_index_components, scan_index_range,
+    is_expired, read_document, scan_index, scan_index_components, scan_index_range,
 };
 
 use crate::aggregate::{AggregateBuilder, AggregatePage, AggregateQuery};
@@ -24,6 +25,8 @@ use crate::scan::{DocumentScan, KeyFilter, ScanOrder};
 /// Bound document read plan.
 #[derive(Clone, Debug)]
 pub struct QueryPlan {
+    collection_id: CollectionId,
+    partition: PartitionId,
     document_key: Vec<u8>,
     fragments: Vec<FragmentReader>,
     filters: Vec<Filter>,
@@ -68,6 +71,8 @@ impl QueryPlan {
 /// Bound multi-document scan plan.
 #[derive(Clone, Debug)]
 pub struct ScanPlan {
+    collection_id: CollectionId,
+    partition: PartitionId,
     key_schema: DocumentKeySchema,
     key_filters: Vec<KeyFilter>,
     fragments: Vec<FragmentReader>,
@@ -313,6 +318,8 @@ impl<B: StorageBackend> QueryEngine<B> {
         }
 
         Ok(QueryPlan {
+            collection_id: query.collection_id(),
+            partition: query.partition(),
             document_key: query.document_key().to_vec(),
             fragments: readers,
             filters: query.filters().to_vec(),
@@ -327,6 +334,15 @@ impl<B: StorageBackend> QueryEngine<B> {
     /// Returns [`QueryError`] for backend or storage assembly failures.
     pub fn execute(&self, plan: &QueryPlan) -> Result<DocumentFragments> {
         let snapshot = self.backend.snapshot()?;
+        if is_expired(
+            &snapshot,
+            plan.collection_id,
+            plan.partition,
+            &plan.document_key,
+            now_micros(),
+        )? {
+            return Ok(BTreeMap::new());
+        }
         let assembled = read_document(&snapshot, &plan.document_key, &plan.fragments)?;
 
         Ok(apply_post_processing(
@@ -492,6 +508,8 @@ impl<B: StorageBackend> QueryEngine<B> {
         }
 
         Ok(ScanPlan {
+            collection_id: query.collection_id(),
+            partition: query.partition(),
             key_schema: query.key_schema().clone(),
             key_filters: query.key_filters().to_vec(),
             fragments: readers,
@@ -554,6 +572,7 @@ impl<B: StorageBackend> QueryEngine<B> {
         }
 
         let after_key = after.map(|position| position.document_key);
+        let now = now_micros();
         let mut documents = Vec::new();
         let mut has_more = false;
         for key in candidates {
@@ -561,6 +580,9 @@ impl<B: StorageBackend> QueryEngine<B> {
                 continue;
             }
             if !key_matches(&plan.key_schema, &plan.key_filters, &key)? {
+                continue;
+            }
+            if is_expired(&snapshot, plan.collection_id, plan.partition, &key, now)? {
                 continue;
             }
             let assembled = read_document(&snapshot, &key, &plan.fragments)?;
@@ -594,9 +616,18 @@ impl<B: StorageBackend> QueryEngine<B> {
         let plan = self.plan_scan(&scan)?;
         let snapshot = self.backend.snapshot()?;
         let mut builder = AggregateBuilder::new(query.group().cloned(), query.aggregates());
+        let now = now_micros();
 
         if let Some(document_key) = query.document_key() {
-            if key_matches(&plan.key_schema, &plan.key_filters, document_key)? {
+            if key_matches(&plan.key_schema, &plan.key_filters, document_key)?
+                && !is_expired(
+                    &snapshot,
+                    query.collection_id(),
+                    query.partition(),
+                    document_key,
+                    now,
+                )?
+            {
                 let assembled = read_document(&snapshot, document_key, &plan.fragments)?;
                 if let Some(fragments) = apply_scan_filters(assembled, &plan.filters, &[]) {
                     builder.add_document(&fragments)?;
@@ -605,6 +636,9 @@ impl<B: StorageBackend> QueryEngine<B> {
         } else {
             for key in collect_candidates(&plan, &snapshot)? {
                 if !key_matches(&plan.key_schema, &plan.key_filters, &key)? {
+                    continue;
+                }
+                if is_expired(&snapshot, plan.collection_id, plan.partition, &key, now)? {
                     continue;
                 }
                 let assembled = read_document(&snapshot, &key, &plan.fragments)?;
@@ -674,6 +708,7 @@ fn execute_index_ordered_page<S: Snapshot>(
     let mut last_order_value = None;
     let mut has_more = false;
     let mut seen = BTreeSet::new();
+    let now = now_micros();
     for record_key in record_keys {
         let Ok(decoded) = decode_record_key(&record_key) else {
             continue;
@@ -686,6 +721,9 @@ fn execute_index_ordered_page<S: Snapshot>(
             continue;
         }
         if !key_matches(&plan.key_schema, &plan.key_filters, &key)? {
+            continue;
+        }
+        if is_expired(snapshot, plan.collection_id, plan.partition, &key, now)? {
             continue;
         }
         let assembled = read_document(snapshot, &key, &plan.fragments)?;
@@ -731,8 +769,12 @@ fn execute_ordered_page<S: Snapshot>(
     after: Option<ScanPosition<'_>>,
 ) -> Result<ScanPage> {
     let mut matched = Vec::new();
+    let now = now_micros();
     for key in candidates {
         if !key_matches(&plan.key_schema, &plan.key_filters, &key)? {
+            continue;
+        }
+        if is_expired(snapshot, plan.collection_id, plan.partition, &key, now)? {
             continue;
         }
         let assembled = read_document(snapshot, &key, &plan.fragments)?;
@@ -975,6 +1017,14 @@ fn project_record(record: FragmentData, fields: &BTreeSet<FieldId>) -> FragmentD
     } else {
         record.project(fields)
     }
+}
+
+fn now_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+        })
 }
 
 fn collect_candidates<S: Snapshot>(plan: &ScanPlan, snapshot: &S) -> Result<BTreeSet<Vec<u8>>> {

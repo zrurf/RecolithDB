@@ -173,6 +173,7 @@ message DocumentPutRequest {
   uint32 partition = 3;
   bytes document_key = 4;
   repeated FragmentPayload fragments = 5;
+  optional uint64 ttl_seconds = 6;
 }
 
 message DocumentPutResponse {
