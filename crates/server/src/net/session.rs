@@ -14,10 +14,10 @@ use recolith_protocol::frame::{
 };
 use recolith_protocol::messages::{
     AggregateRequest, AuthMethod, AuthResult, BackupRequest, CatalogAlterRequest,
-    CatalogApplyRequest, CatalogDropRequest, DescribeCollectionRequest, DocumentGetRequest,
-    DocumentPutRequest, ErrorResponse, ExplainRequest, GoAway, HelloRequest, PingRequest,
-    PingResponse, QueryChunk, QueryRequest, QueryStreamRequest, SecurityMode, WelcomeResponse,
-    compression_bit, feature, opcode, status,
+    CatalogApplyRequest, CatalogDropRequest, DescribeCollectionRequest, DocumentDeleteRequest,
+    DocumentGetRequest, DocumentPutRequest, ErrorResponse, ExplainRequest, GoAway, HelloRequest,
+    PingRequest, PingResponse, QueryChunk, QueryRequest, QueryStreamRequest, SecurityMode,
+    WelcomeResponse, compression_bit, feature, opcode, status,
 };
 use recolith_security::{Principal, unix_seconds};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -135,7 +135,8 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             | feature::STREAMING
             | feature::EXPLAIN
             | feature::AGGREGATE
-            | feature::BACKUP,
+            | feature::BACKUP
+            | feature::DOCUMENT_DELETE,
         max_frame_size: u32::try_from(max_frame_size).unwrap_or(u32::MAX),
         max_batch_subframes: u32::try_from(max_batch_subframes).unwrap_or(u32::MAX),
         max_batch_bytes: u32::try_from(max_batch_bytes).unwrap_or(u32::MAX),
@@ -224,6 +225,7 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             opcode::PING
             | opcode::DOC_GET
             | opcode::DOC_PUT
+            | opcode::DOC_DELETE
             | opcode::QUERY
             | opcode::DESCRIBE_COLLECTION
             | opcode::EXPLAIN
@@ -353,6 +355,11 @@ async fn execute<B: StorageBackend>(
             let request = DocumentPutRequest::decode(body.as_slice())
                 .map_err(|_| OperationError::invalid("malformed DOC_PUT payload"))?;
             operations::document_put(&store, &principal, request)
+        }
+        opcode::DOC_DELETE => {
+            let request = DocumentDeleteRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed DOC_DELETE payload"))?;
+            operations::document_delete(&store, &principal, request)
         }
         opcode::QUERY => {
             let request = QueryRequest::decode(body.as_slice())

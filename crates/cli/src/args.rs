@@ -411,6 +411,29 @@ pub enum DocCommand {
         #[arg(long = "fragment")]
         fragments: Vec<String>,
     },
+    /// Deletes a document and all its fragments.
+    #[command(group(
+        ArgGroup::new("delete_key")
+            .required(true)
+            .args(["key_hex", "keys"])
+    ))]
+    Delete {
+        /// Collection name or identifier.
+        #[arg(long)]
+        collection: String,
+        /// Keyspace name used to disambiguate the collection.
+        #[arg(long)]
+        keyspace: Option<String>,
+        /// Partition index.
+        #[arg(long, default_value_t = 0)]
+        partition: u32,
+        /// Encoded document key in hexadecimal.
+        #[arg(long)]
+        key_hex: Option<String>,
+        /// Document key component in `name=type:value` form.
+        #[arg(long = "key", value_name = "NAME=TYPE:VALUE")]
+        keys: Vec<String>,
+    },
     /// Writes document fragments.
     #[command(group(
         ArgGroup::new("put_key")

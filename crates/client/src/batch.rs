@@ -1,7 +1,7 @@
 use prost::Message;
 use recolith_protocol::messages::{
-    DocumentGetRequest, DocumentPutRequest, ErrorResponse, PingRequest, QueryRequest, opcode,
-    status,
+    DocumentDeleteRequest, DocumentGetRequest, DocumentPutRequest, ErrorResponse, PingRequest,
+    QueryRequest, opcode, status,
 };
 
 /// One unary request inside a batch.
@@ -45,6 +45,12 @@ impl BatchOperation {
     #[must_use]
     pub fn document_put(request: &DocumentPutRequest) -> Self {
         Self::new(opcode::DOC_PUT, request.encode_to_vec())
+    }
+
+    /// Creates a document delete operation.
+    #[must_use]
+    pub fn document_delete(request: &DocumentDeleteRequest) -> Self {
+        Self::new(opcode::DOC_DELETE, request.encode_to_vec())
     }
 
     /// Creates a query operation.

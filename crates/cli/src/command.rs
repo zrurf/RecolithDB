@@ -2,8 +2,9 @@ use std::time::Duration;
 
 use recolith_client::{Client, ClientConfig};
 use recolith_protocol::messages::{
-    AggregateRequest, BackupRequest, CollectionMetadata, DocumentGetRequest, DocumentPutRequest,
-    ExplainRequest, NamedParameter, QueryRequest, QueryStreamRequest, RequestMeta, Value, value,
+    AggregateRequest, BackupRequest, CollectionMetadata, DocumentDeleteRequest, DocumentGetRequest,
+    DocumentPutRequest, ExplainRequest, NamedParameter, QueryRequest, QueryStreamRequest,
+    RequestMeta, Value, value,
 };
 
 use crate::args::{Args, Command, DocCommand, TokenCommand};
@@ -240,6 +241,28 @@ pub async fn run(args: Args) -> Result<(), CliError> {
                         &collection
                     )
                 );
+            }
+            DocCommand::Delete {
+                collection,
+                keyspace,
+                partition,
+                key_hex,
+                keys,
+            } => {
+                let collection = describe(&mut client, &collection, keyspace.as_deref()).await?;
+                let response = client
+                    .document_delete(&DocumentDeleteRequest {
+                        meta: None,
+                        collection_id: collection.id,
+                        partition,
+                        document_key: metadata::document_key(
+                            &keys,
+                            key_hex.as_deref(),
+                            &collection,
+                        )?,
+                    })
+                    .await?;
+                println!("deleted: {}", response.deleted);
             }
             DocCommand::Put {
                 collection,

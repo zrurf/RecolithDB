@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use recolith_backend::{ScanOptions, StorageBackend};
+use recolith_backend::{KeyRange, ScanOptions, Snapshot, StorageBackend};
 use recolith_backend_memory::MemoryBackend;
 use recolith_catalog::Catalog;
 use recolith_common::{
@@ -13,7 +13,9 @@ use recolith_model::{
 };
 use recolith_query::DocumentReadRequest;
 use recolith_schema::{Field, RecordSchema, Type};
-use recolith_storage::{RecordData, Value, encode_document_key, encode_index_value, scan_index};
+use recolith_storage::{
+    RecordData, Value, encode_document_key, encode_document_prefix, encode_index_value, scan_index,
+};
 use recolith_transaction::TransactionError;
 
 use recolith_server::{DocumentError, DocumentStore, DocumentWrite, FragmentWriteRequest};
@@ -415,4 +417,88 @@ fn rejects_duplicate_unique_index_value() {
             recolith_storage::StorageError::UniqueViolation { .. }
         )))
     ));
+}
+
+#[test]
+fn deletes_documents_and_releases_indexes_and_unique_claims() {
+    let (store, backend, key) = store_with_backend();
+    let write = document(&key).with_fragment(FragmentWriteRequest::new(
+        FragmentId::new(2),
+        b"2".to_vec(),
+        item(2, 200),
+    ));
+    store.write(&write).expect("write");
+
+    assert!(
+        store
+            .delete_document(CollectionId::new(1), PartitionId::new(0), &key)
+            .expect("delete")
+    );
+    assert!(
+        !store
+            .delete_document(CollectionId::new(1), PartitionId::new(0), &key)
+            .expect("idempotent delete")
+    );
+
+    let read = DocumentReadRequest::new(CollectionId::new(1), key.clone(), PartitionId::new(0));
+    assert!(store.read(&read).expect("read").is_empty());
+
+    let snapshot = backend.snapshot().expect("snapshot");
+    let mut profile_prefix = encode_document_prefix(BucketId::new(1), PartitionId::new(0), &key);
+    profile_prefix.extend_from_slice(&FragmentId::new(1).get().to_be_bytes());
+    assert!(
+        snapshot
+            .scan(&KeyRange::prefix(&profile_prefix), ScanOptions::default())
+            .expect("profile scan")
+            .is_empty()
+    );
+    let mut item_prefix = encode_document_prefix(BucketId::new(2), PartitionId::new(0), &key);
+    item_prefix.extend_from_slice(&FragmentId::new(2).get().to_be_bytes());
+    assert!(
+        snapshot
+            .scan(&KeyRange::prefix(&item_prefix), ScanOptions::default())
+            .expect("item scan")
+            .is_empty()
+    );
+    assert!(
+        scan_index(
+            &snapshot,
+            BucketId::new(1),
+            PartitionId::new(0),
+            IndexId::new(2),
+            &encode_index_value(&Value::String("alex".to_owned())).expect("value"),
+            ScanOptions::default(),
+        )
+        .expect("unique index")
+        .is_empty()
+    );
+    assert!(
+        scan_index(
+            &snapshot,
+            BucketId::new(2),
+            PartitionId::new(0),
+            IndexId::new(1),
+            &encode_index_value(&Value::U64(100)).expect("value"),
+            ScanOptions::default(),
+        )
+        .expect("item index")
+        .is_empty()
+    );
+
+    let other_key =
+        encode_document_key(&key_schema(), &[recolith_model::KeyValue::U64(43)]).expect("key");
+    store
+        .write(&document(&other_key))
+        .expect("reuse released unique value");
+}
+
+#[test]
+fn deleting_a_missing_document_is_idempotent() {
+    let (store, key) = store();
+
+    assert!(
+        !store
+            .delete_document(CollectionId::new(1), PartitionId::new(0), &key)
+            .expect("delete")
+    );
 }

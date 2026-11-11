@@ -21,9 +21,9 @@ use recolith_query::{DocumentReadRequest, QueryEngine, QueryError};
 use recolith_schema::{Compatibility, RecordSchema, check_compatibility};
 use recolith_storage::{
     DocumentFragments, MAX_DOCUMENT_KEY_LEN, RecordData, RecordHeader, StorageError, decode_fields,
-    decode_record, decode_record_key, delete_index_entry, encode_bucket_prefix, encode_fields,
-    encode_index_prefix, encode_index_value, encode_record, encode_record_key, put_index_entry,
-    put_unique_index_entry,
+    decode_record, decode_record_key, delete_index_entry, encode_bucket_prefix,
+    encode_document_prefix, encode_fields, encode_index_prefix, encode_index_value, encode_record,
+    encode_record_key, put_index_entry, put_unique_index_entry,
 };
 use recolith_transaction::{
     BatchedCommitClock, FragmentWrite, IndexUpdate, LocalWritePath, TransactionError,
@@ -765,6 +765,119 @@ impl<B: StorageBackend> DocumentStore<B> {
         path.commit()?;
 
         Ok(commit_ts)
+    }
+
+    /// Deletes every record and index entry for one document.
+    ///
+    /// Missing documents return `false`. The operation is atomic across all
+    /// fragments of the document.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] for unknown metadata, invalid keys or
+    /// partitions, storage failures, or transaction conflicts.
+    pub fn delete_document(
+        &self,
+        collection_id: CollectionId,
+        partition: PartitionId,
+        document_key: &[u8],
+    ) -> Result<bool, DocumentError> {
+        let _gate = self.data_gate.read().map_err(|_| lock_error())?;
+        let snapshot = self.catalog().snapshot()?;
+        let collection = snapshot
+            .collections
+            .get(&collection_id)
+            .ok_or(DocumentError::UnknownCollection(collection_id))?;
+        if document_key.is_empty() {
+            return Err(DocumentError::InvalidRequest(
+                "document key must not be empty".to_owned(),
+            ));
+        }
+        if document_key.len() > MAX_DOCUMENT_KEY_LEN {
+            return Err(DocumentError::InvalidRequest(format!(
+                "document key is {} bytes, limit is {MAX_DOCUMENT_KEY_LEN}",
+                document_key.len()
+            )));
+        }
+        for fragment in collection.fragments() {
+            let bucket = snapshot
+                .buckets
+                .get(&fragment.bucket_id())
+                .ok_or(DocumentError::MissingMetadata("bucket"))?;
+            if partition.get() >= bucket.partition_count() {
+                return Err(DocumentError::InvalidRequest(format!(
+                    "partition {} is outside bucket {} with {} partitions",
+                    partition,
+                    bucket.id(),
+                    bucket.partition_count()
+                )));
+            }
+            snapshot
+                .schemas
+                .schemas
+                .get(&(bucket.schema_id(), bucket.schema_version()))
+                .ok_or(DocumentError::MissingMetadata("schema"))?;
+        }
+
+        let mut path =
+            LocalWritePath::begin_unclocked(self.backend.as_ref(), TxnOptions::default())?;
+        let mut deleted = false;
+        for fragment in collection.fragments() {
+            let bucket = snapshot
+                .buckets
+                .get(&fragment.bucket_id())
+                .ok_or(DocumentError::MissingMetadata("bucket"))?;
+            let schema = snapshot
+                .schemas
+                .schemas
+                .get(&(bucket.schema_id(), bucket.schema_version()))
+                .ok_or(DocumentError::MissingMetadata("schema"))?;
+            let indexes: Vec<&IndexDefinition> = snapshot
+                .indexes
+                .get(&bucket.id())
+                .map(|indexes| indexes.values().collect())
+                .unwrap_or_default();
+            let mut prefix = encode_document_prefix(bucket.id(), partition, document_key);
+            prefix.extend_from_slice(&fragment.id().get().to_be_bytes());
+            let keys = path.scan_raw(&KeyRange::prefix(&prefix), ScanOptions::default())?;
+            for (key, _) in keys {
+                let Ok(decoded) = decode_record_key(&key) else {
+                    continue;
+                };
+                if decoded.head().partition() != partition
+                    || decoded.document_key() != document_key
+                    || decoded.fragment() != fragment.id()
+                {
+                    continue;
+                }
+                let Some(frame) = path.get_raw(&key)? else {
+                    continue;
+                };
+                let record = decode_record(&frame)?;
+                let record_schema = record_schema(&snapshot, schema, record.header())?;
+                let data = decode_fields(&record_schema, record.payload())?;
+                let mut updates = Vec::new();
+                for index in &indexes {
+                    if let Some(values) = encoded_index_values(index, &data)? {
+                        updates.push(IndexUpdate::new(
+                            index.id(),
+                            Some(values),
+                            None,
+                            index.kind() == IndexKind::Unique,
+                        ));
+                    }
+                }
+                path.delete_fragment(&key, &updates)?;
+                deleted = true;
+            }
+        }
+        if deleted {
+            path.commit()?;
+        } else {
+            path.rollback();
+        }
+
+        Ok(deleted)
     }
 
     /// Reads selected fragments of one document.
