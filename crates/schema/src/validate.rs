@@ -38,9 +38,28 @@ pub fn validate_record(record: &RecordSchema) -> Result<()> {
         }
 
         validate_type(field.ty())?;
+        if field.unique() && !unique_compatible(field.ty()) {
+            return Err(SchemaError::InvalidUniqueField(field.name().to_owned()));
+        }
     }
 
     Ok(())
+}
+
+fn unique_compatible(ty: &Type) -> bool {
+    matches!(
+        ty,
+        Type::Bool
+            | Type::I32
+            | Type::I64
+            | Type::U32
+            | Type::U64
+            | Type::String
+            | Type::Bytes
+            | Type::Timestamp
+            | Type::Duration
+            | Type::Enum(_)
+    )
 }
 
 fn validate_type(ty: &Type) -> Result<()> {

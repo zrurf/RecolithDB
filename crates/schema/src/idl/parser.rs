@@ -48,6 +48,7 @@ impl Parser {
 
     fn parse_field(&mut self) -> Result<Field> {
         let optional = self.eat_keyword("optional");
+        let unique = self.eat_keyword("unique");
         let name = self.take_ident()?;
         self.expect(TokenKind::Colon)?;
         let ty = self.parse_type()?;
@@ -55,7 +56,7 @@ impl Parser {
         let id = FieldId::new(self.take_number()?);
         self.expect(TokenKind::Semicolon)?;
 
-        Ok(Field::new(id, name, ty, optional))
+        Ok(Field::new(id, name, ty, optional).with_unique(unique))
     }
 
     fn parse_type(&mut self) -> Result<Type> {

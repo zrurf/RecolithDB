@@ -20,3 +20,10 @@ bootstrap = "catalog.toml"
 # [ttl]
 # sweep_interval_secs = 60
 # batch_size = 1000
+
+# [workflow]
+# execution = "async"
+# step_timeout_ms = 5000
+
+# [placement]
+# local_backend_id = 0

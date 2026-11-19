@@ -85,20 +85,21 @@ RecolithDB is in early single-node development. Implemented today:
 - Local transactions, multi-fragment commits with one timestamp, optimistic `if_match`, unique reservation workflow, persistent commit clock.
 - RQL document-query subset: parser, catalog binder, document key encoding, planner, executor, single-document point reads, multi-document scans with primary-key ranges, fragment filters, limits, index pushdown, `ORDER BY`, cursor pagination, chunked streaming results, plan explanation, single-partition aggregation/grouping, and offline migration for oversized buckets.
 - In-process document service: catalog-bound multi-fragment writes, document TTL and expiry filtering, atomic whole-document deletion with index and unique-claim cleanup, cardinality and partition validation, multi-fragment reads, and automatic index maintenance with sparse and unique indexes.
+- Durable Saga workflows: `WF_START` / `WF_STATUS` / `WF_CANCEL` with synchronous or background execution, per-step timeouts, per-step idempotency, persisted state with crash recovery, compensation, atomic counter steps, and TCC-style unique reservations (`claim` / `confirm`) with write-path enforcement and expiry sweeps.
 - Protocol frame layer: fixed 38-byte header, CRC32C, zstd/lz4 compression, BATCH codec, Protobuf v1 messages, and collection metadata lookup.
 - TCP session layer: HELLO/WELCOME negotiation, bearer-token auth, compression selection, PING/PONG, BATCH dispatch, and structured errors.
 - TLS 1.3 transport with rustls and typed Rust client handshake, authentication, document, query, explain, batch, and collection-description calls.
 - Runnable `recolithd` process with TOML configuration, memory or fjall storage, optional catalog bootstrap, persisted catalog reload, runtime catalog creation, TLS, bearer auth, logging, graceful shutdown, and offline configuration validation.
-- `recolith` CLI with `ping`, RQL `query`, `explain`, `aggregate`, `backup`, `describe`, schema-aware `doc get` / `doc put` / `doc delete`, runtime `catalog` creation, alteration, file apply, and drop commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
-- Protocol document, query, and admin operations: DOC_GET, idempotent DOC_PUT with document TTL and same-transaction deduplication, atomic DOC_DELETE, RQL QUERY execution, plan-only EXPLAIN, single-partition AGGREGATE, and online BACKUP.
+- `recolith` CLI with `ping`, RQL `query`, `explain`, `aggregate`, `backup`, `describe`, schema-aware `doc get` / `doc put` / `doc delete`, direct `bucket get` / `bucket put` / `bucket delete` / `bucket scan`, runtime `catalog` creation, alteration, file apply, and drop commands, and local `token issue` / `token inspect` / `token verify`, including TLS, bearer auth, named keys and fields, and human-readable output.
+- Protocol document, query, and admin operations: DOC_GET, idempotent DOC_PUT with document TTL and same-transaction deduplication, atomic DOC_DELETE, RQL QUERY execution, plan-only EXPLAIN, single-partition AGGREGATE, online BACKUP, and direct BUCKET_GET / BUCKET_PUT / BUCKET_DELETE / BUCKET_SCAN record operations.
 - Process-exit crash recovery test and a full restart test covering catalog reload, commit-clock continuity, and persisted documents.
 - Point read/write benchmark example for the fjall adapter.
 - Batched commit-timestamp allocation, parallel document writes, and document plus concurrent multi-client benchmarks.
 - Network robustness coverage: oversized, truncated, and corrupt frames, malformed batches, TLS rejection, and shutdown draining.
-- Process-local server metrics for sessions, requests, errors, operation counts, and per-operation latency percentiles, logged periodically and at shutdown.
+- Process-local server metrics for sessions, requests, errors, operation counts, and per-operation latency percentiles including deletes, explains, aggregates, and backups, logged periodically and at shutdown, with slow-operation logging.
 - Bounded concurrent sessions with connection-limit overload rejection and rejection metrics.
 - HMAC-SHA256 opaque tokens, role-based collection permissions, token expiry, local token inspection, verification, fingerprint display, revocation file management, and principal-scoped idempotency.
-- Atomic catalog creation, alteration, and removal for keyspaces, schema versions, buckets, collections, and indexes, with generation checks, purge controls, synchronous index backfill, schema switching, declarative record migration, and persisted reload.
+- Atomic catalog creation, alteration, and removal for keyspaces, schema versions, buckets, collections, indexes, and placements, with generation checks, purge controls, synchronous index backfill, schema switching, declarative record migration, persisted reload, and write-path placement enforcement against a configured local backend.
 - Offline logical backup and restore plus online snapshot backups with checksums, entry-count validation, bounded scan batches, a restricted output directory, and overwrite protection.
 
 Not yet implemented:
@@ -145,7 +146,52 @@ batch_size = 1000
 
 Set `sweep_interval_secs = 0` to disable the reaper. Lazy expiry filtering still applies when the reaper is disabled.
 
+## Workflows
+
+Cross-partition and multi-step operations use explicit Saga workflows with bounded execution. `WF_START` submits a definition of up to 16 steps — `put_document`, `delete_document`, `increment_field` (atomic counter), and `claim_reservation` / `confirm_reservation` (TCC) — and by default runs it to a terminal state in the same request. Steps are persisted with per-step idempotency keys, so retries and crash recovery deduplicate; `recolithd` resumes interrupted workflows at startup.
+
+`execution_mode` on the request selects synchronous or asynchronous execution; when absent, the server applies the configured `[workflow].execution` default. Asynchronous `WF_START` persists the workflow as `Pending`, returns immediately, and a background task runs the steps; clients poll `WF_STATUS` for the terminal state. A background execution is not batchable with others: each asynchronous submission owns exactly one runner task, and restart-time resume stays synchronous.
+
+Each step is timed against `[workflow].step_timeout_ms` (default 5,000; `0` disables the timeout). The timeout is enforced at step boundaries — an in-progress step is never preempted, but a step that finishes after its budget is marked failed, immediately compensated when the step type allows it, and the workflow takes the normal failure path (compensate earlier steps or dead-letter). Compensation steps are timed the same way.
+
+Failure compensates succeeded steps in reverse: document writes are deleted, counter increments are reversed, and claims are released. If a succeeded step is not compensable (such as `delete_document` or `confirm_reservation`), the workflow moves to a `Failed` dead-letter state instead. `WF_STATUS` reports the state and per-step results; `WF_CANCEL` compensates a running workflow.
+
+Globally unique fields are schema-marked with the `unique` keyword (only comparable scalars). Direct writes that add or change a unique value require a `Reserved` or `Committed` reservation owned by the document, and `DOC_DELETE` releases the reservation. The reaper's sweep also deletes expired reservations. `WF_START` requires `write` permission on every touched collection; workflow opcodes are not allowed inside `BATCH`.
+
+```rust
+// Rust SDK
+client.start_workflow(&WorkflowStartRequest { meta: None, id: "trade-1".into(), definition: Some(definition) }).await?;
+```
+
+Failed workflows move to a dead-letter state and stay queryable. Operators resolve them with `WF_RESOLVE`: `retry` clears the error and continues from the failed step (already-committed steps are not reapplied), while `abandon` compensates anything still compensable and archives the workflow as `Abandoned`. `WF_LIST` returns workflow summaries ordered by identifier and requires `admin` on `*/*`.
+
+```text
+cargo run -p recolith-cli --bin recolith -- workflow status trade-1
+cargo run -p recolith-cli --bin recolith -- workflow list --limit 100
+cargo run -p recolith-cli --bin recolith -- workflow resolve trade-1 --action retry
+cargo run -p recolith-cli --bin recolith -- workflow cancel trade-1
+```
+
+A background reconciler repairs orphaned reservations: expired claims whose owner document already holds the reserved value are confirmed, while reservations whose owner document is missing or no longer holds the value are released.
+
 The example configuration and catalog are under [`examples/recolithd`](examples/recolithd). The bootstrap catalog is applied only when persistent metadata is empty; later starts reuse the stored catalog.
+
+## Direct Bucket Record Operations
+
+`BUCKET_GET` (`0x0090`), `BUCKET_PUT` (`0x0091`), `BUCKET_DELETE` (`0x0092`), and `BUCKET_SCAN` (`0x0093`) address one record directly by `(bucket, partition, fragment, document key, subkey)`. They negotiate the `BUCKET_OPS` feature bit and are authorized through the owning collection, falling back to the bucket name for standalone buckets: `read` for `BUCKET_GET` and `BUCKET_SCAN`, `write` for `BUCKET_PUT` and `BUCKET_DELETE`.
+
+The bucket policy gates direct writes. `strict` buckets reject `BUCKET_PUT` and `BUCKET_DELETE` while still allowing reads; `managed` buckets validate fields against the bound schema, maintain local indexes, and enforce unique reservations when collection-owned; `raw` buckets skip required-field validation, index maintenance, and unique enforcement, and their records decode leniently on read. Cardinality rules match the document API for collection-owned fragments — `one` requires an empty subkey and `many` requires one — while standalone buckets accept any fragment identifier and subkey. `BUCKET_PUT` supports optimistic `if_match` against the record's commit timestamp.
+
+Requests can address a bucket by identifier or by name: when `bucket_id` is zero, the server resolves `bucket_name` (optionally narrowed to a keyspace) and reports unknown or ambiguous names as `NOT_FOUND`; responses echo the resolved identifier. `BUCKET_SCAN` reads one partition in storage-key order with an optional `fragment_id` filter, a `start_after` cursor carrying the raw record key of the previous page's last record, and a limit capped at 10,000; there is no snapshot isolation across pages. TTL expiry is document-scoped: direct bucket reads return expired records, and direct writes never set or clear TTL metadata.
+
+The `recolith` CLI exposes `bucket get` / `bucket put` / `bucket delete` / `bucket scan`, accepting numeric identifiers or names, hexadecimal or UTF-8 keys, typed `field_id=type:value` field flags, `--if-match` for optimistic writes, and hex `start-after` cursors:
+
+```text
+cargo run -p recolith-cli --bin recolith -- bucket put --keyspace game --bucket scratch --partition 1 --fragment 9 --key k1 --field 1=string:hello
+cargo run -p recolith-cli --bin recolith -- bucket get --keyspace game --bucket scratch --fragment 9 --key k1
+cargo run -p recolith-cli --bin recolith -- bucket scan --bucket 2 --partition 1 --limit 50
+cargo run -p recolith-cli --bin recolith -- bucket delete --keyspace game --bucket scratch --fragment 9 --key k1
+```
 
 ## Backup and Restore
 
@@ -171,6 +217,19 @@ cargo run -p recolith-server --bin recolith-backup -- restore --data-dir restore
 ```
 
 Restore requires an empty target directory. Switch the server data path to the restored directory after verifying it. Online restore and backup streaming to clients are not implemented.
+
+## Observability
+
+Per-operation counters and latency percentiles cover `DOC_GET`, `DOC_PUT`, `DOC_DELETE`, `QUERY`, `EXPLAIN`, `AGGREGATE`, `BACKUP`, and `DESCRIBE_COLLECTION`, plus per-operation histograms for direct bucket record operations (`BUCKET_GET`, `BUCKET_PUT`, `BUCKET_DELETE`, `BUCKET_SCAN`) with a combined request counter. The server logs a metrics summary periodically and at shutdown. TTL sweeps, expired documents, and reaper errors are counted separately.
+
+Slow operations can be logged with a threshold:
+
+```toml
+[observability]
+slow_query_threshold_ms = 200
+```
+
+`DOC_GET`, `DOC_PUT`, `DOC_DELETE`, `QUERY`, `EXPLAIN`, `AGGREGATE`, and `BACKUP` requests that take at least the threshold emit a `slow operation` warning with the operation name, request ID, duration, status, collection, partition, and the request `trace_id` when provided. Parameter values, RQL text, and document contents are never logged. Set `slow_query_threshold_ms = 0` to disable the log.
 
 ## Authentication
 
@@ -333,6 +392,21 @@ Indexes can be redefined in place; old entries are removed and the new definitio
 ```text
 cargo run -p recolith-cli --bin recolith -- catalog alter-index --bucket-id 1 --index-id 1 --name by-name --kind equality --field 1
 ```
+
+### Bucket Placements
+
+Catalog definitions and `CATALOG_APPLY` can carry placement entries that assign a bucket to a backend with an affinity group; the placement always covers the bucket's full partition range:
+
+```toml
+[[placements]]
+bucket_id = 1
+backend_id = 3
+affinity_group = "us-east"
+```
+
+Applying the identical placement again is a no-op, a different backend for the same bucket returns `CONFLICT`, and a placement for an unknown bucket is rejected. Keyspace drops cascade placements.
+
+The server process is configured with `[placement].local_backend_id` (default `0`). Write paths — `DOC_PUT`, `DOC_DELETE`, counter increments, and `BUCKET_PUT` / `BUCKET_DELETE` — resolve each target bucket's placement and reject the operation with `FAILED_PRECONDITION` when the bucket is placed on a different backend; unplaced buckets are always writable, and multi-fragment writes are rejected as a whole when any target bucket is remote (such operations need explicit workflows once distribution exists). Reads, the TTL reaper, index backfill, and migration rewrites are not placement-checked so the node can always repair its local data.
 
 ## Offline Migration
 

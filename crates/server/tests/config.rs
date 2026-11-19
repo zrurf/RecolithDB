@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use recolith_server::{Config, ConfigError, StorageSettings};
+use recolith_server::{Config, ConfigError, StorageSettings, WorkflowExecution};
 
 fn temp_dir(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("recolith-config-{label}-{}", std::process::id()));
@@ -40,6 +40,13 @@ directory = "backups"
 [ttl]
 sweep_interval_secs = 5
 batch_size = 25
+
+[observability]
+slow_query_threshold_ms = 100
+
+[workflow]
+execution = "async"
+step_timeout_ms = 2500
 "#,
     )
     .expect("write config");
@@ -66,6 +73,9 @@ batch_size = 25
     );
     assert_eq!(config.ttl.sweep_interval_secs, 5);
     assert_eq!(config.ttl.batch_size, 25);
+    assert_eq!(config.observability.slow_query_threshold_ms, 100);
+    assert_eq!(config.workflow.execution, WorkflowExecution::Async);
+    assert_eq!(config.workflow.step_timeout_ms, 2500);
 
     assert_eq!(config.server.max_connections, 32);
     let server = config.server_config().expect("server config");
@@ -196,6 +206,32 @@ revoked_tokens_file = "revoked.toml"
 }
 
 #[test]
+fn allows_disabling_slow_operation_logging() {
+    let dir = temp_dir("slow-log-off");
+    let config_path = dir.join("recolith.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+listen = "127.0.0.1:7420"
+
+[storage]
+backend = "memory"
+
+[observability]
+slow_query_threshold_ms = 0
+"#,
+    )
+    .expect("write config");
+
+    let config = Config::load(&config_path).expect("load config");
+    let server = config.server_config().expect("server config");
+    assert_eq!(server.slow_query_threshold_ms, 0);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn rejects_zero_ttl_batch_size_when_sweeping() {
     let dir = temp_dir("ttl-batch");
     let config_path = dir.join("recolith.toml");
@@ -286,6 +322,79 @@ roles_file = "roles.toml"
         Config::load(&config_path),
         Err(ConfigError::Invalid(_))
     ));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn workflow_settings_default_to_sync_and_five_seconds() {
+    let dir = temp_dir("workflow-default");
+    let config_path = dir.join("recolith.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+listen = "127.0.0.1:7420"
+
+[storage]
+backend = "memory"
+"#,
+    )
+    .expect("write config");
+
+    let config = Config::load(&config_path).expect("load config");
+    assert_eq!(config.workflow.execution, WorkflowExecution::Sync);
+    assert_eq!(config.workflow.step_timeout_ms, 5_000);
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn rejects_unknown_workflow_settings() {
+    let dir = temp_dir("workflow-unknown");
+    let config_path = dir.join("recolith.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+listen = "127.0.0.1:7420"
+
+[storage]
+backend = "memory"
+
+[workflow]
+unknown = true
+"#,
+    )
+    .expect("write config");
+
+    let error = Config::load(&config_path).expect_err("reject unknown field");
+    assert!(error.to_string().contains("unknown field"));
+
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn loads_placement_settings() {
+    let dir = temp_dir("placement");
+    let config_path = dir.join("recolith.toml");
+    fs::write(
+        &config_path,
+        r#"
+[server]
+listen = "127.0.0.1:7420"
+
+[storage]
+backend = "memory"
+
+[placement]
+local_backend_id = 7
+"#,
+    )
+    .expect("write config");
+
+    let config = Config::load(&config_path).expect("load config");
+    assert_eq!(config.placement.local_backend_id, 7);
 
     let _ = fs::remove_dir_all(dir);
 }

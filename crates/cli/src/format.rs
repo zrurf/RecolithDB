@@ -1,8 +1,8 @@
 use recolith_protocol::messages::{
-    AggregateColumn, AggregateFunction, AggregateResponse, BackupResponse, CollectionMetadata,
-    DocumentResult, ExplainFilterOp, ExplainResponse, FragmentCardinality, FragmentMetadata,
-    FragmentResult, IndexKind, SchemaScalarType, SchemaType, Value, explain_response, schema_type,
-    value,
+    AggregateColumn, AggregateFunction, AggregateResponse, BackupResponse, BucketRecord,
+    CollectionMetadata, DocumentResult, ExplainFilterOp, ExplainResponse, FragmentCardinality,
+    FragmentMetadata, FragmentResult, IndexKind, SchemaScalarType, SchemaType, Value,
+    WorkflowStatusResponse, explain_response, schema_type, value,
 };
 
 use crate::hex;
@@ -249,6 +249,71 @@ pub fn format_backup(response: &BackupResponse) -> String {
     )
 }
 
+/// Formats one workflow's state and per-step results.
+#[must_use]
+pub fn format_workflow(response: &WorkflowStatusResponse) -> String {
+    let mut output = format!(
+        "workflow {} ({}, step {})\n",
+        response.id,
+        workflow_state(response.state),
+        response.current_step
+    );
+    if !response.error.is_empty() {
+        output.push_str(&format!("error: {}\n", response.error));
+    }
+    for (index, step) in response.steps.iter().enumerate() {
+        output.push_str(&format!(
+            "  step {} ({}): {}\n",
+            index + 1,
+            workflow_step_status(step.status),
+            workflow_step_kind(step.step.as_ref())
+        ));
+    }
+
+    output
+}
+
+pub(crate) fn workflow_state(state: i32) -> &'static str {
+    match recolith_protocol::messages::WorkflowState::try_from(state) {
+        Ok(recolith_protocol::messages::WorkflowState::Pending) => "pending",
+        Ok(recolith_protocol::messages::WorkflowState::Running) => "running",
+        Ok(recolith_protocol::messages::WorkflowState::Compensating) => "compensating",
+        Ok(recolith_protocol::messages::WorkflowState::Completed) => "completed",
+        Ok(recolith_protocol::messages::WorkflowState::Compensated) => "compensated",
+        Ok(recolith_protocol::messages::WorkflowState::Failed) => "failed",
+        Ok(recolith_protocol::messages::WorkflowState::Abandoned) => "abandoned",
+        Ok(recolith_protocol::messages::WorkflowState::Unspecified) | Err(_) => "unknown",
+    }
+}
+
+fn workflow_step_status(status: i32) -> &'static str {
+    match recolith_protocol::messages::WorkflowStepStatus::try_from(status) {
+        Ok(recolith_protocol::messages::WorkflowStepStatus::Pending) => "pending",
+        Ok(recolith_protocol::messages::WorkflowStepStatus::Succeeded) => "succeeded",
+        Ok(recolith_protocol::messages::WorkflowStepStatus::Failed) => "failed",
+        Ok(recolith_protocol::messages::WorkflowStepStatus::Compensated) => "compensated",
+        Ok(recolith_protocol::messages::WorkflowStepStatus::Skipped) => "skipped",
+        Ok(recolith_protocol::messages::WorkflowStepStatus::Unspecified) | Err(_) => "unknown",
+    }
+}
+
+fn workflow_step_kind(step: Option<&recolith_protocol::messages::WorkflowStep>) -> &'static str {
+    match step.map(|step| step.kind.as_ref()) {
+        Some(Some(recolith_protocol::messages::workflow_step::Kind::PutDocument(_))) => "put",
+        Some(Some(recolith_protocol::messages::workflow_step::Kind::DeleteDocument(_))) => "delete",
+        Some(Some(recolith_protocol::messages::workflow_step::Kind::IncrementField(_))) => {
+            "increment"
+        }
+        Some(Some(recolith_protocol::messages::workflow_step::Kind::ClaimReservation(_))) => {
+            "claim"
+        }
+        Some(Some(recolith_protocol::messages::workflow_step::Kind::ConfirmReservation(_))) => {
+            "confirm"
+        }
+        _ => "unknown",
+    }
+}
+
 /// Formats aggregate query results.
 #[must_use]
 pub fn format_aggregate(response: &AggregateResponse) -> String {
@@ -481,4 +546,39 @@ fn index_kind(kind: i32) -> &'static str {
         Ok(recolith_protocol::messages::IndexKind::Unique) => "unique",
         Ok(recolith_protocol::messages::IndexKind::Unspecified) | Err(_) => "unknown",
     }
+}
+
+/// Renders one bucket record with its key fields.
+pub fn format_bucket_record(record: &BucketRecord) -> String {
+    let mut output = String::new();
+    if let Some(id) = &record.id {
+        output.push_str(&format!(
+            "bucket {} partition {} fragment {} key=0x{} subkey=0x{}
+",
+            id.bucket_id,
+            id.partition,
+            id.fragment_id,
+            hex::encode(&id.document_key),
+            hex::encode(&id.subkey),
+        ));
+    }
+    output.push_str(&format!(
+        "schema {} v{} commit={}
+",
+        record.schema_id, record.schema_version, record.commit_ts
+    ));
+    for field in &record.fields {
+        output.push_str(&format!(
+            "  {} = {}
+",
+            field.field_id,
+            field
+                .value
+                .as_ref()
+                .map(format_value)
+                .unwrap_or_else(|| "null".to_owned())
+        ));
+    }
+
+    output
 }

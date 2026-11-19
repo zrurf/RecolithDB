@@ -68,6 +68,35 @@ pub fn game_store() -> Arc<DocumentStore<MemoryBackend>> {
             )],
         ))
         .expect("collection");
+    catalog
+        .create_bucket(
+            KeyspaceId::new(1),
+            Bucket::new(
+                BucketId::new(2),
+                "scratch",
+                8,
+                BucketPolicy::Raw,
+                SchemaId::new(1),
+                SchemaVersion::new(1),
+            ),
+        )
+        .expect("raw bucket");
+    catalog
+        .create_keyspace(Keyspace::new(KeyspaceId::new(2), "meta"))
+        .expect("second keyspace");
+    catalog
+        .create_bucket(
+            KeyspaceId::new(2),
+            Bucket::new(
+                BucketId::new(3),
+                "scratch",
+                8,
+                BucketPolicy::Raw,
+                SchemaId::new(1),
+                SchemaVersion::new(1),
+            ),
+        )
+        .expect("ambiguous raw bucket");
 
     Arc::new(DocumentStore::new(
         Arc::new(catalog),
@@ -122,4 +151,13 @@ pub fn profile_put(key: &[u8], name: &str, idempotency: &[u8]) -> DocumentPutReq
         }],
         ttl_seconds: None,
     }
+}
+
+pub fn profile_payload(
+    key: &[u8],
+    name: &str,
+    idempotency: &[u8],
+) -> recolith_protocol::messages::FragmentPayload {
+    let request = profile_put(key, name, idempotency);
+    request.fragments.into_iter().next().expect("fragment")
 }

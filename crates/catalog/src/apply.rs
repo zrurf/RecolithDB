@@ -1,11 +1,26 @@
 //! Additive catalog definition application.
 
-use recolith_common::{BucketId, KeyspaceId};
+use crate::placement::BucketPlacement;
+use recolith_common::{BackendId, BucketId, KeyspaceId};
 use recolith_model::{Bucket, Collection, IndexDefinition, Keyspace};
 use recolith_schema::RecordSchema;
 
 use crate::catalog::Catalog;
 use crate::error::{CatalogError, Result};
+
+/// Placement intent applied against an existing or newly created bucket.
+///
+/// The bucket's partition count is taken from the catalog, so a placement is
+/// always fully covering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlacementChange {
+    /// Bucket to place.
+    pub bucket_id: BucketId,
+    /// Assigned backend.
+    pub backend_id: BackendId,
+    /// Affinity group label.
+    pub affinity_group: String,
+}
 
 /// Additive catalog definitions applied as one validated batch.
 ///
@@ -23,6 +38,8 @@ pub struct CatalogChanges {
     pub collections: Vec<Collection>,
     /// Indexes to create, paired with their bucket.
     pub indexes: Vec<(BucketId, IndexDefinition)>,
+    /// Bucket placements to assign.
+    pub placements: Vec<PlacementChange>,
 }
 
 impl Catalog {
@@ -113,6 +130,28 @@ impl Catalog {
                 return Err(conflict(format!("index {}", index.id())));
             }
             candidate.create_index(*bucket_id, index.clone())?;
+            changed = true;
+        }
+
+        for placement in &changes.placements {
+            let current = candidate.snapshot()?;
+            let bucket = current
+                .buckets
+                .get(&placement.bucket_id)
+                .ok_or(CatalogError::NotFound("bucket"))?;
+            let full = BucketPlacement::new(
+                placement.bucket_id,
+                placement.backend_id,
+                placement.affinity_group.clone(),
+                bucket.partition_count(),
+            );
+            if let Some(existing) = current.placements.get(&placement.bucket_id) {
+                if *existing == full {
+                    continue;
+                }
+                return Err(conflict(format!("placement {}", placement.bucket_id)));
+            }
+            candidate.place_bucket(full)?;
             changed = true;
         }
 

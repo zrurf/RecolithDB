@@ -2,16 +2,19 @@ use std::time::Duration;
 
 use recolith_client::{Client, ClientConfig};
 use recolith_protocol::messages::{
-    AggregateRequest, BackupRequest, CollectionMetadata, DocumentDeleteRequest, DocumentGetRequest,
-    DocumentPutRequest, ExplainRequest, NamedParameter, QueryRequest, QueryStreamRequest,
-    RequestMeta, Value, value,
+    AggregateRequest, BackupRequest, BucketDeleteRequest, BucketGetRequest, BucketPutRequest,
+    BucketRecordId, BucketScanRequest, CollectionMetadata, DocumentDeleteRequest,
+    DocumentGetRequest, DocumentPutRequest, ExplainRequest, FieldValue, NamedParameter,
+    QueryRequest, QueryStreamRequest, RequestMeta, Value, WorkflowCancelRequest,
+    WorkflowListRequest, WorkflowResolveAction, WorkflowResolveRequest, WorkflowStatusRequest,
+    value,
 };
 
-use crate::args::{Args, Command, DocCommand, TokenCommand};
+use crate::args::{Args, BucketCommand, Command, DocCommand, TokenCommand, WorkflowCommand};
 use crate::error::CliError;
 use crate::format::{
-    format_aggregate, format_backup, format_collection, format_document, format_explain,
-    format_fragments_named,
+    format_aggregate, format_backup, format_bucket_record, format_collection, format_document,
+    format_explain, format_fragments_named, format_workflow,
 };
 use crate::hex;
 use crate::metadata;
@@ -199,6 +202,189 @@ pub async fn run(args: Args) -> Result<(), CliError> {
             let collection = describe(&mut client, &collection, keyspace.as_deref()).await?;
             print!("{}", format_collection(&collection));
         }
+        Command::Workflow { command } => match command {
+            WorkflowCommand::Status { id } => {
+                let response = client
+                    .workflow_status(&WorkflowStatusRequest {
+                        meta: None,
+                        id: id.clone(),
+                    })
+                    .await?;
+                print!("{}", format_workflow(&response));
+            }
+            WorkflowCommand::Cancel { id } => {
+                let response = client
+                    .cancel_workflow(&WorkflowCancelRequest {
+                        meta: None,
+                        id: id.clone(),
+                    })
+                    .await?;
+                print!("{}", format_workflow(&response));
+            }
+            WorkflowCommand::List { limit, start_after } => {
+                let response = client
+                    .workflow_list(&WorkflowListRequest {
+                        meta: None,
+                        start_after: start_after.clone().unwrap_or_default(),
+                        limit,
+                    })
+                    .await?;
+                if response.workflows.is_empty() {
+                    println!("workflows: none");
+                }
+                for workflow in &response.workflows {
+                    println!(
+                        "workflow {} (step {}) {}",
+                        workflow.id,
+                        workflow.current_step,
+                        crate::format::workflow_state(workflow.state)
+                    );
+                }
+            }
+            WorkflowCommand::Resolve { id, action } => {
+                let resolve_action = match action.as_str() {
+                    "retry" => WorkflowResolveAction::Retry,
+                    _ => WorkflowResolveAction::Abandon,
+                };
+                let response = client
+                    .resolve_workflow(&WorkflowResolveRequest {
+                        meta: None,
+                        id: id.clone(),
+                        action: resolve_action as i32,
+                    })
+                    .await?;
+                if let Some(workflow) = &response.workflow {
+                    print!("{}", format_workflow(workflow));
+                }
+            }
+        },
+        Command::Bucket { command } => match command {
+            BucketCommand::Get {
+                keyspace,
+                bucket,
+                partition,
+                fragment,
+                key_hex,
+                key,
+                subkey_hex,
+                subkey,
+            } => {
+                let (bucket_id, bucket_name) = bucket_reference(&bucket);
+                let request = BucketGetRequest {
+                    meta: None,
+                    id: Some(BucketRecordId {
+                        bucket_id,
+                        partition,
+                        fragment_id: fragment,
+                        document_key: key_bytes(key_hex.as_deref(), key.as_deref())?,
+                        subkey: subkey_bytes(subkey_hex.as_deref(), subkey.as_deref())?,
+                        keyspace: keyspace.clone(),
+                        bucket_name,
+                    }),
+                };
+                let response = client.bucket_get(&request).await?;
+                match response.record {
+                    Some(record) => print!("{}", format_bucket_record(&record)),
+                    None => println!("record: absent"),
+                }
+            }
+            BucketCommand::Put {
+                keyspace,
+                bucket,
+                partition,
+                fragment,
+                key_hex,
+                key,
+                subkey_hex,
+                subkey,
+                fields,
+                if_match,
+            } => {
+                let (bucket_id, bucket_name) = bucket_reference(&bucket);
+                let parsed = fields
+                    .iter()
+                    .map(|input| bucket_field(input))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let request = BucketPutRequest {
+                    meta: None,
+                    id: Some(BucketRecordId {
+                        bucket_id,
+                        partition,
+                        fragment_id: fragment,
+                        document_key: key_bytes(key_hex.as_deref(), key.as_deref())?,
+                        subkey: subkey_bytes(subkey_hex.as_deref(), subkey.as_deref())?,
+                        keyspace: keyspace.clone(),
+                        bucket_name,
+                    }),
+                    fields: parsed,
+                    if_match,
+                };
+                let response = client.bucket_put(&request).await?;
+                println!("commit_ts: {}", response.commit_ts);
+            }
+            BucketCommand::Delete {
+                keyspace,
+                bucket,
+                partition,
+                fragment,
+                key_hex,
+                key,
+                subkey_hex,
+                subkey,
+            } => {
+                let (bucket_id, bucket_name) = bucket_reference(&bucket);
+                let request = BucketDeleteRequest {
+                    meta: None,
+                    id: Some(BucketRecordId {
+                        bucket_id,
+                        partition,
+                        fragment_id: fragment,
+                        document_key: key_bytes(key_hex.as_deref(), key.as_deref())?,
+                        subkey: subkey_bytes(subkey_hex.as_deref(), subkey.as_deref())?,
+                        keyspace: keyspace.clone(),
+                        bucket_name,
+                    }),
+                };
+                let response = client.bucket_delete(&request).await?;
+                println!("deleted: {}", response.deleted);
+            }
+            BucketCommand::Scan {
+                keyspace,
+                bucket,
+                partition,
+                fragment,
+                limit,
+                start_after_hex,
+            } => {
+                let (bucket_id, bucket_name) = bucket_reference(&bucket);
+                let start_after = match start_after_hex.as_deref() {
+                    Some(text) => {
+                        crate::hex::decode(text).ok_or_else(|| CliError::InvalidValue {
+                            kind: "start-after-hex",
+                            value: text.to_owned(),
+                        })?
+                    }
+                    None => Vec::new(),
+                };
+                let request = BucketScanRequest {
+                    meta: None,
+                    bucket_id,
+                    partition,
+                    fragment_id: fragment,
+                    start_after,
+                    limit,
+                    keyspace: keyspace.clone(),
+                    bucket_name,
+                };
+                let response = client.bucket_scan(&request).await?;
+                if response.records.is_empty() {
+                    println!("records: none");
+                }
+                for record in &response.records {
+                    print!("{}", format_bucket_record(record));
+                }
+            }
+        },
         Command::Token { .. } => {}
         Command::Catalog { command } => match crate::catalog::request(command)? {
             crate::catalog::CatalogRequest::Apply(request) => {
@@ -233,14 +419,18 @@ pub async fn run(args: Args) -> Result<(), CliError> {
                     projection: Vec::new(),
                 };
                 let response = client.document_get(&request).await?;
-                print!(
-                    "{}",
-                    format_fragments_named(
-                        &response.document_key,
-                        &response.fragments,
-                        &collection
-                    )
-                );
+                if response.fragments.is_empty() {
+                    println!("document: absent or expired");
+                } else {
+                    print!(
+                        "{}",
+                        format_fragments_named(
+                            &response.document_key,
+                            &response.fragments,
+                            &collection
+                        )
+                    );
+                }
             }
             DocCommand::Delete {
                 collection,
@@ -397,5 +587,69 @@ where
     raw.parse().map_err(|_| CliError::InvalidValue {
         kind,
         value: raw.to_owned(),
+    })
+}
+
+/// Splits a bucket reference into an identifier and an optional name.
+///
+/// Numeric references use the identifier form; anything else is treated as a
+/// bucket name resolved by the server.
+fn bucket_reference(bucket: &str) -> (u64, Option<String>) {
+    match bucket.parse::<u64>() {
+        Ok(id) => (id, None),
+        Err(_) => (0, Some(bucket.to_owned())),
+    }
+}
+
+/// Decodes a document key from hexadecimal or UTF-8 text.
+///
+/// # Errors
+///
+/// Returns [`CliError`] when the key is missing or malformed.
+fn key_bytes(key_hex: Option<&str>, key: Option<&str>) -> Result<Vec<u8>, CliError> {
+    if let Some(text) = key_hex {
+        return crate::hex::decode(text).ok_or_else(|| CliError::InvalidValue {
+            kind: "key-hex",
+            value: text.to_owned(),
+        });
+    }
+    key.map(|text| text.as_bytes().to_vec())
+        .ok_or_else(|| CliError::InvalidParameter("a document key is required".to_owned()))
+}
+
+/// Decodes a record subkey from hexadecimal or UTF-8 text.
+///
+/// # Errors
+///
+/// Returns [`CliError`] when the subkey is malformed.
+fn subkey_bytes(subkey_hex: Option<&str>, subkey: Option<&str>) -> Result<Vec<u8>, CliError> {
+    if let Some(text) = subkey_hex {
+        return crate::hex::decode(text).ok_or_else(|| CliError::InvalidValue {
+            kind: "subkey-hex",
+            value: text.to_owned(),
+        });
+    }
+    Ok(subkey
+        .map(|text| text.as_bytes().to_vec())
+        .unwrap_or_default())
+}
+
+/// Parses a bucket field in `field_id=type:value` form.
+///
+/// # Errors
+///
+/// Returns [`CliError`] when the syntax or value is invalid.
+fn bucket_field(input: &str) -> Result<FieldValue, CliError> {
+    let (target, specification) = input
+        .split_once('=')
+        .ok_or_else(|| CliError::InvalidField(input.to_owned()))?;
+    let field_id = target
+        .parse::<u32>()
+        .map_err(|_| CliError::InvalidField(input.to_owned()))?;
+    let kind = parse_typed_value(specification)?;
+
+    Ok(FieldValue {
+        field_id,
+        value: Some(Value { kind: Some(kind) }),
     })
 }

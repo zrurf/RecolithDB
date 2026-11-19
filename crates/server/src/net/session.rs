@@ -2,7 +2,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use prost::Message;
 use recolith_backend::StorageBackend;
@@ -13,11 +13,13 @@ use recolith_protocol::frame::{
     FrameCodec, FrameHeader, HEADER_LEN, PayloadEncoding, VERSION_MAJOR, VERSION_MINOR,
 };
 use recolith_protocol::messages::{
-    AggregateRequest, AuthMethod, AuthResult, BackupRequest, CatalogAlterRequest,
-    CatalogApplyRequest, CatalogDropRequest, DescribeCollectionRequest, DocumentDeleteRequest,
-    DocumentGetRequest, DocumentPutRequest, ErrorResponse, ExplainRequest, GoAway, HelloRequest,
-    PingRequest, PingResponse, QueryChunk, QueryRequest, QueryStreamRequest, SecurityMode,
-    WelcomeResponse, compression_bit, feature, opcode, status,
+    AggregateRequest, AuthMethod, AuthResult, BackupRequest, BucketDeleteRequest, BucketGetRequest,
+    BucketPutRequest, BucketScanRequest, CatalogAlterRequest, CatalogApplyRequest,
+    CatalogDropRequest, DescribeCollectionRequest, DocumentDeleteRequest, DocumentGetRequest,
+    DocumentPutRequest, ErrorResponse, ExplainRequest, GoAway, HelloRequest, PingRequest,
+    PingResponse, QueryChunk, QueryRequest, QueryStreamRequest, SecurityMode, WelcomeResponse,
+    WorkflowCancelRequest, WorkflowListRequest, WorkflowResolveRequest, WorkflowStartRequest,
+    WorkflowStatusRequest, compression_bit, feature, opcode, status,
 };
 use recolith_security::{Principal, unix_seconds};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -25,11 +27,36 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::document::DocumentStore;
 use crate::metrics::ServerMetrics;
 use crate::net::{SERVER_VERSION, ServerConfig};
+use crate::observability::{hex, opcode_name, should_log_slow};
 
-use super::operations::{self, OperationError, OperationResponse};
+use super::operations::{self, OperationDiagnostics, OperationError, OperationResponse};
 
 const DEFAULT_STREAM_CHUNK: u32 = 100;
 const MAX_STREAM_CHUNK: u32 = 1_000;
+
+/// Logs one operation that exceeded the configured slow threshold.
+fn log_slow_operation(
+    config: &ServerConfig,
+    opcode: u16,
+    request_id: u64,
+    elapsed: Duration,
+    status: u16,
+    diagnostics: &OperationDiagnostics,
+) {
+    if !should_log_slow(config.slow_query_threshold_ms, opcode, elapsed) {
+        return;
+    }
+    tracing::warn!(
+        operation = opcode_name(opcode),
+        request_id,
+        duration_ms = elapsed.as_millis() as u64,
+        status,
+        collection = diagnostics.collection.map(|id| id.get()),
+        partition = diagnostics.partition,
+        trace_id = %hex(&diagnostics.trace_id),
+        "slow operation"
+    );
+}
 
 pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + Send>(
     mut stream: S,
@@ -137,7 +164,9 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             | feature::AGGREGATE
             | feature::BACKUP
             | feature::DOCUMENT_DELETE
-            | feature::TTL,
+            | feature::TTL
+            | feature::WORKFLOW
+            | feature::BUCKET_OPS,
         max_frame_size: u32::try_from(max_frame_size).unwrap_or(u32::MAX),
         max_batch_subframes: u32::try_from(max_batch_subframes).unwrap_or(u32::MAX),
         max_batch_bytes: u32::try_from(max_batch_bytes).unwrap_or(u32::MAX),
@@ -232,17 +261,49 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
             | opcode::EXPLAIN
             | opcode::AGGREGATE
             | opcode::BACKUP
+            | opcode::WF_START
+            | opcode::WF_STATUS
+            | opcode::WF_CANCEL
+            | opcode::WF_RESOLVE
+            | opcode::WF_LIST
+            | opcode::BUCKET_GET
+            | opcode::BUCKET_PUT
+            | opcode::BUCKET_DELETE
+            | opcode::BUCKET_SCAN
             | opcode::CATALOG_APPLY
             | opcode::CATALOG_DROP
             | opcode::CATALOG_ALTER => {
                 let started = Instant::now();
-                let outcome =
-                    execute(header.opcode(), body, Arc::clone(&store), principal.clone()).await;
+                let outcome = execute(
+                    header.opcode(),
+                    body,
+                    Arc::clone(&store),
+                    principal.clone(),
+                    Arc::clone(&config.metrics),
+                )
+                .await;
+                let elapsed = started.elapsed();
                 match outcome {
                     Ok(response) => {
+                        log_slow_operation(
+                            &config,
+                            header.opcode(),
+                            header.request_id(),
+                            elapsed,
+                            status::OK,
+                            &response.diagnostics,
+                        );
                         write_operation(&mut stream, &codec, header.request_id(), response).await?;
                     }
                     Err(error) => {
+                        log_slow_operation(
+                            &config,
+                            header.opcode(),
+                            header.request_id(),
+                            elapsed,
+                            error.status(),
+                            &OperationDiagnostics::default(),
+                        );
                         send_error(
                             &mut stream,
                             &codec,
@@ -254,9 +315,7 @@ pub(crate) async fn run<B: StorageBackend, S: AsyncRead + AsyncWrite + Unpin + S
                         .await?;
                     }
                 }
-                config
-                    .metrics
-                    .observe_latency(header.opcode(), started.elapsed());
+                config.metrics.observe_latency(header.opcode(), elapsed);
             }
             opcode::QUERY_STREAM => {
                 handle_query_stream(
@@ -332,6 +391,7 @@ async fn execute<B: StorageBackend>(
     body: Vec<u8>,
     store: Arc<DocumentStore<B>>,
     principal: Principal,
+    metrics: Arc<ServerMetrics>,
 ) -> Result<OperationResponse, OperationError> {
     if opcode == opcode::PING {
         let request = PingRequest::decode(body.as_slice())
@@ -343,6 +403,7 @@ async fn execute<B: StorageBackend>(
         return Ok(OperationResponse {
             opcode: opcode::PONG,
             payload: response.encode_to_vec(),
+            diagnostics: OperationDiagnostics::default(),
         });
     }
 
@@ -381,6 +442,51 @@ async fn execute<B: StorageBackend>(
             let request = BackupRequest::decode(body.as_slice())
                 .map_err(|_| OperationError::invalid("malformed BACKUP payload"))?;
             operations::backup(&store, &principal, request)
+        }
+        opcode::WF_START => {
+            let request = WorkflowStartRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed WF_START payload"))?;
+            operations::workflow_start(&store, &principal, Arc::clone(&metrics), request)
+        }
+        opcode::WF_STATUS => {
+            let request = WorkflowStatusRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed WF_STATUS payload"))?;
+            operations::workflow_status(&store, &principal, request)
+        }
+        opcode::WF_CANCEL => {
+            let request = WorkflowCancelRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed WF_CANCEL payload"))?;
+            operations::workflow_cancel(&store, &principal, &metrics, request)
+        }
+        opcode::WF_RESOLVE => {
+            let request = WorkflowResolveRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed WF_RESOLVE payload"))?;
+            operations::workflow_resolve(&store, &principal, &metrics, request)
+        }
+        opcode::WF_LIST => {
+            let request = WorkflowListRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed WF_LIST payload"))?;
+            operations::workflow_list(&store, &principal, request)
+        }
+        opcode::BUCKET_GET => {
+            let request = BucketGetRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed BUCKET_GET payload"))?;
+            operations::bucket_get(&store, &principal, request)
+        }
+        opcode::BUCKET_PUT => {
+            let request = BucketPutRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed BUCKET_PUT payload"))?;
+            operations::bucket_put(&store, &principal, request)
+        }
+        opcode::BUCKET_DELETE => {
+            let request = BucketDeleteRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed BUCKET_DELETE payload"))?;
+            operations::bucket_delete(&store, &principal, request)
+        }
+        opcode::BUCKET_SCAN => {
+            let request = BucketScanRequest::decode(body.as_slice())
+                .map_err(|_| OperationError::invalid("malformed BUCKET_SCAN payload"))?;
+            operations::bucket_scan(&store, &principal, request)
         }
         opcode::DESCRIBE_COLLECTION => {
             let request = DescribeCollectionRequest::decode(body.as_slice())
@@ -491,11 +597,13 @@ async fn handle_query_stream<B: StorageBackend, W: AsyncWrite + Unpin>(
         let partition = request.partition;
         let rql = request.rql.clone();
         let parameters = request.parameters.clone();
+        let page_meta = request.meta.clone();
         let page_cursor = cursor.clone();
         let outcome = tokio::task::spawn_blocking(move || {
             operations::query_page(
                 &store,
                 &principal,
+                page_meta.as_ref(),
                 partition,
                 &rql,
                 &parameters,
@@ -618,6 +726,9 @@ async fn handle_batch<B: StorageBackend, W: AsyncWrite + Unpin>(
                 | opcode::CATALOG_DROP
                 | opcode::CATALOG_ALTER
                 | opcode::BACKUP
+                | opcode::WF_START
+                | opcode::WF_STATUS
+                | opcode::WF_CANCEL
                 | opcode::QUERY_STREAM
         ) {
             send_error(
@@ -638,6 +749,7 @@ async fn handle_batch<B: StorageBackend, W: AsyncWrite + Unpin>(
             subframe.payload().to_vec(),
             Arc::clone(&store),
             principal.clone(),
+            Arc::clone(&metrics),
         )
         .await
         {

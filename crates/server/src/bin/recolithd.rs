@@ -6,10 +6,11 @@ use std::time::Duration;
 use clap::Parser;
 use recolith_backend::StorageBackend;
 use recolith_catalog::{Catalog, CatalogError, load_catalog, save_catalog};
+use recolith_common::BackendId;
 use recolith_server::{
     BootstrapError, Config, ConfigError, DocumentStore, MetricsSnapshot, ServerConfig,
-    ServerMetrics, StorageSettings, load_bootstrap, migration_in_progress, run_ttl_reaper,
-    serve_with_shutdown,
+    ServerMetrics, StorageSettings, WorkflowExecution, load_bootstrap, migration_in_progress,
+    run_ttl_reaper, serve_with_shutdown,
 };
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -117,7 +118,32 @@ async fn run_backend<B: StorageBackend>(
         tracing::info!(path = %directory.display(), "online backup directory ready");
         store = store.with_backup_directory(directory.clone());
     }
+    if config.workflow.step_timeout_ms > 0 {
+        store = store.with_workflow_step_timeout(std::time::Duration::from_millis(
+            config.workflow.step_timeout_ms,
+        ));
+    }
+    if config.workflow.execution == WorkflowExecution::Async {
+        store = store.with_workflow_default_async(true);
+    }
+    store = store.with_local_backend_id(BackendId::new(config.placement.local_backend_id));
     let store = Arc::new(store);
+    // Resume interrupted workflows until drained; each pass handles up to
+    // 1,000 records, and the loop is capped so a poison record cannot hang
+    // startup forever.
+    let mut resumed_total = 0_u64;
+    for _ in 0..1_000 {
+        let resumed = store
+            .resume_workflows(1_000)
+            .map_err(|error| RuntimeError::Message(error.to_string()))?;
+        resumed_total += u64::from(resumed);
+        if resumed == 0 {
+            break;
+        }
+    }
+    if resumed_total > 0 {
+        tracing::info!(workflows = resumed_total, "interrupted workflows resumed");
+    }
     let listener = TcpListener::bind(server_config.listen).await?;
     let address = listener.local_addr()?;
     let metrics = server_config.metrics();
@@ -201,19 +227,40 @@ fn log_metrics(snapshot: &MetricsSnapshot) {
         writes = snapshot.document_writes,
         queries = snapshot.queries,
         metadata = snapshot.metadata_requests,
+        deletes = snapshot.document_deletes,
+        explains = snapshot.explanations,
+        aggregates = snapshot.aggregates,
+        backups = snapshot.backups,
         ping_p50_us = snapshot.ping_latency.p50_micros,
         ping_p99_us = snapshot.ping_latency.p99_micros,
         read_p50_us = snapshot.document_read_latency.p50_micros,
         read_p99_us = snapshot.document_read_latency.p99_micros,
         write_p50_us = snapshot.document_write_latency.p50_micros,
         write_p99_us = snapshot.document_write_latency.p99_micros,
+        delete_p50_us = snapshot.document_delete_latency.p50_micros,
+        delete_p99_us = snapshot.document_delete_latency.p99_micros,
         query_p50_us = snapshot.query_latency.p50_micros,
         query_p99_us = snapshot.query_latency.p99_micros,
+        explain_p50_us = snapshot.explain_latency.p50_micros,
+        explain_p99_us = snapshot.explain_latency.p99_micros,
+        aggregate_p50_us = snapshot.aggregate_latency.p50_micros,
+        aggregate_p99_us = snapshot.aggregate_latency.p99_micros,
+        backup_p50_us = snapshot.backup_latency.p50_micros,
+        backup_p99_us = snapshot.backup_latency.p99_micros,
         metadata_p50_us = snapshot.metadata_latency.p50_micros,
         metadata_p99_us = snapshot.metadata_latency.p99_micros,
         ttl_sweeps = snapshot.ttl_sweeps,
         expired_documents = snapshot.expired_documents,
         ttl_errors = snapshot.ttl_errors,
+        workflows_started = snapshot.workflows_started,
+        workflows_completed = snapshot.workflows_completed,
+        workflows_compensated = snapshot.workflows_compensated,
+        workflows_failed = snapshot.workflows_failed,
+        bucket_ops = snapshot.bucket_ops,
+        bucket_read_p99_us = snapshot.bucket_get_latency.p99_micros,
+        bucket_write_p99_us = snapshot.bucket_put_latency.p99_micros,
+        bucket_delete_p99_us = snapshot.bucket_delete_latency.p99_micros,
+        bucket_scan_p99_us = snapshot.bucket_scan_latency.p99_micros,
         "server metrics"
     );
 }

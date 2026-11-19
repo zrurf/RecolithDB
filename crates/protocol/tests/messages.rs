@@ -9,10 +9,14 @@ use recolith_protocol::messages::{
     ExplainOrder, ExplainRequest, ExplainResponse, ExplainScanPlan, FieldConversion, FieldMapping,
     FieldValue, FragmentDefinition, FragmentMetadata, FragmentPayload, HelloRequest,
     IndexDefinition, IndexKind, KeyFieldDefinition, KeyFieldMetadata, KeyFieldType,
-    KeyspaceDefinition, NamedParameter, QueryRequest, QueryStreamRequest, RequestMeta,
-    SchemaDefinition, SchemaField, SchemaList, SchemaMigration, SchemaScalarType, SchemaType,
-    SetBucketSchema, Value, catalog_alter_request, catalog_drop_request, compression_bit,
+    KeyspaceDefinition, NamedParameter, PlacementDefinition, QueryRequest, QueryStreamRequest,
+    RequestMeta, SchemaDefinition, SchemaField, SchemaList, SchemaMigration, SchemaScalarType,
+    SchemaType, SetBucketSchema, Value, WorkflowDefinition, WorkflowExecutionMode,
+    WorkflowListRequest, WorkflowPutDocument, WorkflowResolveAction, WorkflowResolveRequest,
+    WorkflowStartRequest, WorkflowStartResponse, WorkflowState, WorkflowStatusResponse,
+    WorkflowStep, catalog_alter_request, catalog_drop_request, compression_bit,
     describe_collection_request, explain_response, feature, field_mapping, schema_type, value,
+    workflow_step,
 };
 
 #[test]
@@ -145,6 +149,7 @@ fn roundtrips_collection_metadata() {
                         name: "name".to_owned(),
                         optional: false,
                         r#type: Some(string_type.clone()),
+                        unique: false,
                     },
                     SchemaField {
                         id: 2,
@@ -155,6 +160,7 @@ fn roundtrips_collection_metadata() {
                                 element: Some(Box::new(string_type)),
                             }))),
                         }),
+                        unique: false,
                     },
                 ],
             }],
@@ -215,6 +221,11 @@ fn roundtrips_catalog_apply_request() {
             name: "by-level".to_owned(),
             kind: IndexKind::Range as i32,
             fields: vec![2],
+        }],
+        placements: vec![PlacementDefinition {
+            bucket_id: 1,
+            backend_id: 3,
+            affinity_group: "us-east".to_owned(),
         }],
     };
 
@@ -386,6 +397,65 @@ fn roundtrips_aggregate_request_and_response() {
     let encoded = response.encode_to_vec();
     let decoded = AggregateResponse::decode(encoded.as_slice()).expect("decode response");
     assert_eq!(decoded, response);
+}
+
+#[test]
+fn roundtrips_workflow_requests_and_responses() {
+    let start = WorkflowStartRequest {
+        meta: Some(RequestMeta {
+            catalog_generation: 2,
+            ..Default::default()
+        }),
+        id: "trade-1".to_owned(),
+        definition: Some(WorkflowDefinition {
+            steps: vec![WorkflowStep {
+                kind: Some(workflow_step::Kind::PutDocument(WorkflowPutDocument {
+                    collection_id: 1,
+                    partition: 0,
+                    document_key: b"player:1".to_vec(),
+                    fragments: Vec::new(),
+                    ttl_seconds: None,
+                })),
+            }],
+        }),
+        execution_mode: WorkflowExecutionMode::Async as i32,
+    };
+    let encoded = start.encode_to_vec();
+    let decoded = WorkflowStartRequest::decode(encoded.as_slice()).expect("decode start");
+    assert_eq!(decoded, start);
+
+    let response = WorkflowStartResponse {
+        workflow: Some(WorkflowStatusResponse {
+            id: "trade-1".to_owned(),
+            state: WorkflowState::Completed as i32,
+            current_step: 1,
+            steps: Vec::new(),
+            error: String::new(),
+            created_at_unix_micros: 100,
+            updated_at_unix_micros: 200,
+        }),
+    };
+    let encoded = response.encode_to_vec();
+    let decoded = WorkflowStartResponse::decode(encoded.as_slice()).expect("decode response");
+    assert_eq!(decoded, response);
+
+    let resolve = WorkflowResolveRequest {
+        meta: None,
+        id: "trade-1".to_owned(),
+        action: WorkflowResolveAction::Retry as i32,
+    };
+    let encoded = resolve.encode_to_vec();
+    let decoded = WorkflowResolveRequest::decode(encoded.as_slice()).expect("decode resolve");
+    assert_eq!(decoded, resolve);
+
+    let list = WorkflowListRequest {
+        meta: None,
+        start_after: "trade-1".to_owned(),
+        limit: 10,
+    };
+    let encoded = list.encode_to_vec();
+    let decoded = WorkflowListRequest::decode(encoded.as_slice()).expect("decode list");
+    assert_eq!(decoded, list);
 }
 
 #[test]

@@ -9,6 +9,7 @@ pub struct Field {
     name: String,
     ty: Type,
     optional: bool,
+    unique: bool,
 }
 
 impl Field {
@@ -20,7 +21,15 @@ impl Field {
             name: name.into(),
             ty,
             optional,
+            unique: false,
         }
+    }
+
+    /// Marks the field as globally unique.
+    #[must_use]
+    pub const fn with_unique(mut self, unique: bool) -> Self {
+        self.unique = unique;
+        self
     }
 
     /// Returns the immutable field ID.
@@ -43,7 +52,13 @@ impl Field {
 
     /// Returns whether the field may be absent.
     #[must_use]
-    pub fn optional(&self) -> bool {
+    pub const fn optional(&self) -> bool {
         self.optional
+    }
+
+    /// Returns whether the field carries a global unique reservation.
+    #[must_use]
+    pub const fn unique(&self) -> bool {
+        self.unique
     }
 }

@@ -5,7 +5,7 @@ use std::fmt;
 use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use recolith_backend::{
     BackendError, KeyRange, ScanOptions, Snapshot, StorageBackend, Transaction, TxnOptions,
@@ -15,17 +15,21 @@ use recolith_catalog::{
     CatalogWrite, save_catalog,
 };
 use recolith_common::{
-    BucketId, CatalogGeneration, CollectionId, CommitTs, FragmentId, IndexId, PartitionId,
+    BackendId, BucketId, CatalogGeneration, CollectionId, CommitTs, FieldId, FragmentId, IndexId,
+    PartitionId, SchemaId, SchemaVersion,
 };
-use recolith_model::{FragmentCardinality, IndexDefinition, IndexKind};
+use recolith_model::{
+    Bucket, BucketPolicy, Fragment, FragmentCardinality, IndexDefinition, IndexKind,
+};
 use recolith_query::{DocumentReadRequest, QueryEngine, QueryError};
-use recolith_schema::{Compatibility, RecordSchema, check_compatibility};
+use recolith_schema::{Compatibility, Field, RecordSchema, check_compatibility};
 use recolith_storage::{
-    DocumentFragments, MAX_DOCUMENT_KEY_LEN, RecordData, RecordHeader, StorageError, decode_fields,
-    decode_record, decode_record_key, decode_ttl_index_key, decode_ttl_value, delete_index_entry,
-    encode_bucket_prefix, encode_document_prefix, encode_fields, encode_index_prefix,
-    encode_index_value, encode_record, encode_record_key, encode_ttl_index_key, encode_ttl_key,
-    encode_ttl_value, put_index_entry, put_unique_index_entry, ttl_index_prefix,
+    DocumentFragments, MAX_DOCUMENT_KEY_LEN, RecordData, RecordHeader, StorageError, Value,
+    decode_fields, decode_record, decode_record_key, decode_ttl_index_key, decode_ttl_value,
+    delete_index_entry, encode_bucket_prefix, encode_document_prefix, encode_fields,
+    encode_index_prefix, encode_index_value, encode_partition_prefix, encode_record,
+    encode_record_key, encode_ttl_index_key, encode_ttl_key, encode_ttl_value, put_index_entry,
+    put_unique_index_entry, ttl_index_prefix,
 };
 use recolith_transaction::{
     BatchedCommitClock, FragmentWrite, IndexUpdate, LocalWritePath, TransactionError,
@@ -208,6 +212,17 @@ impl DocumentWrite {
     }
 }
 
+/// Result of one counter increment.
+#[derive(Clone, Debug)]
+pub struct CounterChange {
+    /// Value before the increment.
+    pub before: Value,
+    /// Value after the increment.
+    pub after: Value,
+    /// Whether a retry returned the recorded result instead of applying again.
+    pub deduplicated: bool,
+}
+
 /// Document operation error.
 #[derive(Debug)]
 pub enum DocumentError {
@@ -246,6 +261,20 @@ pub enum DocumentError {
     MigrationRequired,
     /// Record migration failed.
     Migration(MigrationError),
+    /// A unique field changed without a committed or pending reservation.
+    UniqueReservationRequired {
+        /// Qualified field name for diagnostics.
+        field: String,
+    },
+    /// The write targets a bucket placed on a different backend.
+    PlacementRejected {
+        /// Placed bucket.
+        bucket: BucketId,
+        /// Backend the bucket is placed on.
+        backend: BackendId,
+        /// Backend the store writes locally.
+        local: BackendId,
+    },
 }
 
 impl fmt::Display for DocumentError {
@@ -279,6 +308,18 @@ impl fmt::Display for DocumentError {
             Self::InvalidRequest(message) => {
                 write!(formatter, "invalid document request: {message}")
             }
+            Self::UniqueReservationRequired { field } => write!(
+                formatter,
+                "field {field} requires a global unique reservation"
+            ),
+            Self::PlacementRejected {
+                bucket,
+                backend,
+                local,
+            } => write!(
+                formatter,
+                "bucket {bucket} is placed on backend {backend}; local backend is {local}"
+            ),
         }
     }
 }
@@ -339,6 +380,9 @@ pub struct DocumentStore<B: StorageBackend> {
     ddl_lock: Mutex<()>,
     backup_directory: Option<PathBuf>,
     backup_lock: Mutex<()>,
+    workflow_step_timeout: Option<Duration>,
+    workflow_default_async: bool,
+    local_backend_id: BackendId,
 }
 
 impl<B: StorageBackend> DocumentStore<B> {
@@ -353,7 +397,23 @@ impl<B: StorageBackend> DocumentStore<B> {
             ddl_lock: Mutex::new(()),
             backup_directory: None,
             backup_lock: Mutex::new(()),
+            workflow_step_timeout: None,
+            workflow_default_async: false,
+            local_backend_id: BackendId::new(0),
         }
+    }
+
+    /// Sets the backend identifier this store writes locally.
+    #[must_use]
+    pub const fn with_local_backend_id(mut self, backend_id: BackendId) -> Self {
+        self.local_backend_id = backend_id;
+        self
+    }
+
+    /// Returns the backend identifier this store writes locally.
+    #[must_use]
+    pub const fn local_backend_id(&self) -> BackendId {
+        self.local_backend_id
     }
 
     /// Sets the directory used by online logical backups.
@@ -361,6 +421,38 @@ impl<B: StorageBackend> DocumentStore<B> {
     pub fn with_backup_directory(mut self, directory: impl Into<PathBuf>) -> Self {
         self.backup_directory = Some(directory.into());
         self
+    }
+
+    /// Sets the per-step timeout enforced at step boundaries.
+    #[must_use]
+    pub fn with_workflow_step_timeout(mut self, timeout: Duration) -> Self {
+        self.workflow_step_timeout = Some(timeout);
+        self
+    }
+
+    /// Makes asynchronous execution the default for `WF_START`.
+    #[must_use]
+    pub fn with_workflow_default_async(mut self, default_async: bool) -> Self {
+        self.workflow_default_async = default_async;
+        self
+    }
+
+    /// Returns the configured per-step timeout, if any.
+    #[must_use]
+    pub const fn workflow_step_timeout(&self) -> Option<Duration> {
+        self.workflow_step_timeout
+    }
+
+    /// Returns whether `WF_START` runs asynchronously by default.
+    #[must_use]
+    pub const fn workflow_default_async(&self) -> bool {
+        self.workflow_default_async
+    }
+
+    /// Returns the backing backend for internal subsystems.
+    #[must_use]
+    pub(crate) fn backend(&self) -> &B {
+        &self.backend
     }
 
     /// Returns the current catalog generation.
@@ -690,6 +782,7 @@ impl<B: StorageBackend> DocumentStore<B> {
                     bucket.partition_count()
                 )));
             }
+            check_bucket_placement(&snapshot, bucket.id(), self.local_backend_id)?;
             match fragment.cardinality() {
                 FragmentCardinality::One if !fragment_request.subkey.is_empty() => {
                     return Err(DocumentError::InvalidRequest(format!(
@@ -761,7 +854,11 @@ impl<B: StorageBackend> DocumentStore<B> {
                 }
                 None => None,
             };
-            let mut write = FragmentWrite::new(target.key, target.schema, target.data.clone());
+            let mut write = FragmentWrite::new(
+                target.key.clone(),
+                target.schema.clone(),
+                target.data.clone(),
+            );
             for index in &target.indexes {
                 let old_values = match &old {
                     Some(data) => encoded_index_values(index, data)?,
@@ -781,6 +878,16 @@ impl<B: StorageBackend> DocumentStore<B> {
             if let Some(expected) = target.if_match {
                 write = write.with_if_match(expected);
             }
+            enforce_unique_reservations(
+                &mut path,
+                &target.schema,
+                request.collection,
+                request.partition,
+                &request.document_key,
+                old.as_ref(),
+                &target.data,
+                current_micros(),
+            )?;
             writes.push(write);
         }
         let commit_ts = self.clock.reserve(self.backend.as_ref())?;
@@ -821,7 +928,7 @@ impl<B: StorageBackend> DocumentStore<B> {
         partition: PartitionId,
         document_key: &[u8],
     ) -> Result<bool, DocumentError> {
-        self.delete_document_inner(collection_id, partition, document_key, None)
+        self.delete_document_inner(collection_id, partition, document_key, None, true)
     }
 
     /// Deletes a document only when its expiry still matches and has passed.
@@ -838,11 +945,15 @@ impl<B: StorageBackend> DocumentStore<B> {
         expected_expiry_micros: u64,
         now_micros: u64,
     ) -> Result<bool, DocumentError> {
+        // The expiry reaper is internal maintenance: it must delete records
+        // regardless of the bucket's placement so the node can repair its
+        // local data.
         self.delete_document_inner(
             collection_id,
             partition,
             document_key,
             Some((expected_expiry_micros, now_micros)),
+            false,
         )
     }
 
@@ -852,6 +963,7 @@ impl<B: StorageBackend> DocumentStore<B> {
         partition: PartitionId,
         document_key: &[u8],
         expiration: Option<(u64, u64)>,
+        placement_check: bool,
     ) -> Result<bool, DocumentError> {
         let _gate = self.data_gate.read().map_err(|_| lock_error())?;
         let snapshot = self.catalog().snapshot()?;
@@ -882,6 +994,9 @@ impl<B: StorageBackend> DocumentStore<B> {
                     bucket.id(),
                     bucket.partition_count()
                 )));
+            }
+            if placement_check {
+                check_bucket_placement(&snapshot, bucket.id(), self.local_backend_id)?;
             }
             snapshot
                 .schemas
@@ -960,6 +1075,26 @@ impl<B: StorageBackend> DocumentStore<B> {
                     }
                 }
                 path.delete_fragment(&key, &updates)?;
+                for field in record_schema.fields() {
+                    if !field.unique() {
+                        continue;
+                    }
+                    if let Some(value) = data.get(field.id()) {
+                        let key = reservation_key(record_schema.id(), field.id(), value)?;
+                        if let Some(reservation) = path
+                            .get_raw(&key)?
+                            .and_then(|value| decode_reservation_record(&value))
+                            && owner_matches(
+                                &reservation.owner,
+                                collection_id,
+                                partition,
+                                document_key,
+                            )
+                        {
+                            path.delete_raw(&key);
+                        }
+                    }
+                }
                 deleted = true;
             }
         }
@@ -1047,6 +1182,843 @@ impl<B: StorageBackend> DocumentStore<B> {
         Ok(())
     }
 
+    /// Atomically increments a numeric field of a `one` fragment.
+    ///
+    /// The document must exist and the field must be `i64` or `u64`. The value
+    /// is read and written in one transaction, so concurrent increments are
+    /// serialized by the backend. An optional idempotency binding deduplicates
+    /// workflow step retries and returns the recorded result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] for unknown metadata, a missing document or
+    /// field, out-of-range results, or backend failures.
+    #[allow(clippy::too_many_arguments)]
+    pub fn increment_field(
+        &self,
+        collection_id: CollectionId,
+        partition: PartitionId,
+        document_key: &[u8],
+        fragment_id: FragmentId,
+        field_id: FieldId,
+        delta: i64,
+        idempotency: Option<(&[u8], [u8; 32])>,
+    ) -> Result<CounterChange, DocumentError> {
+        let _gate = self.data_gate.read().map_err(|_| lock_error())?;
+        let snapshot = self.catalog().snapshot()?;
+        let collection = snapshot
+            .collections
+            .get(&collection_id)
+            .ok_or(DocumentError::UnknownCollection(collection_id))?;
+        if delta == 0 {
+            return Err(DocumentError::InvalidRequest(
+                "counter delta must not be zero".to_owned(),
+            ));
+        }
+        let fragment = collection
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.id() == fragment_id)
+            .ok_or(DocumentError::UnknownFragment(fragment_id))?;
+        if fragment.cardinality() != FragmentCardinality::One {
+            return Err(DocumentError::InvalidRequest(format!(
+                "fragment {fragment_id} must be one cardinality for counters"
+            )));
+        }
+        let bucket = snapshot
+            .buckets
+            .get(&fragment.bucket_id())
+            .ok_or(DocumentError::MissingMetadata("bucket"))?;
+        if partition.get() >= bucket.partition_count() {
+            return Err(DocumentError::InvalidRequest(format!(
+                "partition {} is outside bucket {} with {} partitions",
+                partition,
+                bucket.id(),
+                bucket.partition_count()
+            )));
+        }
+        check_bucket_placement(&snapshot, bucket.id(), self.local_backend_id)?;
+        let schema = snapshot
+            .schemas
+            .schemas
+            .get(&(bucket.schema_id(), bucket.schema_version()))
+            .ok_or(DocumentError::MissingMetadata("schema"))?;
+        let field = schema
+            .field(field_id)
+            .ok_or(DocumentError::MissingMetadata("field"))?;
+        if !matches!(
+            field.ty(),
+            recolith_schema::Type::I64 | recolith_schema::Type::U64
+        ) {
+            return Err(DocumentError::InvalidRequest(format!(
+                "field {} is not an i64 or u64 counter",
+                field.name()
+            )));
+        }
+        let key = encode_record_key(bucket.id(), partition, document_key, fragment_id, &[]);
+        let indexes: Vec<&IndexDefinition> = snapshot
+            .indexes
+            .get(&bucket.id())
+            .map(|indexes| indexes.values().collect())
+            .unwrap_or_default();
+
+        let mut path =
+            LocalWritePath::begin_unclocked(self.backend.as_ref(), TxnOptions::default())?;
+        if let Some((idempotency_key, request_hash)) = idempotency
+            && let Some(record) = path.get_raw(idempotency_key)?
+        {
+            if record.first() != Some(&WORKFLOW_DEDUP_VERSION) || record.len() != 65 {
+                return Err(DocumentError::InvalidRequest(
+                    "malformed workflow dedup record".to_owned(),
+                ));
+            }
+            if record[1..33] != request_hash {
+                return Err(DocumentError::IdempotencyConflict);
+            }
+            let before = i128::from_be_bytes(record[33..49].try_into().expect("16 bytes"));
+            let after = i128::from_be_bytes(record[49..65].try_into().expect("16 bytes"));
+            path.rollback();
+
+            return Ok(CounterChange {
+                before: counter_value(field.ty(), before)?,
+                after: counter_value(field.ty(), after)?,
+                deduplicated: true,
+            });
+        }
+
+        let Some(frame) = path.get_raw(&key)? else {
+            path.rollback();
+
+            return Err(DocumentError::InvalidRequest(
+                "counter document does not exist".to_owned(),
+            ));
+        };
+        let record = decode_record(&frame)?;
+        let record_schema = record_schema(&snapshot, schema, record.header())?;
+        let mut data = decode_fields(&record_schema, record.payload())?;
+        let current = data
+            .get(field_id)
+            .cloned()
+            .ok_or(DocumentError::InvalidRequest(format!(
+                "field {} is missing",
+                field.name()
+            )))?;
+        let before = counter_i128(&current)?;
+        let after = before
+            .checked_add(i128::from(delta))
+            .ok_or(DocumentError::InvalidRequest(format!(
+                "counter field {} overflows",
+                field.name()
+            )))?;
+        let new_value = counter_value(field.ty(), after)?;
+        let old_data = data.clone();
+        data.insert(field_id, new_value.clone());
+
+        let mut write = FragmentWrite::new(key.clone(), record_schema.clone(), data.clone());
+        for index in &indexes {
+            let old_values = encoded_index_values(index, &old_data)?;
+            let new_values = encoded_index_values(index, &data)?;
+            if old_values == new_values {
+                continue;
+            }
+            write = write.with_index(IndexUpdate::new(
+                index.id(),
+                old_values,
+                new_values,
+                index.kind() == IndexKind::Unique,
+            ));
+        }
+        let commit_ts = self.clock.reserve(self.backend.as_ref())?;
+        path.write_fragments_at(&[write], commit_ts)?;
+        if let Some((idempotency_key, request_hash)) = idempotency {
+            let mut payload = Vec::with_capacity(65);
+            payload.push(WORKFLOW_DEDUP_VERSION);
+            payload.extend_from_slice(&request_hash);
+            payload.extend_from_slice(&before.to_be_bytes());
+            payload.extend_from_slice(&after.to_be_bytes());
+            path.put_raw(idempotency_key, payload);
+        }
+        path.commit()?;
+
+        Ok(CounterChange {
+            before: current,
+            after: new_value,
+            deduplicated: false,
+        })
+    }
+
+    /// Claims a global unique reservation (`TCC try`).
+    ///
+    /// The reservation is created in the `Reserved` state with a TTL when the
+    /// value is free. Re-claiming by the same owner is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] when the value is held by another owner or the
+    /// backend fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_reservation(
+        &self,
+        schema_id: SchemaId,
+        field_id: FieldId,
+        value: &Value,
+        owner_collection: CollectionId,
+        partition: PartitionId,
+        owner_key: &[u8],
+        ttl_seconds: u64,
+        idempotency: Option<(&[u8], [u8; 32])>,
+    ) -> Result<(), DocumentError> {
+        let _gate = self.data_gate.read().map_err(|_| lock_error())?;
+        let mut path =
+            LocalWritePath::begin_unclocked(self.backend.as_ref(), TxnOptions::default())?;
+        if let Some((idempotency_key, request_hash)) = idempotency
+            && let Some(record) = path.get_raw(idempotency_key)?
+        {
+            if record.len() != 33 || record.first() != Some(&WORKFLOW_DEDUP_VERSION) {
+                return Err(DocumentError::InvalidRequest(
+                    "malformed workflow dedup record".to_owned(),
+                ));
+            }
+            if record[1..33] != request_hash {
+                return Err(DocumentError::IdempotencyConflict);
+            }
+            path.rollback();
+
+            return Ok(());
+        }
+        let key = reservation_key(schema_id, field_id, value)?;
+        let now = current_micros();
+        let existing = path
+            .get_raw(&key)?
+            .and_then(|value| decode_reservation_record(&value));
+        match existing {
+            Some(record) => {
+                let live = record.state == RESERVATION_STATE_COMMITTED
+                    || (record.state == RESERVATION_STATE_RESERVED
+                        && (record.expires_at_micros == 0 || record.expires_at_micros > now));
+                if !owner_matches(&record.owner, owner_collection, partition, owner_key) && live {
+                    path.rollback();
+
+                    return Err(DocumentError::InvalidRequest(
+                        "unique value is reserved by another document".to_owned(),
+                    ));
+                }
+                if record.state == RESERVATION_STATE_RESERVED {
+                    let expires_at = ttl_expiry(now, ttl_seconds)?;
+                    let refreshed = ReservationRecord {
+                        state: RESERVATION_STATE_RESERVED,
+                        expires_at_micros: expires_at,
+                        owner: ReservationOwner {
+                            collection: owner_collection,
+                            partition,
+                            document_key: owner_key.to_vec(),
+                        },
+                    };
+                    path.put_raw(&key, encode_reservation_record(&refreshed));
+                }
+            }
+            None => {
+                let expires_at = ttl_expiry(now, ttl_seconds)?;
+                let record = ReservationRecord {
+                    state: RESERVATION_STATE_RESERVED,
+                    expires_at_micros: expires_at,
+                    owner: ReservationOwner {
+                        collection: owner_collection,
+                        partition,
+                        document_key: owner_key.to_vec(),
+                    },
+                };
+                path.put_raw(&key, encode_reservation_record(&record));
+            }
+        }
+        if let Some((idempotency_key, request_hash)) = idempotency {
+            let mut payload = Vec::with_capacity(33);
+            payload.push(WORKFLOW_DEDUP_VERSION);
+            payload.extend_from_slice(&request_hash);
+            path.put_raw(idempotency_key, payload);
+        }
+        path.commit()?;
+
+        Ok(())
+    }
+
+    /// Marks a reservation `Committed` (`TCC confirm`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] when the reservation is missing, held by
+    /// another owner, or the backend fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn confirm_reservation(
+        &self,
+        schema_id: SchemaId,
+        field_id: FieldId,
+        value: &Value,
+        owner_collection: CollectionId,
+        partition: PartitionId,
+        owner_key: &[u8],
+        idempotency: Option<(&[u8], [u8; 32])>,
+    ) -> Result<(), DocumentError> {
+        let _gate = self.data_gate.read().map_err(|_| lock_error())?;
+        let mut path =
+            LocalWritePath::begin_unclocked(self.backend.as_ref(), TxnOptions::default())?;
+        if let Some((idempotency_key, request_hash)) = idempotency
+            && let Some(record) = path.get_raw(idempotency_key)?
+        {
+            if record.len() != 33 || record.first() != Some(&WORKFLOW_DEDUP_VERSION) {
+                return Err(DocumentError::InvalidRequest(
+                    "malformed workflow dedup record".to_owned(),
+                ));
+            }
+            if record[1..33] != request_hash {
+                return Err(DocumentError::IdempotencyConflict);
+            }
+            path.rollback();
+
+            return Ok(());
+        }
+        let key = reservation_key(schema_id, field_id, value)?;
+        let Some(record) = path
+            .get_raw(&key)?
+            .and_then(|value| decode_reservation_record(&value))
+        else {
+            path.rollback();
+
+            return Err(DocumentError::InvalidRequest(
+                "unique reservation does not exist".to_owned(),
+            ));
+        };
+        if !owner_matches(&record.owner, owner_collection, partition, owner_key) {
+            path.rollback();
+
+            return Err(DocumentError::InvalidRequest(
+                "unique reservation is owned by another document".to_owned(),
+            ));
+        }
+        if record.state == RESERVATION_STATE_RESERVED {
+            let committed = ReservationRecord {
+                state: RESERVATION_STATE_COMMITTED,
+                expires_at_micros: 0,
+                owner: ReservationOwner {
+                    collection: owner_collection,
+                    partition,
+                    document_key: owner_key.to_vec(),
+                },
+            };
+            path.put_raw(&key, encode_reservation_record(&committed));
+        }
+        if let Some((idempotency_key, request_hash)) = idempotency {
+            let mut payload = Vec::with_capacity(33);
+            payload.push(WORKFLOW_DEDUP_VERSION);
+            payload.extend_from_slice(&request_hash);
+            path.put_raw(idempotency_key, payload);
+        }
+        path.commit()?;
+
+        Ok(())
+    }
+
+    /// Releases a reservation owned by one document (`TCC cancel`).
+    ///
+    /// A missing reservation is treated as already released.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] for backend failures.
+    pub fn release_reservation(
+        &self,
+        schema_id: SchemaId,
+        field_id: FieldId,
+        value: &Value,
+        owner_collection: CollectionId,
+        partition: PartitionId,
+        owner_key: &[u8],
+    ) -> Result<bool, DocumentError> {
+        let _gate = self.data_gate.read().map_err(|_| lock_error())?;
+        let mut path =
+            LocalWritePath::begin_unclocked(self.backend.as_ref(), TxnOptions::default())?;
+        let key = reservation_key(schema_id, field_id, value)?;
+        let released = path
+            .get_raw(&key)?
+            .and_then(|value| decode_reservation_record(&value))
+            .is_some_and(|record| {
+                owner_matches(&record.owner, owner_collection, partition, owner_key)
+            });
+        if released {
+            path.delete_raw(&key);
+            path.commit()?;
+        } else {
+            path.rollback();
+        }
+
+        Ok(released)
+    }
+
+    /// Deletes expired `Reserved` reservations in bounded batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] for backend failures.
+    pub fn sweep_expired_reservations(
+        &self,
+        now_micros: u64,
+        limit: usize,
+    ) -> Result<u64, DocumentError> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let snapshot = self.backend().snapshot()?;
+        let entries = snapshot.scan(
+            &KeyRange::prefix(RESERVATION_PREFIX),
+            ScanOptions {
+                limit: Some(limit),
+                reverse: false,
+            },
+        )?;
+        let mut deleted = 0_u64;
+        let mut transaction = self.backend.begin(TxnOptions::default())?;
+        for (key, value) in entries {
+            let Some(record) = decode_reservation_record(&value) else {
+                continue;
+            };
+            if record.state == RESERVATION_STATE_RESERVED
+                && record.expires_at_micros != 0
+                && record.expires_at_micros <= now_micros
+            {
+                transaction.delete(&key);
+                deleted = deleted.saturating_add(1);
+            }
+        }
+        if deleted > 0 {
+            transaction.commit()?;
+        } else {
+            transaction.rollback();
+        }
+
+        Ok(deleted)
+    }
+
+    /// Repairs orphaned unique reservations in bounded batches.
+    ///
+    /// Expired `Reserved` records whose owner document already carries the
+    /// reserved value are confirmed; every other record whose owner document
+    /// is missing or no longer holds the value is released.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] for backend failures.
+    pub fn reconcile_reservations(
+        &self,
+        now_micros: u64,
+        limit: usize,
+    ) -> Result<ReconcileStats, DocumentError> {
+        if limit == 0 {
+            return Ok(ReconcileStats::default());
+        }
+        let _gate = self.data_gate.read().map_err(|_| lock_error())?;
+        let snapshot = self.backend().snapshot()?;
+        let catalog_snapshot = self.catalog().snapshot()?;
+        let entries = snapshot.scan(
+            &KeyRange::prefix(RESERVATION_PREFIX),
+            ScanOptions {
+                limit: Some(limit),
+                reverse: false,
+            },
+        )?;
+
+        let mut stats = ReconcileStats::default();
+        let mut transaction = self.backend.begin(TxnOptions::default())?;
+        for (key, value) in entries {
+            let Some((schema_id, field_id, normalized, record)) =
+                decode_reservation_entry(&key, &value)
+            else {
+                continue;
+            };
+            stats.checked = stats.checked.saturating_add(1);
+
+            let holds = owner_document_holds_value(
+                &snapshot,
+                &catalog_snapshot,
+                schema_id,
+                field_id,
+                record.owner.collection,
+                record.owner.partition,
+                &record.owner.document_key,
+                &normalized,
+            );
+            let expired = record.state == RESERVATION_STATE_RESERVED
+                && record.expires_at_micros != 0
+                && record.expires_at_micros <= now_micros;
+
+            match record.state {
+                RESERVATION_STATE_RESERVED => match holds {
+                    // The owner document already carries the reserved value:
+                    // confirm the claim.
+                    Some(true) => {
+                        let committed = ReservationRecord {
+                            state: RESERVATION_STATE_COMMITTED,
+                            expires_at_micros: 0,
+                            owner: record.owner,
+                        };
+                        transaction.put(&key, encode_reservation_record(&committed));
+                        stats.confirmed = stats.confirmed.saturating_add(1);
+                    }
+                    // Expired without the value: release.
+                    Some(false) if expired => {
+                        transaction.delete(&key);
+                        stats.released = stats.released.saturating_add(1);
+                    }
+                    // Still a pending claim; leave it alone.
+                    _ => {
+                        stats.unchanged = stats.unchanged.saturating_add(1);
+                    }
+                },
+                RESERVATION_STATE_COMMITTED => match holds {
+                    // The owner document still holds the value: healthy.
+                    Some(true) => {
+                        stats.unchanged = stats.unchanged.saturating_add(1);
+                    }
+                    // The document no longer holds the value: orphaned.
+                    Some(false) => {
+                        transaction.delete(&key);
+                        stats.released = stats.released.saturating_add(1);
+                    }
+                    // Undeterminable (many fragment, decode failure): leave.
+                    None => {
+                        stats.unchanged = stats.unchanged.saturating_add(1);
+                    }
+                },
+                _ => {
+                    stats.unchanged = stats.unchanged.saturating_add(1);
+                }
+            }
+        }
+        if stats.confirmed > 0 || stats.released > 0 {
+            transaction.commit()?;
+        } else {
+            transaction.rollback();
+        }
+
+        Ok(stats)
+    }
+
+    /// Reads one record directly from a bucket.
+    ///
+    /// Allowed under every bucket policy; the record is returned without
+    /// document assembly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] for unknown metadata or storage failures.
+    pub fn bucket_get(
+        &self,
+        bucket_id: BucketId,
+        partition: PartitionId,
+        fragment_id: FragmentId,
+        document_key: &[u8],
+        subkey: &[u8],
+    ) -> Result<Option<BucketRecordData>, DocumentError> {
+        let _gate = self.read_guard()?;
+        let snapshot = self.catalog().snapshot()?;
+        let (bucket, schema) = bucket_with_schema(&snapshot, bucket_id)?;
+        validate_bucket_partition(bucket, partition)?;
+        bucket_fragment_cardinality(&snapshot, bucket, fragment_id)?;
+        let key = encode_record_key(bucket.id(), partition, document_key, fragment_id, subkey);
+        let storage = self.backend.snapshot()?;
+        let Some(frame) = storage.get(&key)? else {
+            return Ok(None);
+        };
+        let record = decode_record(&frame)?;
+        let decode_schema = decode_schema_for_policy(schema, bucket.policy());
+        let record_schema = record_schema(&snapshot, &decode_schema, record.header())?;
+        let data = decode_fields(&record_schema, record.payload())?;
+
+        Ok(Some(BucketRecordData {
+            schema_id: record_schema.id(),
+            schema_version: record_schema.version(),
+            commit_ts: record.header().commit_ts(),
+            data,
+        }))
+    }
+
+    /// Writes one record directly to a bucket.
+    ///
+    /// `managed` buckets validate fields against the bound schema, maintain
+    /// local indexes, and enforce unique reservations; `raw` buckets skip
+    /// validation, indexes, and unique enforcement; `strict` buckets reject
+    /// direct writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] for unknown metadata, policy rejection,
+    /// schema errors, or backend failures.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bucket_put(
+        &self,
+        bucket_id: BucketId,
+        partition: PartitionId,
+        fragment_id: FragmentId,
+        document_key: &[u8],
+        subkey: &[u8],
+        data: &RecordData,
+        if_match: Option<CommitTs>,
+    ) -> Result<CommitTs, DocumentError> {
+        let _gate = self.data_gate.read().map_err(|_| lock_error())?;
+        let snapshot = self.catalog().snapshot()?;
+        let (bucket, schema) = bucket_with_schema(&snapshot, bucket_id)?;
+        validate_bucket_partition(bucket, partition)?;
+        check_bucket_placement(&snapshot, bucket.id(), self.local_backend_id)?;
+        if bucket.policy() == BucketPolicy::Strict {
+            return Err(policy_rejected(bucket));
+        }
+        let cardinality = bucket_fragment_cardinality(&snapshot, bucket, fragment_id)?;
+        if let Some(cardinality) = cardinality {
+            match cardinality {
+                FragmentCardinality::One if !subkey.is_empty() => {
+                    return Err(DocumentError::InvalidRequest(format!(
+                        "one fragment {fragment_id} requires an empty subkey"
+                    )));
+                }
+                FragmentCardinality::Many if subkey.is_empty() => {
+                    return Err(DocumentError::InvalidRequest(format!(
+                        "many fragment {fragment_id} requires a subkey"
+                    )));
+                }
+                _ => {}
+            }
+        }
+        let indexes: Vec<&IndexDefinition> = snapshot
+            .indexes
+            .get(&bucket.id())
+            .map(|indexes| indexes.values().collect())
+            .unwrap_or_default();
+        let managed = bucket.policy() == BucketPolicy::Managed;
+        let encode_schema = if managed {
+            schema.clone()
+        } else {
+            schema_all_optional(schema)
+        };
+
+        if document_key.is_empty() {
+            return Err(DocumentError::InvalidRequest(
+                "document key must not be empty".to_owned(),
+            ));
+        }
+        if document_key.len() > MAX_DOCUMENT_KEY_LEN {
+            return Err(DocumentError::InvalidRequest(format!(
+                "document key is {} bytes, limit is {MAX_DOCUMENT_KEY_LEN}",
+                document_key.len()
+            )));
+        }
+
+        let key = encode_record_key(bucket.id(), partition, document_key, fragment_id, subkey);
+        let mut path =
+            LocalWritePath::begin_unclocked(self.backend.as_ref(), TxnOptions::default())?;
+        let old = if managed {
+            match path.get_raw(&key)? {
+                Some(frame) => {
+                    let decoded = decode_record(&frame)?;
+                    let record_schema = record_schema(&snapshot, schema, decoded.header())?;
+                    Some(decode_fields(&record_schema, decoded.payload())?)
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
+        let mut write = FragmentWrite::new(key.clone(), encode_schema.clone(), data.clone());
+        if managed {
+            for index in &indexes {
+                let old_values = if let Some(old) = old.as_ref() {
+                    encoded_index_values(index, old)?
+                } else {
+                    None
+                };
+                let new_values = encoded_index_values(index, data)?;
+                if old_values == new_values {
+                    continue;
+                }
+                write = write.with_index(IndexUpdate::new(
+                    index.id(),
+                    old_values,
+                    new_values,
+                    index.kind() == IndexKind::Unique,
+                ));
+            }
+            let owner_collection = collection_for_bucket(&snapshot, bucket.id());
+            if let Some(collection_id) = owner_collection {
+                enforce_unique_reservations(
+                    &mut path,
+                    schema,
+                    collection_id,
+                    partition,
+                    document_key,
+                    old.as_ref(),
+                    data,
+                    current_micros(),
+                )?;
+            }
+        }
+        if let Some(expected) = if_match {
+            write = write.with_if_match(expected);
+        }
+        let commit_ts = self.clock.reserve(self.backend.as_ref())?;
+        path.write_fragments_at(&[write], commit_ts)?;
+        path.commit()?;
+
+        Ok(commit_ts)
+    }
+
+    /// Deletes one record directly from a bucket.
+    ///
+    /// `managed` buckets maintain local indexes on delete; `raw` buckets skip
+    /// index maintenance; `strict` buckets reject direct deletes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] for unknown metadata, policy rejection, or
+    /// backend failures.
+    pub fn bucket_delete(
+        &self,
+        bucket_id: BucketId,
+        partition: PartitionId,
+        fragment_id: FragmentId,
+        document_key: &[u8],
+        subkey: &[u8],
+    ) -> Result<bool, DocumentError> {
+        let _gate = self.data_gate.read().map_err(|_| lock_error())?;
+        let snapshot = self.catalog().snapshot()?;
+        let (bucket, schema) = bucket_with_schema(&snapshot, bucket_id)?;
+        validate_bucket_partition(bucket, partition)?;
+        check_bucket_placement(&snapshot, bucket.id(), self.local_backend_id)?;
+        if bucket.policy() == BucketPolicy::Strict {
+            return Err(policy_rejected(bucket));
+        }
+        bucket_fragment_cardinality(&snapshot, bucket, fragment_id)?;
+        let indexes: Vec<&IndexDefinition> = snapshot
+            .indexes
+            .get(&bucket.id())
+            .map(|indexes| indexes.values().collect())
+            .unwrap_or_default();
+        let managed = bucket.policy() == BucketPolicy::Managed;
+
+        let key = encode_record_key(bucket.id(), partition, document_key, fragment_id, subkey);
+        let mut path =
+            LocalWritePath::begin_unclocked(self.backend.as_ref(), TxnOptions::default())?;
+        let Some(frame) = path.get_raw(&key)? else {
+            path.rollback();
+
+            return Ok(false);
+        };
+        let mut updates = Vec::new();
+        if managed {
+            let decoded = decode_record(&frame)?;
+            let decode_schema = record_schema(&snapshot, schema, decoded.header())?;
+            let old_data = decode_fields(&decode_schema, decoded.payload())?;
+            for index in &indexes {
+                if let Some(old_values) = encoded_index_values(index, &old_data)? {
+                    updates.push(IndexUpdate::new(
+                        index.id(),
+                        Some(old_values),
+                        None,
+                        index.kind() == IndexKind::Unique,
+                    ));
+                }
+            }
+        }
+        path.delete_fragment(&key, &updates)?;
+        path.commit()?;
+
+        Ok(true)
+    }
+
+    /// Scans records of one bucket partition in bounded batches.
+    ///
+    /// Records are ordered by storage key; `fragment_id` filters by fragment,
+    /// and `start_after` is the opaque record key of the last record from the
+    /// previous page.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DocumentError`] for unknown metadata or storage failures.
+    pub fn bucket_scan(
+        &self,
+        bucket_id: BucketId,
+        partition: PartitionId,
+        fragment_id: Option<FragmentId>,
+        start_after: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, BucketRecordData)>, DocumentError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let _gate = self.read_guard()?;
+        let snapshot = self.catalog().snapshot()?;
+        let (bucket, schema) = bucket_with_schema(&snapshot, bucket_id)?;
+        validate_bucket_partition(bucket, partition)?;
+
+        let prefix = encode_partition_prefix(bucket.id(), partition);
+        let end = KeyRange::prefix(&prefix).end_bound().clone();
+        let start = match start_after {
+            Some(last) => Bound::Excluded(last.to_vec()),
+            None => Bound::Included(prefix.clone()),
+        };
+        let storage = self.backend.snapshot()?;
+        let decode_schema = decode_schema_for_policy(schema, bucket.policy());
+        let mut results = Vec::new();
+        let mut range = KeyRange::new(start, end.clone());
+        loop {
+            let remaining = limit - results.len();
+            let entries = storage.scan(
+                &range,
+                ScanOptions {
+                    limit: Some(remaining.min(BACKFILL_SCAN_ENTRIES)),
+                    reverse: false,
+                },
+            )?;
+            if entries.is_empty() {
+                break;
+            }
+            let last = entries.last().expect("non-empty scan").0.clone();
+            for (key, frame) in entries {
+                let Ok(decoded_key) = decode_record_key(&key) else {
+                    continue;
+                };
+                if let Some(fragment_id) = fragment_id
+                    && decoded_key.fragment() != fragment_id
+                {
+                    continue;
+                }
+                let Ok(record) = decode_record(&frame) else {
+                    continue;
+                };
+                let Ok(record_schema) = record_schema(&snapshot, &decode_schema, record.header())
+                else {
+                    continue;
+                };
+                let Ok(data) = decode_fields(&record_schema, record.payload()) else {
+                    continue;
+                };
+                results.push((
+                    key,
+                    BucketRecordData {
+                        schema_id: record_schema.id(),
+                        schema_version: record_schema.version(),
+                        commit_ts: record.header().commit_ts(),
+                        data,
+                    },
+                ));
+                if results.len() >= limit {
+                    return Ok(results);
+                }
+            }
+            range = KeyRange::new(Bound::Excluded(last), end.clone());
+        }
+
+        Ok(results)
+    }
+
     /// Reads selected fragments of one document.
     ///
     /// # Errors
@@ -1062,6 +2034,12 @@ impl<B: StorageBackend> DocumentStore<B> {
 
 const IDEMPOTENCY_RECORD_VERSION: u8 = 1;
 const IDEMPOTENCY_RECORD_LEN: usize = 1 + 32 + 8;
+const RESERVATION_PREFIX: &[u8] = b"\0recolith/reservation/";
+const RESERVATION_RECORD_VERSION: u8 = 1;
+const RESERVATION_STATE_RESERVED: u8 = 1;
+const RESERVATION_STATE_COMMITTED: u8 = 2;
+/// Version tag for workflow step deduplication records.
+pub(crate) const WORKFLOW_DEDUP_VERSION: u8 = 1;
 const BACKFILL_SCAN_ENTRIES: usize = 1_024;
 const MAX_BACKFILL_ENTRIES: usize = 100_000;
 const MAX_BACKFILL_BYTES: usize = 64 * 1024 * 1024;
@@ -1607,6 +2585,457 @@ fn apply_ttl<B: StorageBackend>(
     );
 
     Ok(())
+}
+
+fn counter_i128(value: &Value) -> Result<i128, DocumentError> {
+    match value {
+        Value::I64(value) => Ok(i128::from(*value)),
+        Value::U64(value) => Ok(i128::from(*value)),
+        _ => Err(DocumentError::InvalidRequest(
+            "counter field is not an i64 or u64".to_owned(),
+        )),
+    }
+}
+
+fn counter_value(ty: &recolith_schema::Type, value: i128) -> Result<Value, DocumentError> {
+    match ty {
+        recolith_schema::Type::I64 => {
+            let value = i64::try_from(value)
+                .map_err(|_| DocumentError::InvalidRequest("counter overflows i64".to_owned()))?;
+            Ok(Value::I64(value))
+        }
+        recolith_schema::Type::U64 => {
+            let value = u64::try_from(value).map_err(|_| {
+                DocumentError::InvalidRequest("counter value out of u64 range".to_owned())
+            })?;
+            Ok(Value::U64(value))
+        }
+        _ => Err(DocumentError::InvalidRequest(
+            "counter field is not an i64 or u64".to_owned(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn enforce_unique_reservations<B: StorageBackend>(
+    path: &mut LocalWritePath<B>,
+    schema: &RecordSchema,
+    collection_id: CollectionId,
+    partition: PartitionId,
+    document_key: &[u8],
+    old: Option<&RecordData>,
+    new: &RecordData,
+    now_micros: u64,
+) -> Result<(), DocumentError> {
+    for field in schema.fields() {
+        if !field.unique() {
+            continue;
+        }
+        let old_value = old.and_then(|data| data.get(field.id()));
+        let new_value = new.get(field.id());
+        let old_normalized = match old_value {
+            Some(value) => Some(normalized_unique_value(value)?),
+            None => None,
+        }
+        .filter(|normalized| !normalized.is_empty());
+        let new_normalized = match new_value {
+            Some(value) => Some(normalized_unique_value(value)?),
+            None => None,
+        }
+        .filter(|normalized| !normalized.is_empty());
+        if old_normalized == new_normalized {
+            continue;
+        }
+        if let Some(value) = new_value {
+            let key = reservation_key(schema.id(), field.id(), value)?;
+            let Some(record) = path
+                .get_raw(&key)?
+                .and_then(|value| decode_reservation_record(&value))
+            else {
+                return Err(DocumentError::UniqueReservationRequired {
+                    field: field.name().to_owned(),
+                });
+            };
+            let live = record.state == RESERVATION_STATE_COMMITTED
+                || (record.state == RESERVATION_STATE_RESERVED
+                    && (record.expires_at_micros == 0 || record.expires_at_micros > now_micros));
+            if !owner_matches(&record.owner, collection_id, partition, document_key) || !live {
+                return Err(DocumentError::UniqueReservationRequired {
+                    field: field.name().to_owned(),
+                });
+            }
+        }
+        if let Some(value) = old_value {
+            let key = reservation_key(schema.id(), field.id(), value)?;
+            if let Some(record) = path
+                .get_raw(&key)?
+                .and_then(|value| decode_reservation_record(&value))
+                && owner_matches(&record.owner, collection_id, partition, document_key)
+            {
+                path.delete_raw(&key);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Result of one reservation reconciliation pass.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReconcileStats {
+    /// Reservations examined.
+    pub checked: u64,
+    /// Pending claims confirmed because the owner document holds the value.
+    pub confirmed: u64,
+    /// Orphaned reservations released.
+    pub released: u64,
+    /// Reservations left untouched.
+    pub unchanged: u64,
+}
+
+fn decode_reservation_entry(
+    key: &[u8],
+    value: &[u8],
+) -> Option<(SchemaId, FieldId, Vec<u8>, ReservationRecord)> {
+    let rest = key.strip_prefix(RESERVATION_PREFIX)?;
+    if rest.len() < 12 {
+        return None;
+    }
+    let schema_id = SchemaId::new(u64::from_be_bytes(
+        rest[..8].try_into().expect("eight bytes"),
+    ));
+    let field_id = FieldId::new(u32::from_be_bytes(
+        rest[8..12].try_into().expect("four bytes"),
+    ));
+    let normalized = rest[12..].to_vec();
+    let record = decode_reservation_record(value)?;
+
+    Some((schema_id, field_id, normalized, record))
+}
+
+/// Returns whether the owner document holds the reserved value.
+///
+/// `None` means the check is undeterminable (many fragment or decode
+/// failure) and the caller must leave the reservation alone.
+#[allow(clippy::too_many_arguments)]
+fn owner_document_holds_value<S: Snapshot>(
+    snapshot: &S,
+    catalog: &CatalogSnapshot,
+    schema_id: SchemaId,
+    field_id: FieldId,
+    collection_id: CollectionId,
+    partition: PartitionId,
+    document_key: &[u8],
+    normalized: &[u8],
+) -> Option<bool> {
+    let collection = catalog.collections.get(&collection_id)?;
+    let mut target: Option<(FragmentId, BucketId, RecordSchema, FragmentCardinality)> = None;
+    for fragment in collection.fragments() {
+        let bucket = catalog.buckets.get(&fragment.bucket_id())?;
+        if bucket.schema_id() != schema_id {
+            continue;
+        }
+        let schema = catalog
+            .schemas
+            .schemas
+            .get(&(bucket.schema_id(), bucket.schema_version()))?;
+        let Some(field) = schema.field(field_id) else {
+            continue;
+        };
+        if field.unique() {
+            target = Some((
+                fragment.id(),
+                bucket.id(),
+                schema.clone(),
+                fragment.cardinality(),
+            ));
+            break;
+        }
+    }
+    let (fragment_id, bucket_id, schema, cardinality) = target?;
+    if cardinality != FragmentCardinality::One {
+        // Many-fragment unique fields are not reconcilable in v1.
+        return None;
+    }
+    let key = encode_record_key(bucket_id, partition, document_key, fragment_id, &[]);
+    let Some(frame) = snapshot.get(&key).ok()? else {
+        // The owner document does not exist.
+        return Some(false);
+    };
+    let record = decode_record(&frame).ok()?;
+    let record_schema = if record.header().schema_id() == schema.id()
+        && record.header().schema_version() == schema.version()
+    {
+        schema.clone()
+    } else {
+        catalog
+            .schemas
+            .schemas
+            .get(&(schema.id(), record.header().schema_version()))
+            .cloned()?
+    };
+    let data = decode_fields(&record_schema, record.payload()).ok()?;
+    let Some(value) = data.get(field_id) else {
+        return Some(false);
+    };
+    let doc_normalized = normalized_unique_value(value).ok()?;
+
+    Some(doc_normalized == normalized)
+}
+
+/// One directly read bucket record.
+#[derive(Clone, Debug)]
+pub struct BucketRecordData {
+    schema_id: SchemaId,
+    schema_version: SchemaVersion,
+    commit_ts: CommitTs,
+    data: RecordData,
+}
+
+impl BucketRecordData {
+    /// Returns the record schema identifier.
+    #[must_use]
+    pub const fn schema_id(&self) -> SchemaId {
+        self.schema_id
+    }
+
+    /// Returns the record schema version.
+    #[must_use]
+    pub const fn schema_version(&self) -> SchemaVersion {
+        self.schema_version
+    }
+
+    /// Returns the record commit timestamp.
+    #[must_use]
+    pub const fn commit_ts(&self) -> CommitTs {
+        self.commit_ts
+    }
+
+    /// Returns the decoded fields.
+    #[must_use]
+    pub const fn data(&self) -> &RecordData {
+        &self.data
+    }
+}
+
+fn bucket_with_schema(
+    snapshot: &CatalogSnapshot,
+    bucket_id: BucketId,
+) -> Result<(&Bucket, &RecordSchema), DocumentError> {
+    let bucket = snapshot
+        .buckets
+        .get(&bucket_id)
+        .ok_or(DocumentError::MissingMetadata("bucket"))?;
+    let schema = snapshot
+        .schemas
+        .schemas
+        .get(&(bucket.schema_id(), bucket.schema_version()))
+        .ok_or(DocumentError::MissingMetadata("schema"))?;
+
+    Ok((bucket, schema))
+}
+
+fn validate_bucket_partition(bucket: &Bucket, partition: PartitionId) -> Result<(), DocumentError> {
+    if partition.get() >= bucket.partition_count() {
+        return Err(partition_error(partition, bucket));
+    }
+
+    Ok(())
+}
+
+fn placement_rejected(bucket: BucketId, backend: BackendId, local: BackendId) -> DocumentError {
+    DocumentError::PlacementRejected {
+        bucket,
+        backend,
+        local,
+    }
+}
+
+fn check_bucket_placement(
+    snapshot: &CatalogSnapshot,
+    bucket_id: BucketId,
+    local_backend: BackendId,
+) -> Result<(), DocumentError> {
+    if let Some(placement) = snapshot.placements.get(&bucket_id)
+        && placement.backend_id() != local_backend
+    {
+        return Err(placement_rejected(
+            bucket_id,
+            placement.backend_id(),
+            local_backend,
+        ));
+    }
+
+    Ok(())
+}
+
+fn partition_error(partition: PartitionId, bucket: &Bucket) -> DocumentError {
+    DocumentError::InvalidRequest(format!(
+        "partition {} is outside bucket {} with {} partitions",
+        partition,
+        bucket.id(),
+        bucket.partition_count()
+    ))
+}
+
+fn policy_rejected(bucket: &Bucket) -> DocumentError {
+    DocumentError::InvalidRequest(format!(
+        "bucket {} is strict; use the document API",
+        bucket.name()
+    ))
+}
+
+/// Returns the fragment cardinality for collection-owned buckets, `None` for
+/// standalone buckets, and an error when an owned bucket does not contain the
+/// requested fragment.
+fn bucket_fragment_cardinality(
+    snapshot: &CatalogSnapshot,
+    bucket: &Bucket,
+    fragment_id: FragmentId,
+) -> Result<Option<FragmentCardinality>, DocumentError> {
+    for collection in snapshot.collections.values() {
+        let on_bucket: Vec<&Fragment> = collection
+            .fragments()
+            .iter()
+            .filter(|fragment| fragment.bucket_id() == bucket.id())
+            .collect();
+        if on_bucket.is_empty() {
+            continue;
+        }
+        let Some(fragment) = on_bucket
+            .iter()
+            .find(|fragment| fragment.id() == fragment_id)
+        else {
+            return Err(DocumentError::UnknownFragment(fragment_id));
+        };
+
+        return Ok(Some(fragment.cardinality()));
+    }
+
+    Ok(None)
+}
+
+/// Returns the collection that owns a bucket, if any.
+fn collection_for_bucket(snapshot: &CatalogSnapshot, bucket_id: BucketId) -> Option<CollectionId> {
+    snapshot.collections.values().find_map(|collection| {
+        collection
+            .fragments()
+            .iter()
+            .find(|fragment| fragment.bucket_id() == bucket_id)
+            .map(|_| collection.id())
+    })
+}
+
+/// Returns the schema used to decode a record: the bound schema for managed
+/// buckets, or an all-optional variant for raw buckets whose writes skipped
+/// required-field validation.
+fn decode_schema_for_policy(schema: &RecordSchema, policy: BucketPolicy) -> RecordSchema {
+    if policy == BucketPolicy::Managed {
+        schema.clone()
+    } else {
+        schema_all_optional(schema)
+    }
+}
+
+/// Clones a schema with every field marked optional.
+///
+/// Raw bucket writes skip required-field validation but keep the bound
+/// schema's field IDs and types for framing.
+fn schema_all_optional(schema: &RecordSchema) -> RecordSchema {
+    let fields = schema
+        .fields()
+        .iter()
+        .map(|field| Field::new(field.id(), field.name(), field.ty().clone(), true))
+        .collect();
+    RecordSchema::new(schema.id(), schema.version(), schema.name(), fields)
+}
+
+pub(crate) fn normalized_unique_value(value: &Value) -> Result<Vec<u8>, DocumentError> {
+    match value {
+        Value::String(text) => Ok(text.trim().to_lowercase().into_bytes()),
+        other => encode_index_value(other)
+            .map(|encoded| encoded[1..].to_vec())
+            .map_err(Into::into),
+    }
+}
+
+fn reservation_key(
+    schema_id: SchemaId,
+    field_id: FieldId,
+    value: &Value,
+) -> Result<Vec<u8>, DocumentError> {
+    let mut key = Vec::new();
+    key.extend_from_slice(RESERVATION_PREFIX);
+    key.extend_from_slice(&schema_id.get().to_be_bytes());
+    key.extend_from_slice(&field_id.get().to_be_bytes());
+    key.extend_from_slice(&normalized_unique_value(value)?);
+
+    Ok(key)
+}
+
+struct ReservationOwner {
+    collection: CollectionId,
+    partition: PartitionId,
+    document_key: Vec<u8>,
+}
+
+struct ReservationRecord {
+    state: u8,
+    expires_at_micros: u64,
+    owner: ReservationOwner,
+}
+
+fn encode_reservation_record(record: &ReservationRecord) -> Vec<u8> {
+    let mut value = Vec::new();
+    value.push(RESERVATION_RECORD_VERSION);
+    value.push(record.state);
+    value.extend_from_slice(&record.expires_at_micros.to_be_bytes());
+    value.extend_from_slice(&record.owner.collection.get().to_be_bytes());
+    value.extend_from_slice(&record.owner.partition.get().to_be_bytes());
+    value.extend_from_slice(&(record.owner.document_key.len() as u32).to_be_bytes());
+    value.extend_from_slice(&record.owner.document_key);
+
+    value
+}
+
+fn decode_reservation_record(value: &[u8]) -> Option<ReservationRecord> {
+    if value.first() != Some(&RESERVATION_RECORD_VERSION) || value.len() < 22 {
+        return None;
+    }
+    let state = value[1];
+    let expires_at_micros = u64::from_be_bytes(value[2..10].try_into().expect("eight bytes"));
+    let collection = CollectionId::new(u64::from_be_bytes(
+        value[10..18].try_into().expect("eight bytes"),
+    ));
+    let partition = PartitionId::new(u32::from_be_bytes(
+        value[18..22].try_into().expect("four bytes"),
+    ));
+    let owner_len = u32::from_be_bytes(value[22..26].try_into().expect("four bytes")) as usize;
+    let document_key = value.get(26..26 + owner_len)?.to_vec();
+    if state != RESERVATION_STATE_RESERVED && state != RESERVATION_STATE_COMMITTED {
+        return None;
+    }
+
+    Some(ReservationRecord {
+        state,
+        expires_at_micros,
+        owner: ReservationOwner {
+            collection,
+            partition,
+            document_key,
+        },
+    })
+}
+
+fn owner_matches(
+    owner: &ReservationOwner,
+    collection: CollectionId,
+    partition: PartitionId,
+    document_key: &[u8],
+) -> bool {
+    owner.collection == collection
+        && owner.partition == partition
+        && owner.document_key == document_key
 }
 
 fn encoded_index_values(

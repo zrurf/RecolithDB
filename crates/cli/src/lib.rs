@@ -10,10 +10,12 @@ mod hex;
 mod metadata;
 mod token;
 
-pub use args::{Args, CatalogCommand, Command, DocCommand, TokenCommand};
+pub use args::{
+    Args, BucketCommand, CatalogCommand, Command, DocCommand, TokenCommand, WorkflowCommand,
+};
 pub use command::{parse_field, parse_parameter, run};
 pub use error::CliError;
 pub use format::{
     format_aggregate, format_backup, format_collection, format_document, format_explain,
-    format_fragments, format_fragments_named, format_value,
+    format_fragments, format_fragments_named, format_value, format_workflow,
 };

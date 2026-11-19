@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use recolith_backend::StorageBackend;
 use recolith_catalog::{CatalogAlter, CatalogChanges, CatalogDrop, CatalogError, CatalogSnapshot};
 use recolith_common::{
-    BucketId, CatalogGeneration, CollectionId, CommitTs, FieldId, FragmentId, IndexId, KeyspaceId,
-    PartitionId, SchemaId, SchemaVersion,
+    BackendId, BucketId, CatalogGeneration, CollectionId, CommitTs, FieldId, FragmentId, IndexId,
+    KeyspaceId, PartitionId, SchemaId, SchemaVersion,
 };
 use recolith_model::{
     Bucket, BucketPolicy, Collection, DocumentKeySchema, Fragment, FragmentCardinality,
@@ -15,14 +16,19 @@ use recolith_model::{
 };
 use recolith_protocol::messages::{
     self, AggregateColumn, AggregateRequest, AggregateResponse, AggregateRow, BackupRequest,
-    BackupResponse, BucketDefinition, CatalogAlterRequest, CatalogAlterResponse,
+    BackupResponse, BucketDefinition, BucketDeleteRequest, BucketDeleteResponse, BucketGetRequest,
+    BucketGetResponse, BucketPutRequest, BucketPutResponse, BucketRecord, BucketRecordId,
+    BucketScanRequest, BucketScanResponse, CatalogAlterRequest, CatalogAlterResponse,
     CatalogApplyRequest, CatalogApplyResponse, CatalogDropRequest, CatalogDropResponse,
     DescribeCollectionRequest, DescribeCollectionResponse, DocumentDeleteRequest,
     DocumentDeleteResponse, DocumentGetRequest, DocumentGetResponse, DocumentPutRequest,
     DocumentPutResponse, DocumentResult, ExplainDocumentPlan, ExplainDrive, ExplainFieldSelection,
     ExplainFilter, ExplainFilterOp, ExplainIndex, ExplainKeyFilter, ExplainOrder, ExplainRequest,
     ExplainResponse, ExplainScanPlan, FragmentVersion, QueryRequest, QueryResponse, RequestMeta,
-    describe_collection_request, explain_response, opcode, status, value,
+    WorkflowCancelRequest, WorkflowDefinition, WorkflowExecutionMode, WorkflowListRequest,
+    WorkflowListResponse, WorkflowRecord, WorkflowResolveRequest, WorkflowResolveResponse,
+    WorkflowStartRequest, WorkflowStartResponse, WorkflowStatusRequest, WorkflowStatusResponse,
+    WorkflowSummary, describe_collection_request, explain_response, opcode, status, value,
 };
 use recolith_query::error::QueryError;
 use recolith_query::{
@@ -32,16 +38,21 @@ use recolith_query::{
 };
 use recolith_schema::parse_record;
 use recolith_security::{Action, AuthTarget, Principal};
-use recolith_storage::StorageError;
+use recolith_storage::{StorageError, decode_record_key};
 use recolith_transaction::TransactionError;
 use sha2::{Digest, Sha256};
 
+use recolith_catalog::apply::PlacementChange;
+
 use crate::backup::BackupError;
 use crate::document::{
-    DocumentError, DocumentStore, DocumentWrite, FragmentWriteRequest, Idempotency,
+    BucketRecordData, DocumentError, DocumentStore, DocumentWrite, FragmentWriteRequest,
+    Idempotency,
 };
+use crate::metrics::ServerMetrics;
 use crate::migration::{FieldMapping, MigrationConversion, MigrationSource, SchemaMigration};
 use crate::query_cursor;
+use crate::workflow::{WorkflowError, step_target_collection};
 
 use super::convert;
 
@@ -94,6 +105,38 @@ impl std::error::Error for OperationError {}
 pub(crate) struct OperationResponse {
     pub(crate) opcode: u16,
     pub(crate) payload: Vec<u8>,
+    pub(crate) diagnostics: OperationDiagnostics,
+}
+
+/// Request-scoped fields used by slow-operation logging.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct OperationDiagnostics {
+    pub(crate) collection: Option<CollectionId>,
+    pub(crate) partition: Option<u32>,
+    pub(crate) trace_id: Vec<u8>,
+}
+
+impl OperationDiagnostics {
+    fn from_meta(meta: Option<&RequestMeta>) -> Self {
+        Self {
+            trace_id: meta.map(|meta| meta.trace_id.clone()).unwrap_or_default(),
+            ..Self::default()
+        }
+    }
+
+    fn with_collection(mut self, collection: CollectionId) -> Self {
+        self.collection = Some(collection);
+        self
+    }
+
+    fn with_partition(mut self, partition: u32) -> Self {
+        self.partition = Some(partition);
+        self
+    }
+}
+
+fn diagnostics(meta: Option<&RequestMeta>) -> OperationDiagnostics {
+    OperationDiagnostics::from_meta(meta)
 }
 
 pub(crate) fn document_delete<B: StorageBackend>(
@@ -117,6 +160,303 @@ pub(crate) fn document_delete<B: StorageBackend>(
     Ok(OperationResponse {
         opcode: opcode::DOC_DELETE,
         payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref())
+            .with_collection(collection_id)
+            .with_partition(request.partition),
+    })
+}
+
+/// Authorizes a bucket operation through the owning collection, falling back
+/// to the bucket name for standalone buckets.
+fn authorize_bucket(
+    snapshot: &CatalogSnapshot,
+    principal: &Principal,
+    bucket: &Bucket,
+    action: Action,
+) -> Result<(), OperationError> {
+    let keyspace_id = snapshot
+        .bucket_keyspaces
+        .get(&bucket.id())
+        .copied()
+        .ok_or_else(|| OperationError::internal("bucket references an unknown keyspace"))?;
+    let keyspace = snapshot
+        .keyspaces
+        .get(&keyspace_id)
+        .ok_or_else(|| OperationError::internal("bucket references a missing keyspace"))?;
+    let collection_name = snapshot
+        .collections
+        .values()
+        .find(|collection| {
+            collection
+                .fragments()
+                .iter()
+                .any(|fragment| fragment.bucket_id() == bucket.id())
+        })
+        .map(|collection| collection.name());
+    let target = AuthTarget {
+        keyspace: keyspace.name(),
+        collection: collection_name.unwrap_or(bucket.name()),
+    };
+    if principal.authorize(target, action) {
+        Ok(())
+    } else {
+        Err(OperationError::new(
+            status::PERMISSION_DENIED,
+            "permission denied",
+        ))
+    }
+}
+
+fn resolve_bucket(
+    snapshot: &CatalogSnapshot,
+    bucket_id: BucketId,
+) -> Result<&Bucket, OperationError> {
+    snapshot
+        .buckets
+        .get(&bucket_id)
+        .ok_or_else(|| OperationError::new(status::NOT_FOUND, "bucket was not found"))
+}
+
+fn bucket_request_id(
+    snapshot: &CatalogSnapshot,
+    id: &BucketRecordId,
+) -> Result<(BucketId, PartitionId, FragmentId), OperationError> {
+    let bucket_id = resolve_bucket_reference(
+        snapshot,
+        id.bucket_id,
+        id.keyspace.as_deref(),
+        id.bucket_name.as_deref(),
+    )?;
+    if id.document_key.is_empty() {
+        return Err(OperationError::invalid("document key must not be empty"));
+    }
+
+    Ok((
+        bucket_id,
+        PartitionId::new(id.partition),
+        FragmentId::new(id.fragment_id),
+    ))
+}
+
+/// Resolves a bucket by identifier, or by name when the identifier is zero.
+///
+/// Name resolution may be narrowed to one keyspace; an unknown or ambiguous
+/// name is reported as not found.
+fn resolve_bucket_reference(
+    snapshot: &CatalogSnapshot,
+    bucket_id: u64,
+    keyspace: Option<&str>,
+    bucket_name: Option<&str>,
+) -> Result<BucketId, OperationError> {
+    if bucket_id != 0 {
+        return Ok(BucketId::new(bucket_id));
+    }
+    let Some(name) = bucket_name.filter(|name| !name.is_empty()) else {
+        return Err(OperationError::invalid(
+            "bucket id or bucket name is required",
+        ));
+    };
+    let keyspace_id = match keyspace.filter(|name| !name.is_empty()) {
+        Some(keyspace_name) => {
+            let keyspace = snapshot
+                .keyspaces
+                .values()
+                .find(|keyspace| keyspace.name() == keyspace_name);
+            match keyspace {
+                Some(keyspace) => Some(keyspace.id()),
+                None => {
+                    return Err(OperationError::new(
+                        status::NOT_FOUND,
+                        "bucket was not found",
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
+    let matches: Vec<BucketId> = snapshot
+        .buckets
+        .values()
+        .filter(|bucket| bucket.name() == name)
+        .map(|bucket| bucket.id())
+        .filter(|candidate| {
+            keyspace_id.is_none_or(|keyspace_id| {
+                snapshot.bucket_keyspaces.get(candidate) == Some(&keyspace_id)
+            })
+        })
+        .collect();
+    match matches.as_slice() {
+        [bucket_id] => Ok(*bucket_id),
+        _ => Err(OperationError::new(
+            status::NOT_FOUND,
+            "bucket was not found",
+        )),
+    }
+}
+
+fn bucket_record_to_wire(id: &BucketRecordId, record: &BucketRecordData) -> BucketRecord {
+    BucketRecord {
+        id: Some(id.clone()),
+        schema_id: record.schema_id().get(),
+        schema_version: record.schema_version().get(),
+        commit_ts: record.commit_ts().get(),
+        fields: convert::record_to_wire(record.data()),
+    }
+}
+
+pub(crate) fn bucket_get<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    request: BucketGetRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    let id = request
+        .id
+        .as_ref()
+        .ok_or_else(|| OperationError::invalid("bucket record id is required"))?;
+    let snapshot = store.catalog_snapshot().map_err(map_document)?;
+    let (bucket_id, partition, fragment_id) = bucket_request_id(&snapshot, id)?;
+    let bucket = resolve_bucket(&snapshot, bucket_id)?;
+    authorize_bucket(&snapshot, principal, bucket, Action::Read)?;
+    let record = store
+        .bucket_get(
+            bucket_id,
+            partition,
+            fragment_id,
+            &id.document_key,
+            &id.subkey,
+        )
+        .map_err(map_document)?;
+    let mut wire_id = id.clone();
+    wire_id.bucket_id = bucket_id.get();
+    let response = BucketGetResponse {
+        record: record.map(|record| bucket_record_to_wire(&wire_id, &record)),
+    };
+
+    Ok(OperationResponse {
+        opcode: opcode::BUCKET_GET,
+        payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref()).with_partition(id.partition),
+    })
+}
+
+pub(crate) fn bucket_put<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    request: BucketPutRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    let id = request
+        .id
+        .as_ref()
+        .ok_or_else(|| OperationError::invalid("bucket record id is required"))?;
+    let snapshot = store.catalog_snapshot().map_err(map_document)?;
+    let (bucket_id, partition, fragment_id) = bucket_request_id(&snapshot, id)?;
+    let data = convert::record_from_wire(&request.fields)
+        .map_err(|error| OperationError::new(status::INVALID_REQUEST, error.to_string()))?;
+    let bucket = resolve_bucket(&snapshot, bucket_id)?;
+    authorize_bucket(&snapshot, principal, bucket, Action::Write)?;
+    let commit_ts = store
+        .bucket_put(
+            bucket_id,
+            partition,
+            fragment_id,
+            &id.document_key,
+            &id.subkey,
+            &data,
+            request.if_match.map(CommitTs::new),
+        )
+        .map_err(map_document)?;
+    let response = BucketPutResponse {
+        commit_ts: commit_ts.get(),
+    };
+
+    Ok(OperationResponse {
+        opcode: opcode::BUCKET_PUT,
+        payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref()).with_partition(id.partition),
+    })
+}
+
+pub(crate) fn bucket_delete<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    request: BucketDeleteRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    let id = request
+        .id
+        .as_ref()
+        .ok_or_else(|| OperationError::invalid("bucket record id is required"))?;
+    let snapshot = store.catalog_snapshot().map_err(map_document)?;
+    let (bucket_id, partition, fragment_id) = bucket_request_id(&snapshot, id)?;
+    let bucket = resolve_bucket(&snapshot, bucket_id)?;
+    authorize_bucket(&snapshot, principal, bucket, Action::Write)?;
+    let deleted = store
+        .bucket_delete(
+            bucket_id,
+            partition,
+            fragment_id,
+            &id.document_key,
+            &id.subkey,
+        )
+        .map_err(map_document)?;
+    let response = BucketDeleteResponse { deleted };
+
+    Ok(OperationResponse {
+        opcode: opcode::BUCKET_DELETE,
+        payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref()).with_partition(id.partition),
+    })
+}
+
+pub(crate) fn bucket_scan<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    request: BucketScanRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    let snapshot = store.catalog_snapshot().map_err(map_document)?;
+    let bucket_id = resolve_bucket_reference(
+        &snapshot,
+        request.bucket_id,
+        request.keyspace.as_deref(),
+        request.bucket_name.as_deref(),
+    )?;
+    let bucket = resolve_bucket(&snapshot, bucket_id)?;
+    authorize_bucket(&snapshot, principal, bucket, Action::Read)?;
+    let records = store
+        .bucket_scan(
+            bucket_id,
+            PartitionId::new(request.partition),
+            request.fragment_id.map(FragmentId::new),
+            (!request.start_after.is_empty()).then_some(request.start_after.as_slice()),
+            request.limit.min(MAX_QUERY_LIMIT as u32) as usize,
+        )
+        .map_err(map_document)?;
+    let response = BucketScanResponse {
+        records: records
+            .iter()
+            .filter_map(|(key, record)| {
+                let decoded = decode_record_key(key).ok()?;
+                let id = BucketRecordId {
+                    bucket_id: decoded.head().bucket().get(),
+                    partition: decoded.head().partition().get(),
+                    fragment_id: decoded.fragment().get(),
+                    document_key: decoded.document_key().to_vec(),
+                    subkey: decoded.subkey().to_vec(),
+                    keyspace: None,
+                    bucket_name: None,
+                };
+                Some(bucket_record_to_wire(&id, record))
+            })
+            .collect(),
+    };
+
+    Ok(OperationResponse {
+        opcode: opcode::BUCKET_SCAN,
+        payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref()).with_partition(request.partition),
     })
 }
 
@@ -161,6 +501,9 @@ pub(crate) fn document_get<B: StorageBackend>(
     Ok(OperationResponse {
         opcode: opcode::DOC_GET,
         payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref())
+            .with_collection(CollectionId::new(request.collection_id))
+            .with_partition(request.partition),
     })
 }
 
@@ -184,6 +527,7 @@ pub(crate) fn describe_collection<B: StorageBackend>(
     Ok(OperationResponse {
         opcode: opcode::DESCRIBE_COLLECTION,
         payload: response.encode_to_vec(),
+        diagnostics: OperationDiagnostics::default(),
     })
 }
 
@@ -211,6 +555,7 @@ pub(crate) fn catalog_apply<B: StorageBackend>(
     Ok(OperationResponse {
         opcode: opcode::CATALOG_APPLY,
         payload: response.encode_to_vec(),
+        diagnostics: OperationDiagnostics::default(),
     })
 }
 
@@ -238,6 +583,7 @@ pub(crate) fn catalog_drop<B: StorageBackend>(
     Ok(OperationResponse {
         opcode: opcode::CATALOG_DROP,
         payload: response.encode_to_vec(),
+        diagnostics: OperationDiagnostics::default(),
     })
 }
 
@@ -265,6 +611,7 @@ pub(crate) fn catalog_alter<B: StorageBackend>(
     Ok(OperationResponse {
         opcode: opcode::CATALOG_ALTER,
         payload: response.encode_to_vec(),
+        diagnostics: OperationDiagnostics::default(),
     })
 }
 
@@ -489,6 +836,18 @@ fn catalog_changes(request: CatalogApplyRequest) -> Result<CatalogChanges, Opera
             ),
         ));
     }
+    for placement in request.placements {
+        if placement.affinity_group.is_empty() {
+            return Err(OperationError::invalid(
+                "placement affinity group must not be empty",
+            ));
+        }
+        changes.placements.push(PlacementChange {
+            bucket_id: BucketId::new(placement.bucket_id),
+            backend_id: BackendId::new(placement.backend_id),
+            affinity_group: placement.affinity_group,
+        });
+    }
 
     Ok(changes)
 }
@@ -570,6 +929,29 @@ fn authorize_catalog_changes(
     for (keyspace_id, _) in &changes.buckets {
         let name = keyspaces.get(keyspace_id).copied().ok_or_else(|| {
             OperationError::new(status::NOT_FOUND, "bucket references an unknown keyspace")
+        })?;
+        require_admin(principal, name, "*")?;
+    }
+    for placement in &changes.placements {
+        let keyspace_id = snapshot
+            .bucket_keyspaces
+            .get(&placement.bucket_id)
+            .copied()
+            .or_else(|| {
+                changes
+                    .buckets
+                    .iter()
+                    .find(|(_, bucket)| bucket.id() == placement.bucket_id)
+                    .map(|(keyspace_id, _)| *keyspace_id)
+            })
+            .ok_or_else(|| {
+                OperationError::new(status::NOT_FOUND, "placement references an unknown bucket")
+            })?;
+        let name = keyspaces.get(&keyspace_id).copied().ok_or_else(|| {
+            OperationError::new(
+                status::NOT_FOUND,
+                "placement references an unknown keyspace",
+            )
         })?;
         require_admin(principal, name, "*")?;
     }
@@ -785,12 +1167,16 @@ pub(crate) fn document_put<B: StorageBackend>(
     Ok(OperationResponse {
         opcode: opcode::DOC_PUT,
         payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref())
+            .with_collection(CollectionId::new(request.collection_id))
+            .with_partition(request.partition),
     })
 }
 
 pub(crate) struct QueryPage {
     pub(crate) documents: Vec<DocumentResult>,
     pub(crate) next_cursor: Vec<u8>,
+    pub(crate) diagnostics: OperationDiagnostics,
 }
 
 pub(crate) fn query<B: StorageBackend>(
@@ -803,6 +1189,7 @@ pub(crate) fn query<B: StorageBackend>(
     let page = query_page(
         store,
         principal,
+        request.meta.as_ref(),
         request.partition,
         &request.rql,
         &request.parameters,
@@ -817,6 +1204,7 @@ pub(crate) fn query<B: StorageBackend>(
     Ok(OperationResponse {
         opcode: opcode::QUERY,
         payload: response.encode_to_vec(),
+        diagnostics: page.diagnostics,
     })
 }
 
@@ -876,6 +1264,7 @@ pub(crate) fn aggregate<B: StorageBackend>(
     )
     .map_err(map_bind)?;
     authorize_collection(&snapshot, principal, query.collection_id(), Action::Read)?;
+    let collection_id = query.collection_id();
     let limit = aggregate_limit(request.limit, &parsed);
     let page = store
         .query_engine()
@@ -919,6 +1308,9 @@ pub(crate) fn aggregate<B: StorageBackend>(
     Ok(OperationResponse {
         opcode: opcode::AGGREGATE,
         payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref())
+            .with_collection(collection_id)
+            .with_partition(request.partition),
     })
 }
 
@@ -961,7 +1353,247 @@ pub(crate) fn backup<B: StorageBackend>(
     Ok(OperationResponse {
         opcode: opcode::BACKUP,
         payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref()),
     })
+}
+
+fn workflow_collections(definition: &WorkflowDefinition) -> Vec<CollectionId> {
+    let mut collections = Vec::new();
+    for step in &definition.steps {
+        if let Some(collection) = step_target_collection(step)
+            && !collections.contains(&collection)
+        {
+            collections.push(collection);
+        }
+    }
+
+    collections
+}
+
+fn workflow_status_response(record: WorkflowRecord) -> WorkflowStatusResponse {
+    let state = record.state();
+    let current_step = record.current_step;
+    let created_at = record.created_at_unix_micros;
+    let updated_at = record.updated_at_unix_micros;
+    let error = record.error.clone();
+
+    WorkflowStatusResponse {
+        id: record.id,
+        state: state as i32,
+        current_step,
+        steps: record.steps,
+        error,
+        created_at_unix_micros: created_at,
+        updated_at_unix_micros: updated_at,
+    }
+}
+
+pub(crate) fn workflow_start<B: StorageBackend>(
+    store: &Arc<DocumentStore<B>>,
+    principal: &Principal,
+    metrics: Arc<ServerMetrics>,
+    request: WorkflowStartRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    let mode = request.execution_mode();
+    let snapshot = store.catalog_snapshot().map_err(map_document)?;
+    let definition = request.definition.unwrap_or_default();
+    for collection_id in workflow_collections(&definition) {
+        authorize_collection(&snapshot, principal, collection_id, Action::Write)?;
+    }
+    let asynchronous = mode == WorkflowExecutionMode::Async
+        || (mode == WorkflowExecutionMode::Unspecified && store.workflow_default_async());
+    let record = if asynchronous {
+        let record = store
+            .submit_workflow(&request.id, &definition)
+            .map_err(map_workflow)?;
+        let runner_store = Arc::clone(store);
+        let runner_id = request.id.clone();
+        let runner_metrics = Arc::clone(&metrics);
+        tokio::task::spawn_blocking(move || match runner_store.run_workflow(&runner_id) {
+            Ok(record) => runner_metrics.workflow_finished(record.state()),
+            Err(error) => {
+                tracing::warn!(workflow = %runner_id, %error, "async workflow runner failed");
+            }
+        });
+        record
+    } else {
+        let record = store
+            .start_workflow(&request.id, &definition)
+            .map_err(map_workflow)?;
+        metrics.workflow_finished(record.state());
+        record
+    };
+    metrics.workflow_started();
+    let response = WorkflowStartResponse {
+        workflow: Some(workflow_status_response(record)),
+    };
+
+    Ok(OperationResponse {
+        opcode: opcode::WF_START,
+        payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref()),
+    })
+}
+
+pub(crate) fn workflow_status<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    request: WorkflowStatusRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    let record = store
+        .workflow_record(&request.id)
+        .map_err(map_document)?
+        .ok_or_else(|| {
+            OperationError::new(
+                status::NOT_FOUND,
+                format!("workflow {} does not exist", request.id),
+            )
+        })?;
+    let snapshot = store.catalog_snapshot().map_err(map_document)?;
+    for step in &record.steps {
+        let Some(step) = step.step.as_ref() else {
+            continue;
+        };
+        if let Some(collection_id) = step_target_collection(step) {
+            authorize_collection(&snapshot, principal, collection_id, Action::Read)?;
+        }
+    }
+    let response = workflow_status_response(record);
+
+    Ok(OperationResponse {
+        opcode: opcode::WF_STATUS,
+        payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref()),
+    })
+}
+
+pub(crate) fn workflow_cancel<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    metrics: &ServerMetrics,
+    request: WorkflowCancelRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    let record = store
+        .workflow_record(&request.id)
+        .map_err(map_document)?
+        .ok_or_else(|| {
+            OperationError::new(
+                status::NOT_FOUND,
+                format!("workflow {} does not exist", request.id),
+            )
+        })?;
+    let snapshot = store.catalog_snapshot().map_err(map_document)?;
+    for step in &record.steps {
+        let Some(step) = step.step.as_ref() else {
+            continue;
+        };
+        if let Some(collection_id) = step_target_collection(step) {
+            authorize_collection(&snapshot, principal, collection_id, Action::Write)?;
+        }
+    }
+    let record = store.cancel_workflow(&request.id).map_err(map_workflow)?;
+    metrics.workflow_finished(record.state());
+    let response = workflow_status_response(record);
+
+    Ok(OperationResponse {
+        opcode: opcode::WF_CANCEL,
+        payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref()),
+    })
+}
+
+fn workflow_summary(record: &WorkflowRecord) -> WorkflowSummary {
+    WorkflowSummary {
+        id: record.id.clone(),
+        state: record.state() as i32,
+        current_step: record.current_step,
+        error: record.error.clone(),
+        created_at_unix_micros: record.created_at_unix_micros,
+        updated_at_unix_micros: record.updated_at_unix_micros,
+    }
+}
+
+pub(crate) fn workflow_resolve<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    metrics: &ServerMetrics,
+    request: WorkflowResolveRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    let record = store
+        .workflow_record(&request.id)
+        .map_err(map_document)?
+        .ok_or_else(|| {
+            OperationError::new(
+                status::NOT_FOUND,
+                format!("workflow {} does not exist", request.id),
+            )
+        })?;
+    let snapshot = store.catalog_snapshot().map_err(map_document)?;
+    for step in &record.steps {
+        let Some(step) = step.step.as_ref() else {
+            continue;
+        };
+        if let Some(collection_id) = step_target_collection(step) {
+            authorize_collection(&snapshot, principal, collection_id, Action::Write)?;
+        }
+    }
+    let record = store
+        .resolve_workflow(&request.id, request.action())
+        .map_err(map_workflow)?;
+    metrics.workflow_finished(record.state());
+    let response = WorkflowResolveResponse {
+        workflow: Some(workflow_status_response(record)),
+    };
+
+    Ok(OperationResponse {
+        opcode: opcode::WF_RESOLVE,
+        payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref()),
+    })
+}
+
+pub(crate) fn workflow_list<B: StorageBackend>(
+    store: &DocumentStore<B>,
+    principal: &Principal,
+    request: WorkflowListRequest,
+) -> Result<OperationResponse, OperationError> {
+    check_meta(store, request.meta.as_ref())?;
+    require_admin(principal, "*", "*")?;
+    let limit = if request.limit == 0 {
+        DEFAULT_QUERY_LIMIT as usize
+    } else {
+        request.limit.min(MAX_QUERY_LIMIT as u32) as usize
+    };
+    let records = store
+        .list_workflows(&request.start_after, limit)
+        .map_err(map_document)?;
+    let workflows = records.iter().map(workflow_summary).collect();
+    let response = WorkflowListResponse { workflows };
+
+    Ok(OperationResponse {
+        opcode: opcode::WF_LIST,
+        payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref()),
+    })
+}
+
+fn map_workflow(error: WorkflowError) -> OperationError {
+    match &error {
+        WorkflowError::InvalidWorkflow(_) => {
+            OperationError::new(status::INVALID_REQUEST, error.to_string())
+        }
+        WorkflowError::Execution(DocumentError::UnknownCollection(_)) => {
+            OperationError::new(status::NOT_FOUND, error.to_string())
+        }
+        WorkflowError::Execution(DocumentError::IdempotencyConflict) => {
+            OperationError::new(status::CONFLICT, error.to_string())
+        }
+        _ => OperationError::new(status::INVALID_REQUEST, error.to_string()),
+    }
 }
 
 pub(crate) fn explain<B: StorageBackend>(
@@ -1007,6 +1639,9 @@ pub(crate) fn explain<B: StorageBackend>(
     Ok(OperationResponse {
         opcode: opcode::EXPLAIN,
         payload: response.encode_to_vec(),
+        diagnostics: diagnostics(request.meta.as_ref())
+            .with_collection(collection_id)
+            .with_partition(request.partition),
     })
 }
 
@@ -1115,9 +1750,11 @@ const fn explain_op(op: FilterOp) -> ExplainFilterOp {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn query_page<B: StorageBackend>(
     store: &DocumentStore<B>,
     principal: &Principal,
+    meta: Option<&RequestMeta>,
     partition: u32,
     rql: &str,
     wire_parameters: &[messages::NamedParameter],
@@ -1126,6 +1763,7 @@ pub(crate) fn query_page<B: StorageBackend>(
 ) -> Result<QueryPage, OperationError> {
     let _read = store.read_guard().map_err(map_document)?;
     let (snapshot, query) = bind_wire_query(store, principal, partition, rql, wire_parameters)?;
+    let collection_id = query.collection_id();
     let query_hash = query_cursor::query_hash(partition, rql, wire_parameters);
     let cursor = if cursor.is_empty() {
         None
@@ -1205,6 +1843,9 @@ pub(crate) fn query_page<B: StorageBackend>(
     Ok(QueryPage {
         documents,
         next_cursor,
+        diagnostics: diagnostics(meta)
+            .with_collection(collection_id)
+            .with_partition(partition),
     })
 }
 
@@ -1343,10 +1984,16 @@ fn map_document(error: DocumentError) -> OperationError {
         DocumentError::IdempotencyConflict => {
             OperationError::new(status::CONFLICT, error.to_string())
         }
+        DocumentError::UniqueReservationRequired { .. } => {
+            OperationError::new(status::CONFLICT, error.to_string())
+        }
         DocumentError::InvalidIdempotencyRecord => {
             OperationError::new(status::INTERNAL, error.to_string())
         }
         DocumentError::TargetNotEmpty(_) | DocumentError::BackfillTooLarge { .. } => {
+            OperationError::new(status::FAILED_PRECONDITION, error.to_string())
+        }
+        DocumentError::PlacementRejected { .. } => {
             OperationError::new(status::FAILED_PRECONDITION, error.to_string())
         }
         DocumentError::MigrationRequired | DocumentError::Migration(_) => {

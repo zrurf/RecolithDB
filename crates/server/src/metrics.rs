@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use recolith_protocol::messages::opcode;
+use recolith_protocol::messages::{WorkflowState, opcode};
 
 const LATENCY_BUCKET_MICROS: [u64; 22] = [
     1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1_024, 2_048, 4_096, 8_192, 16_384, 32_768, 65_536,
@@ -52,22 +52,56 @@ pub struct MetricsSnapshot {
     pub queries: u64,
     /// DESCRIBE_COLLECTION requests.
     pub metadata_requests: u64,
+    /// DOC_DELETE requests.
+    pub document_deletes: u64,
+    /// EXPLAIN requests.
+    pub explanations: u64,
+    /// AGGREGATE requests.
+    pub aggregates: u64,
+    /// BACKUP requests.
+    pub backups: u64,
     /// Completed TTL reaper sweeps.
     pub ttl_sweeps: u64,
     /// Expired documents deleted by the reaper.
     pub expired_documents: u64,
     /// TTL reaper failures.
     pub ttl_errors: u64,
+    /// Workflows accepted.
+    pub workflows_started: u64,
+    /// Workflows that completed all steps.
+    pub workflows_completed: u64,
+    /// Workflows compensated after a failure or cancellation.
+    pub workflows_compensated: u64,
+    /// Workflows moved to dead-letter state.
+    pub workflows_failed: u64,
+    /// Direct bucket record operations (BUCKET_GET/PUT/DELETE/SCAN).
+    pub bucket_ops: u64,
     /// PING latency.
     pub ping_latency: LatencySnapshot,
     /// DOC_GET latency.
     pub document_read_latency: LatencySnapshot,
     /// DOC_PUT latency.
     pub document_write_latency: LatencySnapshot,
+    /// DOC_DELETE latency.
+    pub document_delete_latency: LatencySnapshot,
     /// QUERY latency.
     pub query_latency: LatencySnapshot,
+    /// EXPLAIN latency.
+    pub explain_latency: LatencySnapshot,
+    /// AGGREGATE latency.
+    pub aggregate_latency: LatencySnapshot,
+    /// BACKUP latency.
+    pub backup_latency: LatencySnapshot,
     /// DESCRIBE_COLLECTION latency.
     pub metadata_latency: LatencySnapshot,
+    /// BUCKET_GET latency.
+    pub bucket_get_latency: LatencySnapshot,
+    /// BUCKET_PUT latency.
+    pub bucket_put_latency: LatencySnapshot,
+    /// BUCKET_DELETE latency.
+    pub bucket_delete_latency: LatencySnapshot,
+    /// BUCKET_SCAN latency.
+    pub bucket_scan_latency: LatencySnapshot,
 }
 
 #[derive(Debug, Default)]
@@ -137,8 +171,16 @@ struct OperationLatency {
     ping: LatencyHistogram,
     document_read: LatencyHistogram,
     document_write: LatencyHistogram,
+    document_delete: LatencyHistogram,
     query: LatencyHistogram,
+    explain: LatencyHistogram,
+    aggregate: LatencyHistogram,
+    backup: LatencyHistogram,
     metadata: LatencyHistogram,
+    bucket_get: LatencyHistogram,
+    bucket_put: LatencyHistogram,
+    bucket_delete: LatencyHistogram,
+    bucket_scan: LatencyHistogram,
 }
 
 /// Process-local server counters and latency histograms.
@@ -155,9 +197,18 @@ pub struct ServerMetrics {
     document_writes: AtomicU64,
     queries: AtomicU64,
     metadata_requests: AtomicU64,
+    document_deletes: AtomicU64,
+    explanations: AtomicU64,
+    aggregates: AtomicU64,
+    backups: AtomicU64,
     ttl_sweeps: AtomicU64,
     expired_documents: AtomicU64,
     ttl_errors: AtomicU64,
+    workflows_started: AtomicU64,
+    workflows_completed: AtomicU64,
+    workflows_compensated: AtomicU64,
+    workflows_failed: AtomicU64,
+    bucket_ops: AtomicU64,
     latency: OperationLatency,
 }
 
@@ -207,8 +258,16 @@ impl ServerMetrics {
             opcode::PING => self.pings.fetch_add(1, Ordering::Relaxed),
             opcode::DOC_GET => self.document_reads.fetch_add(1, Ordering::Relaxed),
             opcode::DOC_PUT => self.document_writes.fetch_add(1, Ordering::Relaxed),
+            opcode::DOC_DELETE => self.document_deletes.fetch_add(1, Ordering::Relaxed),
             opcode::QUERY => self.queries.fetch_add(1, Ordering::Relaxed),
+            opcode::EXPLAIN => self.explanations.fetch_add(1, Ordering::Relaxed),
+            opcode::AGGREGATE => self.aggregates.fetch_add(1, Ordering::Relaxed),
+            opcode::BACKUP => self.backups.fetch_add(1, Ordering::Relaxed),
             opcode::DESCRIBE_COLLECTION => self.metadata_requests.fetch_add(1, Ordering::Relaxed),
+            opcode::BUCKET_GET
+            | opcode::BUCKET_PUT
+            | opcode::BUCKET_DELETE
+            | opcode::BUCKET_SCAN => self.bucket_ops.fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
     }
@@ -219,8 +278,16 @@ impl ServerMetrics {
             opcode::PING => &self.latency.ping,
             opcode::DOC_GET => &self.latency.document_read,
             opcode::DOC_PUT => &self.latency.document_write,
+            opcode::DOC_DELETE => &self.latency.document_delete,
             opcode::QUERY => &self.latency.query,
+            opcode::EXPLAIN => &self.latency.explain,
+            opcode::AGGREGATE => &self.latency.aggregate,
+            opcode::BACKUP => &self.latency.backup,
             opcode::DESCRIBE_COLLECTION => &self.latency.metadata,
+            opcode::BUCKET_GET => &self.latency.bucket_get,
+            opcode::BUCKET_PUT => &self.latency.bucket_put,
+            opcode::BUCKET_DELETE => &self.latency.bucket_delete,
+            opcode::BUCKET_SCAN => &self.latency.bucket_scan,
             _ => return,
         };
         histogram.observe(duration);
@@ -242,6 +309,27 @@ impl ServerMetrics {
         self.ttl_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records one accepted workflow.
+    pub fn workflow_started(&self) {
+        self.workflows_started.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one workflow reaching a terminal state.
+    pub fn workflow_finished(&self, state: WorkflowState) {
+        match state {
+            WorkflowState::Completed => {
+                self.workflows_completed.fetch_add(1, Ordering::Relaxed);
+            }
+            WorkflowState::Compensated => {
+                self.workflows_compensated.fetch_add(1, Ordering::Relaxed);
+            }
+            WorkflowState::Failed => {
+                self.workflows_failed.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+
     /// Takes a consistent-enough point-in-time snapshot.
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
@@ -257,14 +345,31 @@ impl ServerMetrics {
             document_writes: self.document_writes.load(Ordering::Relaxed),
             queries: self.queries.load(Ordering::Relaxed),
             metadata_requests: self.metadata_requests.load(Ordering::Relaxed),
+            document_deletes: self.document_deletes.load(Ordering::Relaxed),
+            explanations: self.explanations.load(Ordering::Relaxed),
+            aggregates: self.aggregates.load(Ordering::Relaxed),
+            backups: self.backups.load(Ordering::Relaxed),
             ttl_sweeps: self.ttl_sweeps.load(Ordering::Relaxed),
             expired_documents: self.expired_documents.load(Ordering::Relaxed),
             ttl_errors: self.ttl_errors.load(Ordering::Relaxed),
+            workflows_started: self.workflows_started.load(Ordering::Relaxed),
+            workflows_completed: self.workflows_completed.load(Ordering::Relaxed),
+            workflows_compensated: self.workflows_compensated.load(Ordering::Relaxed),
+            workflows_failed: self.workflows_failed.load(Ordering::Relaxed),
+            bucket_ops: self.bucket_ops.load(Ordering::Relaxed),
             ping_latency: self.latency.ping.snapshot(),
             document_read_latency: self.latency.document_read.snapshot(),
             document_write_latency: self.latency.document_write.snapshot(),
+            document_delete_latency: self.latency.document_delete.snapshot(),
             query_latency: self.latency.query.snapshot(),
+            explain_latency: self.latency.explain.snapshot(),
+            aggregate_latency: self.latency.aggregate.snapshot(),
+            backup_latency: self.latency.backup.snapshot(),
             metadata_latency: self.latency.metadata.snapshot(),
+            bucket_get_latency: self.latency.bucket_get.snapshot(),
+            bucket_put_latency: self.latency.bucket_put.snapshot(),
+            bucket_delete_latency: self.latency.bucket_delete.snapshot(),
+            bucket_scan_latency: self.latency.bucket_scan.snapshot(),
         }
     }
 }

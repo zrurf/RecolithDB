@@ -171,3 +171,59 @@ mod idl {
         assert!(parse_record(input, id, version).is_err());
     }
 }
+
+mod unique_fields {
+    use recolith_common::{FieldId, SchemaId, SchemaVersion};
+    use recolith_schema::{
+        Compatibility, Field, RecordSchema, Type, check_compatibility, parse_record,
+    };
+
+    fn record(fields: Vec<Field>) -> RecordSchema {
+        RecordSchema::new(SchemaId::new(1), SchemaVersion::new(1), "player", fields)
+    }
+
+    fn name_field(unique: bool) -> Field {
+        Field::new(FieldId::new(1), "name", Type::String, false).with_unique(unique)
+    }
+
+    #[test]
+    fn parses_unique_marker() {
+        let (id, version) = (SchemaId::new(1), SchemaVersion::new(1));
+        let input = r"
+            record Player {
+                unique name: string @1;
+                level: u32 @2;
+            }
+        ";
+        let record = parse_record(input, id, version).expect("valid IDL");
+
+        assert!(record.fields()[0].unique());
+        assert!(!record.fields()[1].unique());
+    }
+
+    #[test]
+    fn rejects_unique_lists() {
+        let record = record(vec![
+            Field::new(
+                FieldId::new(1),
+                "tags",
+                Type::List(Box::new(Type::String)),
+                true,
+            )
+            .with_unique(true),
+        ]);
+
+        assert!(record.validate().is_err());
+    }
+
+    #[test]
+    fn changing_unique_flag_requires_migration() {
+        let old = record(vec![name_field(false)]);
+        let new = record(vec![name_field(true)]);
+
+        assert_eq!(
+            check_compatibility(&old, &new).expect("compat"),
+            Compatibility::RequiresMigration
+        );
+    }
+}

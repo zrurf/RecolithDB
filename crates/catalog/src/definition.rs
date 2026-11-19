@@ -12,7 +12,7 @@ use recolith_schema::{SchemaError, parse_record};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::apply::CatalogChanges;
+use crate::apply::{CatalogChanges, PlacementChange};
 use crate::catalog::Catalog;
 use crate::error::CatalogError;
 
@@ -29,6 +29,8 @@ pub struct CatalogDefinition {
     pub collections: Vec<Collection>,
     /// Index definitions paired with their bucket.
     pub indexes: Vec<(BucketId, IndexDefinition)>,
+    /// Bucket placements to assign.
+    pub placements: Vec<PlacementChange>,
 }
 
 /// Schema definition carrying source IDL.
@@ -102,6 +104,7 @@ impl CatalogDefinition {
             && file.buckets.is_empty()
             && file.collections.is_empty()
             && file.indexes.is_empty()
+            && file.placements.is_empty()
         {
             return Err(DefinitionError::Empty);
         }
@@ -194,12 +197,23 @@ impl CatalogDefinition {
             })
             .collect();
 
+        let placements = file
+            .placements
+            .into_iter()
+            .map(|placement| PlacementChange {
+                bucket_id: BucketId::new(placement.bucket_id),
+                backend_id: recolith_common::BackendId::new(placement.backend_id),
+                affinity_group: placement.affinity_group,
+            })
+            .collect();
+
         Ok(Self {
             keyspaces,
             schemas,
             buckets,
             collections,
             indexes,
+            placements,
         })
     }
 
@@ -232,6 +246,7 @@ impl CatalogDefinition {
             buckets: self.buckets,
             collections: self.collections,
             indexes: self.indexes,
+            placements: self.placements,
         })
     }
 
@@ -262,6 +277,16 @@ struct DefinitionFile {
     collections: Vec<CollectionConfig>,
     #[serde(default)]
     indexes: Vec<IndexConfig>,
+    #[serde(default)]
+    placements: Vec<PlacementConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlacementConfig {
+    bucket_id: u64,
+    backend_id: u64,
+    affinity_group: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]

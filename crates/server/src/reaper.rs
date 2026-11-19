@@ -22,10 +22,11 @@ pub async fn run_ttl_reaper<B: StorageBackend>(
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         interval.tick().await;
-        let store = Arc::clone(&store);
-        let outcome =
-            tokio::task::spawn_blocking(move || store.sweep_expired(now_micros(), batch_size))
-                .await;
+        let outcome = tokio::task::spawn_blocking({
+            let store = Arc::clone(&store);
+            move || store.sweep_expired(now_micros(), batch_size)
+        })
+        .await;
         match outcome {
             Ok(Ok(sweep)) => {
                 metrics.ttl_sweep(sweep.deleted);
@@ -44,6 +45,31 @@ pub async fn run_ttl_reaper<B: StorageBackend>(
             Err(error) => {
                 metrics.ttl_error();
                 tracing::warn!(%error, "TTL worker failed");
+            }
+        }
+        let store = Arc::clone(&store);
+        let outcome = tokio::task::spawn_blocking(move || {
+            store.reconcile_reservations(now_micros(), batch_size)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(stats)) => {
+                if stats.confirmed > 0 || stats.released > 0 {
+                    tracing::info!(
+                        checked = stats.checked,
+                        confirmed = stats.confirmed,
+                        released = stats.released,
+                        "reconciled unique reservations"
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                metrics.ttl_error();
+                tracing::warn!(%error, "reservation reconcile failed");
+            }
+            Err(error) => {
+                metrics.ttl_error();
+                tracing::warn!(%error, "reservation worker failed");
             }
         }
     }
