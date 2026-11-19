@@ -19,6 +19,7 @@ const BUCKET: &[u8] = b"bucket/";
 const COLLECTION: &[u8] = b"collection/";
 const INDEX: &[u8] = b"index/";
 const PLACEMENT: &[u8] = b"placement/";
+const REPLICA_SET: &[u8] = b"replica/";
 const SCHEMA: &[u8] = b"schema/";
 
 /// Loads a catalog from a backend.
@@ -44,6 +45,7 @@ pub fn load_catalog<B: StorageBackend>(backend: &B) -> Result<Catalog> {
         collections: BTreeMap::new(),
         indexes: BTreeMap::new(),
         placements: BTreeMap::new(),
+        replica_sets: BTreeMap::new(),
         schemas: crate::schema_registry::SchemaSnapshot::default(),
     };
     let mut generation = None;
@@ -101,6 +103,15 @@ pub fn load_catalog<B: StorageBackend>(backend: &B) -> Result<Catalog> {
                 return Err(invalid_metadata("placement key and value disagree"));
             }
             catalog.placements.insert(placement.bucket_id(), placement);
+        } else if let Some(rest) = suffix.strip_prefix(REPLICA_SET) {
+            let bucket_id = single_id(rest)?;
+            let replica_set = codec::decode_replica_set(&value)?;
+            if replica_set.bucket_id().get() != bucket_id {
+                return Err(invalid_metadata("replica key and value disagree"));
+            }
+            catalog
+                .replica_sets
+                .insert(replica_set.bucket_id(), replica_set);
         } else if let Some(rest) = suffix.strip_prefix(SCHEMA) {
             let (schema_id, version) = pair_id(rest)?;
             let schema = codec::decode_schema(&value)?;
@@ -219,6 +230,12 @@ fn encode_snapshot(snapshot: &CatalogSnapshot) -> Result<BTreeMap<Vec<u8>, Vec<u
         entries.insert(
             key(PLACEMENT, &[placement.bucket_id().get()]),
             codec::encode_placement(placement),
+        );
+    }
+    for replica_set in snapshot.replica_sets.values() {
+        entries.insert(
+            key(REPLICA_SET, &[replica_set.bucket_id().get()]),
+            codec::encode_replica_set(replica_set),
         );
     }
     for schema in snapshot.schemas.schemas.values() {

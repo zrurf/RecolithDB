@@ -61,6 +61,28 @@ id = 1
 name = "by-level"
 kind = "range"
 fields = [2]
+
+
+[[buckets]]
+id = 2
+keyspace_id = 1
+name = "events"
+partitions = 8
+policy = "managed"
+schema_id = 1
+schema_version = 1
+
+[[replicas]]
+bucket_id = 2
+affinity_group = "us-west"
+
+[[replicas.members]]
+backend_id = 5
+role = "leader"
+
+[[replicas.members]]
+backend_id = 6
+role = "follower"
 "#;
 
 fn args(endpoint: String, command: Command) -> Args {
@@ -131,6 +153,27 @@ async fn applies_a_catalog_definition_file() {
     ))
     .await
     .expect("put");
+
+    // The replica-set bucket only accepts writes from its leader backend;
+    // this process defaults to backend 0, so writes are rejected.
+    let replica_write = run(args(
+        endpoint.clone(),
+        Command::Doc {
+            command: DocCommand::Put {
+                collection: "player".to_owned(),
+                keyspace: Some("game".to_owned()),
+                partition: 0,
+                key_hex: None,
+                keys: vec!["player_id=u64:2".to_owned()],
+                idempotency_key: "apply-file-2".to_owned(),
+                ttl_seconds: None,
+                fields: vec!["events.name=string:sam".to_owned()],
+                subkeys: vec!["events=e1".to_owned()],
+            },
+        },
+    ))
+    .await;
+    assert!(replica_write.is_err(), "follower write must be rejected");
 
     run(args(
         endpoint,

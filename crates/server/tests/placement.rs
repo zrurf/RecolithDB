@@ -330,3 +330,80 @@ fn expiry_reaper_deletes_placed_documents() {
         .expect("sweep");
     assert_eq!(sweep.deleted, 1);
 }
+
+#[test]
+fn replica_set_accepts_only_leader_writes() {
+    use recolith_catalog::{ReplicaMember, ReplicaRole, ReplicaSet};
+
+    let replica_catalog = catalog();
+    replica_catalog
+        .set_replicas(ReplicaSet::new(
+            BucketId::new(1),
+            "us-east",
+            vec![
+                ReplicaMember::new(BackendId::new(7), ReplicaRole::Leader),
+                ReplicaMember::new(BackendId::new(8), ReplicaRole::Follower),
+            ],
+        ))
+        .expect("replica set");
+    let backend = Arc::new(MemoryBackend::new());
+    let leader = DocumentStore::new(Arc::new(replica_catalog), backend.clone())
+        .with_local_backend_id(BackendId::new(7));
+
+    let write = DocumentWrite::new(CollectionId::new(1), key(1), PartitionId::new(0))
+        .with_fragment(profile_fragment("alex"));
+    leader.write(&write).expect("leader write");
+
+    let follower_catalog = catalog_with_replicas();
+    let follower = DocumentStore::new(Arc::new(follower_catalog), backend.clone())
+        .with_local_backend_id(BackendId::new(8));
+    assert!(matches!(
+        follower.write(&write),
+        Err(DocumentError::PlacementRejected { backend, .. }) if backend == BackendId::new(7)
+    ));
+
+    let foreign_catalog = catalog_with_replicas();
+    let foreign = DocumentStore::new(Arc::new(foreign_catalog), backend.clone());
+    assert!(matches!(
+        foreign.write(&write),
+        Err(DocumentError::PlacementRejected { backend, .. }) if backend == BackendId::new(7)
+    ));
+
+    // Bucket operations follow the same leader-only rule: the placement
+    // check runs before the policy gate, so a follower is rejected even
+    // though the bucket itself is strict.
+    let record = RecordData::new();
+    assert!(matches!(
+        follower.bucket_put(
+            BucketId::new(1),
+            PartitionId::new(0),
+            FragmentId::new(1),
+            b"k",
+            b"",
+            &record,
+            None,
+        ),
+        Err(DocumentError::PlacementRejected { .. })
+    ));
+}
+
+fn catalog_with_replicas() -> recolith_catalog::Catalog {
+    let replica_catalog = catalog();
+    replica_catalog
+        .set_replicas(recolith_catalog::ReplicaSet::new(
+            BucketId::new(1),
+            "us-east",
+            vec![
+                recolith_catalog::ReplicaMember::new(
+                    BackendId::new(7),
+                    recolith_catalog::ReplicaRole::Leader,
+                ),
+                recolith_catalog::ReplicaMember::new(
+                    BackendId::new(8),
+                    recolith_catalog::ReplicaRole::Follower,
+                ),
+            ],
+        ))
+        .expect("replica set");
+    replica_catalog
+}

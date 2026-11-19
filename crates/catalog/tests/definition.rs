@@ -51,6 +51,27 @@ fields = [2]
 bucket_id = 1
 backend_id = 3
 affinity_group = "us-east"
+
+[[buckets]]
+id = 2
+keyspace_id = 1
+name = "events"
+partitions = 8
+policy = "managed"
+schema_id = 1
+schema_version = 1
+
+[[replicas]]
+bucket_id = 2
+affinity_group = "us-west"
+
+[[replicas.members]]
+backend_id = 5
+role = "leader"
+
+[[replicas.members]]
+backend_id = 6
+role = "follower"
 "#;
 
 #[test]
@@ -58,10 +79,11 @@ fn parses_definitions_into_catalog_changes() {
     let definition = CatalogDefinition::parse(DEFINITION).expect("definition");
     assert_eq!(definition.keyspaces.len(), 1);
     assert_eq!(definition.schemas.len(), 1);
-    assert_eq!(definition.buckets.len(), 1);
+    assert_eq!(definition.buckets.len(), 2);
     assert_eq!(definition.collections.len(), 1);
     assert_eq!(definition.indexes.len(), 1);
     assert_eq!(definition.placements.len(), 1);
+    assert_eq!(definition.replicas.len(), 1);
 
     let changes = definition.into_changes().expect("changes");
     assert_eq!(changes.schemas[0].name(), "Profile");
@@ -81,10 +103,10 @@ fn builds_catalog_from_definitions() {
     let snapshot = catalog.snapshot().expect("snapshot");
 
     assert_eq!(snapshot.keyspaces.len(), 1);
-    assert_eq!(snapshot.buckets.len(), 1);
+    assert_eq!(snapshot.buckets.len(), 2);
     assert_eq!(snapshot.collections.len(), 1);
     assert_eq!(snapshot.schemas.schemas.len(), 1);
-    assert_eq!(catalog.generation().get(), 6);
+    assert_eq!(catalog.generation().get(), 8);
 }
 
 #[test]
@@ -148,4 +170,20 @@ backend_id = 3",
         .into_catalog()
         .expect_err("unknown bucket");
     assert!(error.to_string().contains("not found") || error.to_string().contains("bucket"));
+}
+
+#[test]
+fn builds_catalog_with_replica_set_from_definitions() {
+    let catalog = CatalogDefinition::parse(DEFINITION)
+        .expect("definition")
+        .into_catalog()
+        .expect("catalog");
+    let snapshot = catalog.snapshot().expect("snapshot");
+    let replica_set = snapshot
+        .replica_sets
+        .get(&recolith_common::BucketId::new(2))
+        .expect("replica set");
+    assert_eq!(replica_set.affinity_group(), "us-west");
+    assert_eq!(replica_set.leader(), recolith_common::BackendId::new(5));
+    assert_eq!(replica_set.members().len(), 2);
 }

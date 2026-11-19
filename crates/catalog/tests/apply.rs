@@ -1,4 +1,7 @@
-use recolith_catalog::{Catalog, CatalogChanges, CatalogError, apply::PlacementChange};
+use recolith_catalog::{
+    Catalog, CatalogChanges, CatalogError, ReplicaMember, ReplicaRole, ReplicaSet,
+    apply::PlacementChange,
+};
 use recolith_common::{
     BucketId, CollectionId, FieldId, FragmentId, IndexId, KeyspaceId, SchemaId, SchemaVersion,
 };
@@ -54,6 +57,7 @@ fn changes() -> CatalogChanges {
             ),
         )],
         placements: Vec::new(),
+        replicas: Vec::new(),
     }
 }
 
@@ -213,4 +217,121 @@ fn rejects_missing_references_without_partial_changes() {
     ));
     assert_eq!(catalog.generation().get(), 0);
     assert!(catalog.snapshot().expect("snapshot").collections.is_empty());
+}
+
+#[test]
+fn applies_replica_sets_with_validation() {
+    use recolith_model::{Bucket, BucketPolicy};
+
+    let catalog = Catalog::new();
+    let updated = catalog
+        .apply_changes(&changes())
+        .expect("apply")
+        .expect("changed");
+    let mut replica_changes = changes();
+    replica_changes.replicas = vec![ReplicaSet::new(
+        BucketId::new(1),
+        "us-east",
+        vec![
+            ReplicaMember::new(recolith_common::BackendId::new(5), ReplicaRole::Leader),
+            ReplicaMember::new(recolith_common::BackendId::new(6), ReplicaRole::Follower),
+        ],
+    )];
+
+    let next = updated
+        .apply_changes(&replica_changes)
+        .expect("apply replicas")
+        .expect("changed");
+    let snapshot = next.snapshot().expect("snapshot");
+    let replica_set = snapshot
+        .replica_sets
+        .get(&BucketId::new(1))
+        .expect("replica set");
+    assert_eq!(replica_set.leader(), recolith_common::BackendId::new(5));
+
+    // Identical reapplication is a no-op.
+    assert!(
+        next.apply_changes(&replica_changes)
+            .expect("apply")
+            .is_none()
+    );
+
+    // A different membership conflicts.
+    let mut conflicting = replica_changes.clone();
+    conflicting.replicas[0] = ReplicaSet::new(
+        BucketId::new(1),
+        "us-east",
+        vec![ReplicaMember::new(
+            recolith_common::BackendId::new(7),
+            ReplicaRole::Leader,
+        )],
+    );
+    assert!(matches!(
+        next.apply_changes(&conflicting),
+        Err(CatalogError::Conflict(message)) if message.contains("replica set")
+    ));
+
+    // Replica sets and single-backend placements are mutually exclusive.
+    let mut mixed = replica_changes;
+    mixed.buckets = vec![(
+        KeyspaceId::new(1),
+        Bucket::new(
+            BucketId::new(2),
+            "extra",
+            8,
+            recolith_model::BucketPolicy::Raw,
+            recolith_common::SchemaId::new(1),
+            recolith_common::SchemaVersion::new(1),
+        ),
+    )];
+    mixed.placements = vec![PlacementChange {
+        bucket_id: BucketId::new(2),
+        backend_id: recolith_common::BackendId::new(1),
+        affinity_group: "us-west".to_owned(),
+    }];
+    let with_placement = next
+        .apply_changes(&mixed)
+        .expect("apply placement")
+        .expect("changed");
+    let mut conflicting_replica = mixed;
+    conflicting_replica.replicas[0] = ReplicaSet::new(
+        BucketId::new(2),
+        "us-east",
+        vec![ReplicaMember::new(
+            recolith_common::BackendId::new(5),
+            ReplicaRole::Leader,
+        )],
+    );
+    assert!(matches!(
+        with_placement.apply_changes(&conflicting_replica),
+        Err(CatalogError::InvalidPlacement(_))
+    ));
+
+    // Two leaders are rejected.
+    let mut two_leaders = changes();
+    two_leaders.buckets = vec![(
+        KeyspaceId::new(1),
+        Bucket::new(
+            BucketId::new(3),
+            "spare",
+            8,
+            BucketPolicy::Raw,
+            recolith_common::SchemaId::new(1),
+            recolith_common::SchemaVersion::new(1),
+        ),
+    )];
+    two_leaders.replicas = vec![ReplicaSet::new(
+        BucketId::new(3),
+        "us-east",
+        vec![
+            ReplicaMember::new(recolith_common::BackendId::new(5), ReplicaRole::Leader),
+            ReplicaMember::new(recolith_common::BackendId::new(6), ReplicaRole::Leader),
+        ],
+    )];
+    match with_placement.apply_changes(&two_leaders) {
+        Err(CatalogError::InvalidPlacement(message)) => {
+            assert!(message.contains("exactly one leader"), "got: {message}");
+        }
+        other => panic!("expected invalid placement, got: {other:?}"),
+    }
 }
