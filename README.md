@@ -99,7 +99,7 @@ RecolithDB is in early single-node development. Implemented today:
 - Process-local server metrics for sessions, requests, errors, operation counts, and per-operation latency percentiles including deletes, explains, aggregates, and backups, logged periodically and at shutdown, with slow-operation logging.
 - Bounded concurrent sessions with connection-limit overload rejection and rejection metrics.
 - HMAC-SHA256 opaque tokens, role-based collection permissions, token expiry, local token inspection, verification, fingerprint display, revocation file management, and principal-scoped idempotency.
-- Atomic catalog creation, alteration, and removal for keyspaces, schema versions, buckets, collections, indexes, and placements, with generation checks, purge controls, synchronous index backfill, schema switching, declarative record migration, persisted reload, and write-path placement enforcement against a configured local backend.
+- Atomic catalog creation, alteration, and removal for keyspaces, schema versions, buckets, collections, indexes, placements, and replica sets, with generation checks, purge controls, synchronous index backfill, schema switching, declarative record migration, persisted reload, and leader-only write-path enforcement against a configured local backend.
 - Offline logical backup and restore plus online snapshot backups with checksums, entry-count validation, bounded scan batches, a restricted output directory, and overwrite protection.
 
 Not yet implemented:
@@ -406,7 +406,25 @@ affinity_group = "us-east"
 
 Applying the identical placement again is a no-op, a different backend for the same bucket returns `CONFLICT`, and a placement for an unknown bucket is rejected. Keyspace drops cascade placements.
 
-The server process is configured with `[placement].local_backend_id` (default `0`). Write paths — `DOC_PUT`, `DOC_DELETE`, counter increments, and `BUCKET_PUT` / `BUCKET_DELETE` — resolve each target bucket's placement and reject the operation with `FAILED_PRECONDITION` when the bucket is placed on a different backend; unplaced buckets are always writable, and multi-fragment writes are rejected as a whole when any target bucket is remote (such operations need explicit workflows once distribution exists). Reads, the TTL reaper, index backfill, and migration rewrites are not placement-checked so the node can always repair its local data.
+Definitions and `CATALOG_APPLY` can also carry replica sets that assign a bucket to a set of backends with one `leader` and any number of `follower` members:
+
+```toml
+[[replicas]]
+bucket_id = 2
+affinity_group = "us-west"
+
+[[replicas.members]]
+backend_id = 5
+role = "leader"
+
+[[replicas.members]]
+backend_id = 6
+role = "follower"
+```
+
+Validation requires the bucket to exist, at least one member, exactly one leader, and distinct backends. A replica set and a single-backend placement are mutually exclusive for the same bucket; identical reapplication is a no-op and a different membership returns `CONFLICT`. Keyspace drops cascade replica sets.
+
+The server process is configured with `[placement].local_backend_id` (default `0`). Write paths — `DOC_PUT`, `DOC_DELETE`, counter increments, and `BUCKET_PUT` / `BUCKET_DELETE` — resolve each target bucket's replica set or placement and reject the operation with `FAILED_PRECONDITION` when the bucket is not served by the local backend: replica-set buckets accept writes only from the leader, placement buckets only from the placed backend; unplaced buckets are always writable, and multi-fragment writes are rejected as a whole when any target bucket is remote (such operations need explicit workflows once distribution exists). Reads, the TTL reaper, index backfill, and migration rewrites are not placement-checked so the node can always repair its local data.
 
 ## Offline Migration
 

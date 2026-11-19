@@ -9,9 +9,9 @@ use recolith_protocol::messages::{
     BucketDefinition, BucketPolicy, CatalogAlterRequest, CatalogApplyRequest, CatalogDropRequest,
     CatalogIndexTarget, CollectionDefinition, FieldConversion, FieldMapping, FragmentCardinality,
     FragmentDefinition, IndexDefinition, IndexKind, KeyFieldDefinition, KeyFieldType,
-    KeyspaceDefinition, PlacementDefinition, RedefineIndex, RequestMeta, SchemaDefinition,
-    SchemaMigration, SetBucketSchema, Value, catalog_alter_request, catalog_drop_request,
-    field_mapping,
+    KeyspaceDefinition, PlacementDefinition, RedefineIndex, ReplicaMemberDefinition, ReplicaRole,
+    ReplicaSetDefinition, RequestMeta, SchemaDefinition, SchemaMigration, SetBucketSchema, Value,
+    catalog_alter_request, catalog_drop_request, field_mapping,
 };
 
 use crate::args::CatalogCommand;
@@ -280,6 +280,23 @@ fn definition_request(definition: CatalogDefinition, generation: u64) -> Catalog
             bucket_id: placement.bucket_id.get(),
             backend_id: placement.backend_id.get(),
             affinity_group: placement.affinity_group.clone(),
+        });
+    }
+    for replica_set in definition.replicas {
+        request.replicas.push(ReplicaSetDefinition {
+            bucket_id: replica_set.bucket_id().get(),
+            affinity_group: replica_set.affinity_group().to_owned(),
+            members: replica_set
+                .members()
+                .iter()
+                .map(|member| ReplicaMemberDefinition {
+                    backend_id: member.backend_id().get(),
+                    role: match member.role() {
+                        recolith_catalog::ReplicaRole::Leader => ReplicaRole::Leader as i32,
+                        recolith_catalog::ReplicaRole::Follower => ReplicaRole::Follower as i32,
+                    },
+                })
+                .collect(),
         });
     }
 

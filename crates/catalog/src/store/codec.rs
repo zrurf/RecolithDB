@@ -10,7 +10,7 @@ use recolith_model::{
 use recolith_schema::{EnumSchema, Field, RecordSchema, Type};
 
 use crate::error::{CatalogError, Result};
-use crate::placement::BucketPlacement;
+use crate::placement::{BucketPlacement, ReplicaMember, ReplicaRole, ReplicaSet};
 
 const METADATA_FORMAT_VERSION: u8 = 1;
 
@@ -520,4 +520,36 @@ fn u32_id(value: u64) -> Result<u32> {
 
 fn invalid(message: impl Into<String>) -> CatalogError {
     CatalogError::InvalidMetadata(message.into())
+}
+
+pub(super) fn encode_replica_set(replica_set: &ReplicaSet) -> Vec<u8> {
+    let mut output = start();
+    put_u64(&mut output, replica_set.bucket_id().get());
+    put_string(&mut output, replica_set.affinity_group());
+    put_u32(&mut output, replica_set.members().len() as u32);
+    for member in replica_set.members() {
+        put_u64(&mut output, member.backend_id().get());
+        put_bool(&mut output, member.role() == ReplicaRole::Leader);
+    }
+    output
+}
+
+pub(super) fn decode_replica_set(value: &[u8]) -> Result<ReplicaSet> {
+    let mut reader = Reader::start(value)?;
+    let bucket_id = BucketId::new(reader.u64()?);
+    let affinity_group = reader.string()?;
+    let member_count = reader.u32()?;
+    let mut members = Vec::with_capacity(member_count as usize);
+    for _ in 0..member_count {
+        let backend_id = BackendId::new(reader.u64()?);
+        let role = if reader.bool()? {
+            ReplicaRole::Leader
+        } else {
+            ReplicaRole::Follower
+        };
+        members.push(ReplicaMember::new(backend_id, role));
+    }
+    reader.finish()?;
+
+    Ok(ReplicaSet::new(bucket_id, affinity_group, members))
 }

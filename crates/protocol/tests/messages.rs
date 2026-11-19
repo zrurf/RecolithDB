@@ -10,13 +10,13 @@ use recolith_protocol::messages::{
     FieldValue, FragmentDefinition, FragmentMetadata, FragmentPayload, HelloRequest,
     IndexDefinition, IndexKind, KeyFieldDefinition, KeyFieldMetadata, KeyFieldType,
     KeyspaceDefinition, NamedParameter, PlacementDefinition, QueryRequest, QueryStreamRequest,
-    RequestMeta, SchemaDefinition, SchemaField, SchemaList, SchemaMigration, SchemaScalarType,
-    SchemaType, SetBucketSchema, Value, WorkflowDefinition, WorkflowExecutionMode,
-    WorkflowListRequest, WorkflowPutDocument, WorkflowResolveAction, WorkflowResolveRequest,
-    WorkflowStartRequest, WorkflowStartResponse, WorkflowState, WorkflowStatusResponse,
-    WorkflowStep, catalog_alter_request, catalog_drop_request, compression_bit,
-    describe_collection_request, explain_response, feature, field_mapping, schema_type, value,
-    workflow_step,
+    ReplicaMemberDefinition, ReplicaRole, ReplicaSetDefinition, RequestMeta, SchemaDefinition,
+    SchemaField, SchemaList, SchemaMigration, SchemaScalarType, SchemaType, SetBucketSchema, Value,
+    WorkflowDefinition, WorkflowExecutionMode, WorkflowListRequest, WorkflowPutDocument,
+    WorkflowResolveAction, WorkflowResolveRequest, WorkflowStartRequest, WorkflowStartResponse,
+    WorkflowState, WorkflowStatusResponse, WorkflowStep, catalog_alter_request,
+    catalog_drop_request, compression_bit, describe_collection_request, explain_response, feature,
+    field_mapping, schema_type, value, workflow_step,
 };
 
 #[test]
@@ -226,6 +226,20 @@ fn roundtrips_catalog_apply_request() {
             bucket_id: 1,
             backend_id: 3,
             affinity_group: "us-east".to_owned(),
+        }],
+        replicas: vec![ReplicaSetDefinition {
+            bucket_id: 2,
+            affinity_group: "us-west".to_owned(),
+            members: vec![
+                ReplicaMemberDefinition {
+                    backend_id: 5,
+                    role: ReplicaRole::Leader as i32,
+                },
+                ReplicaMemberDefinition {
+                    backend_id: 6,
+                    role: ReplicaRole::Follower as i32,
+                },
+            ],
         }],
     };
 

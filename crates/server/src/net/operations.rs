@@ -5,7 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use prost::Message;
 use recolith_backend::StorageBackend;
-use recolith_catalog::{CatalogAlter, CatalogChanges, CatalogDrop, CatalogError, CatalogSnapshot};
+use recolith_catalog::{
+    CatalogAlter, CatalogChanges, CatalogDrop, CatalogError, CatalogSnapshot, ReplicaMember,
+    ReplicaRole, ReplicaSet,
+};
 use recolith_common::{
     BackendId, BucketId, CatalogGeneration, CollectionId, CommitTs, FieldId, FragmentId, IndexId,
     KeyspaceId, PartitionId, SchemaId, SchemaVersion,
@@ -848,6 +851,34 @@ fn catalog_changes(request: CatalogApplyRequest) -> Result<CatalogChanges, Opera
             affinity_group: placement.affinity_group,
         });
     }
+    for replica_set in request.replicas {
+        if replica_set.affinity_group.is_empty() {
+            return Err(OperationError::invalid(
+                "replica set affinity group must not be empty",
+            ));
+        }
+        let members = replica_set
+            .members
+            .into_iter()
+            .map(|member| {
+                let role = match messages::ReplicaRole::try_from(member.role) {
+                    Ok(messages::ReplicaRole::Leader) => ReplicaRole::Leader,
+                    Ok(messages::ReplicaRole::Follower) => ReplicaRole::Follower,
+                    _ => {
+                        return Err(OperationError::invalid(
+                            "replica member role must be leader or follower",
+                        ));
+                    }
+                };
+                Ok(ReplicaMember::new(BackendId::new(member.backend_id), role))
+            })
+            .collect::<Result<Vec<_>, OperationError>>()?;
+        changes.replicas.push(ReplicaSet::new(
+            BucketId::new(replica_set.bucket_id),
+            replica_set.affinity_group,
+            members,
+        ));
+    }
 
     Ok(changes)
 }
@@ -933,28 +964,14 @@ fn authorize_catalog_changes(
         require_admin(principal, name, "*")?;
     }
     for placement in &changes.placements {
-        let keyspace_id = snapshot
-            .bucket_keyspaces
-            .get(&placement.bucket_id)
-            .copied()
-            .or_else(|| {
-                changes
-                    .buckets
-                    .iter()
-                    .find(|(_, bucket)| bucket.id() == placement.bucket_id)
-                    .map(|(keyspace_id, _)| *keyspace_id)
-            })
-            .ok_or_else(|| {
-                OperationError::new(status::NOT_FOUND, "placement references an unknown bucket")
-            })?;
-        let name = keyspaces.get(&keyspace_id).copied().ok_or_else(|| {
-            OperationError::new(
-                status::NOT_FOUND,
-                "placement references an unknown keyspace",
-            )
-        })?;
+        let name = placement_keyspace(snapshot, changes, placement.bucket_id)?;
         require_admin(principal, name, "*")?;
     }
+    for replica_set in &changes.replicas {
+        let name = placement_keyspace(snapshot, changes, replica_set.bucket_id())?;
+        require_admin(principal, name, "*")?;
+    }
+
     for collection in &changes.collections {
         let name = keyspaces
             .get(&collection.keyspace_id())
@@ -1028,6 +1045,41 @@ fn authorize_collection(
             "permission denied",
         ))
     }
+}
+
+fn placement_keyspace<'a>(
+    snapshot: &'a CatalogSnapshot,
+    changes: &'a CatalogChanges,
+    bucket_id: BucketId,
+) -> Result<&'a str, OperationError> {
+    let keyspace_id = snapshot
+        .bucket_keyspaces
+        .get(&bucket_id)
+        .copied()
+        .or_else(|| {
+            changes
+                .buckets
+                .iter()
+                .find(|(_, bucket)| bucket.id() == bucket_id)
+                .map(|(keyspace_id, _)| *keyspace_id)
+        })
+        .ok_or_else(|| {
+            OperationError::new(status::NOT_FOUND, "placement references an unknown bucket")
+        })?;
+    let mut keyspaces = snapshot
+        .keyspaces
+        .iter()
+        .map(|(id, keyspace)| (*id, keyspace.name()))
+        .collect::<BTreeMap<_, _>>();
+    for keyspace in &changes.keyspaces {
+        keyspaces.insert(keyspace.id(), keyspace.name());
+    }
+    keyspaces.get(&keyspace_id).copied().ok_or_else(|| {
+        OperationError::new(
+            status::NOT_FOUND,
+            "placement references an unknown keyspace",
+        )
+    })
 }
 
 fn resolve_collection<'a>(
@@ -2013,6 +2065,7 @@ fn map_document(error: DocumentError) -> OperationError {
         }
         DocumentError::Catalog(
             CatalogError::InvalidReference(_)
+            | CatalogError::InvalidPlacement(_)
             | CatalogError::InvalidIndex(_)
             | CatalogError::Schema(_)
             | CatalogError::SchemaVersionConflict

@@ -2856,6 +2856,15 @@ fn check_bucket_placement(
     bucket_id: BucketId,
     local_backend: BackendId,
 ) -> Result<(), DocumentError> {
+    // A replica set takes precedence: only the leader accepts writes.
+    if let Some(replica_set) = snapshot.replica_sets.get(&bucket_id) {
+        let leader = replica_set.leader();
+        if leader != local_backend {
+            return Err(placement_rejected(bucket_id, leader, local_backend));
+        }
+
+        return Ok(());
+    }
     if let Some(placement) = snapshot.placements.get(&bucket_id)
         && placement.backend_id() != local_backend
     {

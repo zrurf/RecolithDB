@@ -1,6 +1,6 @@
 //! Additive catalog definition application.
 
-use crate::placement::BucketPlacement;
+use crate::placement::{BucketPlacement, ReplicaSet};
 use recolith_common::{BackendId, BucketId, KeyspaceId};
 use recolith_model::{Bucket, Collection, IndexDefinition, Keyspace};
 use recolith_schema::RecordSchema;
@@ -40,6 +40,8 @@ pub struct CatalogChanges {
     pub indexes: Vec<(BucketId, IndexDefinition)>,
     /// Bucket placements to assign.
     pub placements: Vec<PlacementChange>,
+    /// Replica sets to assign.
+    pub replicas: Vec<ReplicaSet>,
 }
 
 impl Catalog {
@@ -130,6 +132,18 @@ impl Catalog {
                 return Err(conflict(format!("index {}", index.id())));
             }
             candidate.create_index(*bucket_id, index.clone())?;
+            changed = true;
+        }
+
+        for replica_set in &changes.replicas {
+            let current = candidate.snapshot()?;
+            if let Some(existing) = current.replica_sets.get(&replica_set.bucket_id()) {
+                if *existing == *replica_set {
+                    continue;
+                }
+                return Err(conflict(format!("replica set {}", replica_set.bucket_id())));
+            }
+            candidate.set_replicas(replica_set.clone())?;
             changed = true;
         }
 

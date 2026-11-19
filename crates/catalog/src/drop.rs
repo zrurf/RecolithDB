@@ -92,6 +92,7 @@ fn drop_bucket(snapshot: &mut CatalogSnapshot, id: BucketId) -> Result<()> {
     snapshot.bucket_keyspaces.remove(&id);
     snapshot.indexes.remove(&id);
     snapshot.placements.remove(&id);
+    snapshot.replica_sets.remove(&id);
 
     Ok(())
 }
@@ -147,6 +148,7 @@ fn drop_keyspace(snapshot: &mut CatalogSnapshot, id: KeyspaceId) -> Result<()> {
         snapshot.bucket_keyspaces.remove(&bucket_id);
         snapshot.indexes.remove(&bucket_id);
         snapshot.placements.remove(&bucket_id);
+        snapshot.replica_sets.remove(&bucket_id);
     }
     snapshot.keyspaces.remove(&id);
 

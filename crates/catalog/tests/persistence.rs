@@ -11,7 +11,9 @@ use recolith_model::{
 use recolith_schema::{Field, RecordSchema, Type};
 
 use recolith_catalog::store::CATALOG_PREFIX;
-use recolith_catalog::{BucketPlacement, Catalog, load_catalog, save_catalog};
+use recolith_catalog::{
+    BucketPlacement, Catalog, ReplicaMember, ReplicaRole, ReplicaSet, load_catalog, save_catalog,
+};
 
 fn schema(version: u32, optional: bool) -> RecordSchema {
     RecordSchema::new(
@@ -159,4 +161,47 @@ fn rejects_malformed_metadata() {
     transaction.commit().expect("commit");
 
     assert!(load_catalog(&backend).is_err());
+}
+
+#[test]
+fn saves_and_loads_replica_sets() {
+    use recolith_model::{Bucket, BucketPolicy};
+
+    let backend = MemoryBackend::new();
+    let catalog = populated_catalog();
+    catalog
+        .create_bucket(
+            KeyspaceId::new(1),
+            Bucket::new(
+                BucketId::new(2),
+                "events",
+                8,
+                BucketPolicy::Managed,
+                recolith_common::SchemaId::new(1),
+                recolith_common::SchemaVersion::new(1),
+            ),
+        )
+        .expect("bucket");
+    catalog
+        .set_replicas(ReplicaSet::new(
+            BucketId::new(2),
+            "us-east",
+            vec![
+                ReplicaMember::new(BackendId::new(1), ReplicaRole::Leader),
+                ReplicaMember::new(BackendId::new(2), ReplicaRole::Follower),
+            ],
+        ))
+        .expect("replica set");
+    save_catalog(&backend, &catalog).expect("save");
+
+    let loaded = load_catalog(&backend).expect("load");
+    let snapshot = loaded.snapshot().expect("snapshot");
+    let replica_set = snapshot
+        .replica_sets
+        .get(&BucketId::new(2))
+        .expect("replica set");
+    assert_eq!(replica_set.affinity_group(), "us-east");
+    assert_eq!(replica_set.members().len(), 2);
+    assert_eq!(replica_set.leader(), BackendId::new(1));
+    assert_eq!(replica_set.members()[1].role(), ReplicaRole::Follower);
 }

@@ -10,7 +10,7 @@ use recolith_model::{Bucket, Collection, IndexDefinition, IndexKind, Keyspace};
 use recolith_schema::{RecordSchema, Type};
 
 use crate::error::{CatalogError, Result};
-use crate::placement::BucketPlacement;
+use crate::placement::{BucketPlacement, ReplicaRole, ReplicaSet};
 use crate::schema_registry::{SchemaRegistry, SchemaSnapshot};
 
 /// Immutable catalog snapshot.
@@ -30,6 +30,8 @@ pub struct CatalogSnapshot {
     pub indexes: BTreeMap<BucketId, BTreeMap<IndexId, IndexDefinition>>,
     /// Bucket placements.
     pub placements: BTreeMap<BucketId, BucketPlacement>,
+    /// Replica sets per bucket.
+    pub replica_sets: BTreeMap<BucketId, ReplicaSet>,
     /// Schema snapshot.
     pub schemas: SchemaSnapshot,
 }
@@ -61,6 +63,7 @@ struct CatalogState {
     collections: BTreeMap<CollectionId, Collection>,
     indexes: BTreeMap<BucketId, BTreeMap<IndexId, IndexDefinition>>,
     placements: BTreeMap<BucketId, BucketPlacement>,
+    replica_sets: BTreeMap<BucketId, ReplicaSet>,
 }
 
 /// Local catalog with generation tracking.
@@ -241,6 +244,12 @@ impl Catalog {
             .get(&placement.bucket_id())
             .ok_or(CatalogError::NotFound("bucket"))?;
 
+        if state.replica_sets.contains_key(&placement.bucket_id()) {
+            return Err(CatalogError::InvalidPlacement(format!(
+                "bucket {} already has a replica set",
+                placement.bucket_id()
+            )));
+        }
         if bucket.partition_count() != placement.partition_count() {
             return Err(CatalogError::InvalidPlacement(format!(
                 "bucket {} has {} partitions, placement has {}",
@@ -260,6 +269,73 @@ impl Catalog {
         self.bump();
 
         Ok(())
+    }
+
+    /// Assigns a bucket's replica membership.
+    ///
+    /// A replica set and a single-backend placement are mutually exclusive.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError`] for missing buckets, invalid membership,
+    /// legacy placements, or conflicting affinity groups.
+    pub fn set_replicas(&self, replica_set: ReplicaSet) -> Result<()> {
+        let mut state = self.write()?;
+        if !state.buckets.contains_key(&replica_set.bucket_id()) {
+            return Err(CatalogError::NotFound("bucket"));
+        }
+
+        if state.placements.contains_key(&replica_set.bucket_id()) {
+            return Err(CatalogError::InvalidPlacement(format!(
+                "bucket {} already has a single-backend placement",
+                replica_set.bucket_id()
+            )));
+        }
+        if replica_set.members().is_empty() {
+            return Err(CatalogError::InvalidPlacement(
+                "replica set must contain at least one member".to_owned(),
+            ));
+        }
+        if replica_set.affinity_group().is_empty() {
+            return Err(CatalogError::InvalidPlacement(
+                "affinity group must not be empty".to_owned(),
+            ));
+        }
+        let leaders = replica_set
+            .members()
+            .iter()
+            .filter(|member| member.role() == ReplicaRole::Leader)
+            .count();
+        if leaders != 1 {
+            return Err(CatalogError::InvalidPlacement(format!(
+                "replica set must contain exactly one leader, found {leaders}"
+            )));
+        }
+        let mut backends = BTreeSet::new();
+        for member in replica_set.members() {
+            if !backends.insert(member.backend_id()) {
+                return Err(CatalogError::InvalidPlacement(format!(
+                    "backend {} appears twice in the replica set",
+                    member.backend_id()
+                )));
+            }
+        }
+        state
+            .replica_sets
+            .insert(replica_set.bucket_id(), replica_set);
+        drop(state);
+        self.bump();
+
+        Ok(())
+    }
+
+    /// Returns the replica set of one bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CatalogError`] when the catalog state cannot be read.
+    pub fn replica_set(&self, bucket: BucketId) -> Result<Option<ReplicaSet>> {
+        Ok(self.read()?.replica_sets.get(&bucket).cloned())
     }
 
     /// Registers a schema version and advances the catalog generation.
@@ -318,6 +394,7 @@ impl Catalog {
             collections: state.collections.clone(),
             indexes: state.indexes.clone(),
             placements: state.placements.clone(),
+            replica_sets: state.replica_sets.clone(),
             schemas,
         })
     }
@@ -459,6 +536,7 @@ impl Catalog {
                 collections: snapshot.collections,
                 indexes: snapshot.indexes,
                 placements: snapshot.placements,
+                replica_sets: snapshot.replica_sets,
             }),
             schema_registry,
             generation: AtomicU64::new(snapshot.generation.get()),

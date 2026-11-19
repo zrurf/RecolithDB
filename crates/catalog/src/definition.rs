@@ -15,6 +15,7 @@ use thiserror::Error;
 use crate::apply::{CatalogChanges, PlacementChange};
 use crate::catalog::Catalog;
 use crate::error::CatalogError;
+use crate::placement::{ReplicaMember, ReplicaRole, ReplicaSet};
 
 /// Parsed catalog definition file.
 #[derive(Clone, Debug, Default)]
@@ -31,6 +32,8 @@ pub struct CatalogDefinition {
     pub indexes: Vec<(BucketId, IndexDefinition)>,
     /// Bucket placements to assign.
     pub placements: Vec<PlacementChange>,
+    /// Replica sets to assign.
+    pub replicas: Vec<ReplicaSet>,
 }
 
 /// Schema definition carrying source IDL.
@@ -105,6 +108,7 @@ impl CatalogDefinition {
             && file.collections.is_empty()
             && file.indexes.is_empty()
             && file.placements.is_empty()
+            && file.replicas.is_empty()
         {
             return Err(DefinitionError::Empty);
         }
@@ -206,6 +210,26 @@ impl CatalogDefinition {
                 affinity_group: placement.affinity_group,
             })
             .collect();
+        let replicas = file
+            .replicas
+            .into_iter()
+            .map(|replica_set| {
+                ReplicaSet::new(
+                    BucketId::new(replica_set.bucket_id),
+                    replica_set.affinity_group,
+                    replica_set
+                        .members
+                        .into_iter()
+                        .map(|member| {
+                            ReplicaMember::new(
+                                recolith_common::BackendId::new(member.backend_id),
+                                member.role.into(),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
 
         Ok(Self {
             keyspaces,
@@ -214,6 +238,7 @@ impl CatalogDefinition {
             collections,
             indexes,
             placements,
+            replicas,
         })
     }
 
@@ -247,6 +272,7 @@ impl CatalogDefinition {
             collections: self.collections,
             indexes: self.indexes,
             placements: self.placements,
+            replicas: self.replicas,
         })
     }
 
@@ -279,6 +305,8 @@ struct DefinitionFile {
     indexes: Vec<IndexConfig>,
     #[serde(default)]
     placements: Vec<PlacementConfig>,
+    #[serde(default)]
+    replicas: Vec<ReplicaConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -432,6 +460,37 @@ impl From<KeyTypeConfig> for KeyType {
             KeyTypeConfig::String => Self::String,
             KeyTypeConfig::Bytes => Self::Bytes,
             KeyTypeConfig::Uuid => Self::Uuid,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplicaConfig {
+    bucket_id: u64,
+    affinity_group: String,
+    members: Vec<ReplicaMemberConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplicaMemberConfig {
+    backend_id: u64,
+    role: ReplicaRoleConfig,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ReplicaRoleConfig {
+    Leader,
+    Follower,
+}
+
+impl From<ReplicaRoleConfig> for ReplicaRole {
+    fn from(role: ReplicaRoleConfig) -> Self {
+        match role {
+            ReplicaRoleConfig::Leader => ReplicaRole::Leader,
+            ReplicaRoleConfig::Follower => ReplicaRole::Follower,
         }
     }
 }

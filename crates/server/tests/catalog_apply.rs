@@ -162,6 +162,7 @@ fn base_request() -> CatalogApplyRequest {
         }],
         indexes: Vec::new(),
         placements: Vec::new(),
+        replicas: Vec::new(),
     }
 }
 
@@ -358,6 +359,7 @@ fn catalog_changes() -> CatalogChanges {
             ),
         )],
         placements: Vec::new(),
+        replicas: Vec::new(),
     }
 }
 

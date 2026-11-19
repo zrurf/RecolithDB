@@ -777,6 +777,24 @@ message CatalogApplyRequest {
   repeated CollectionDefinition collections = 5;
   repeated IndexDefinition indexes = 6;
   repeated PlacementDefinition placements = 7;
+  repeated ReplicaSetDefinition replicas = 8;
+}
+
+enum ReplicaRole {
+  REPLICA_ROLE_UNSPECIFIED = 0;
+  REPLICA_ROLE_LEADER = 1;
+  REPLICA_ROLE_FOLLOWER = 2;
+}
+
+message ReplicaMemberDefinition {
+  uint64 backend_id = 1;
+  ReplicaRole role = 2;
+}
+
+message ReplicaSetDefinition {
+  uint64 bucket_id = 1;
+  string affinity_group = 2;
+  repeated ReplicaMemberDefinition members = 3;
 }
 
 message PlacementDefinition {

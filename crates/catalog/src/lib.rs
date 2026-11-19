@@ -17,6 +17,6 @@ pub use catalog::{Catalog, CatalogSnapshot};
 pub use definition::{CatalogDefinition, DefinitionError, SchemaDefinition};
 pub use drop::CatalogDrop;
 pub use error::{CatalogError, Result};
-pub use placement::BucketPlacement;
+pub use placement::{BucketPlacement, ReplicaMember, ReplicaRole, ReplicaSet};
 pub use schema_registry::{SchemaRegistry, SchemaSnapshot};
 pub use store::{CatalogWrite, load_catalog, save_catalog};
