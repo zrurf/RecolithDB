@@ -17,6 +17,8 @@ pub enum SchemaError {
     EmptyRecord(String),
     /// A type is invalid in its context.
     InvalidType(String),
+    /// A field is marked unique with an unsupported type.
+    InvalidUniqueField(String),
     /// An enum has no variants.
     EmptyEnum(String),
     /// Two enum variants use the same name.
@@ -36,6 +38,9 @@ impl fmt::Display for SchemaError {
                 write!(formatter, "record {name} must have at least one field")
             }
             Self::InvalidType(message) => write!(formatter, "invalid type: {message}"),
+            Self::InvalidUniqueField(name) => {
+                write!(formatter, "field {name} cannot be globally unique")
+            }
             Self::EmptyEnum(name) => {
                 write!(formatter, "enum {name} must have at least one variant")
             }

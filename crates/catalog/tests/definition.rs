@@ -46,6 +46,11 @@ id = 1
 name = "by-level"
 kind = "range"
 fields = [2]
+
+[[placements]]
+bucket_id = 1
+backend_id = 3
+affinity_group = "us-east"
 "#;
 
 #[test]
@@ -56,11 +61,15 @@ fn parses_definitions_into_catalog_changes() {
     assert_eq!(definition.buckets.len(), 1);
     assert_eq!(definition.collections.len(), 1);
     assert_eq!(definition.indexes.len(), 1);
+    assert_eq!(definition.placements.len(), 1);
 
     let changes = definition.into_changes().expect("changes");
     assert_eq!(changes.schemas[0].name(), "Profile");
     assert_eq!(changes.collections[0].name(), "player");
     assert_eq!(changes.indexes[0].1.fields().len(), 1);
+    assert_eq!(changes.placements[0].bucket_id.get(), 1);
+    assert_eq!(changes.placements[0].backend_id.get(), 3);
+    assert_eq!(changes.placements[0].affinity_group, "us-east");
 }
 
 #[test]
@@ -75,7 +84,7 @@ fn builds_catalog_from_definitions() {
     assert_eq!(snapshot.buckets.len(), 1);
     assert_eq!(snapshot.collections.len(), 1);
     assert_eq!(snapshot.schemas.schemas.len(), 1);
-    assert_eq!(catalog.generation().get(), 5);
+    assert_eq!(catalog.generation().get(), 6);
 }
 
 #[test]
@@ -108,4 +117,35 @@ unexpected = true
         CatalogDefinition::parse(unknown),
         Err(DefinitionError::Parse(_))
     ));
+}
+
+#[test]
+fn builds_catalog_with_placement_from_definitions() {
+    let catalog = CatalogDefinition::parse(DEFINITION)
+        .expect("definition")
+        .into_catalog()
+        .expect("catalog");
+    let snapshot = catalog.snapshot().expect("snapshot");
+    let placement = snapshot
+        .placements
+        .get(&recolith_common::BucketId::new(1))
+        .expect("placement");
+    assert_eq!(placement.backend_id().get(), 3);
+    assert_eq!(placement.affinity_group(), "us-east");
+    assert_eq!(placement.partition_count(), 16);
+}
+
+#[test]
+fn rejects_placement_for_unknown_bucket() {
+    let broken = DEFINITION.replace(
+        "bucket_id = 1
+backend_id = 3",
+        "bucket_id = 9
+backend_id = 3",
+    );
+    let error = CatalogDefinition::parse(&broken)
+        .expect("parse")
+        .into_catalog()
+        .expect_err("unknown bucket");
+    assert!(error.to_string().contains("not found") || error.to_string().contains("bucket"));
 }

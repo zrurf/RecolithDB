@@ -32,6 +32,15 @@ pub struct Config {
     /// Document expiry reaper settings.
     #[serde(default)]
     pub ttl: TtlSettings,
+    /// Observability settings.
+    #[serde(default)]
+    pub observability: ObservabilitySettings,
+    /// Workflow execution settings.
+    #[serde(default)]
+    pub workflow: WorkflowSettings,
+    /// Placement settings.
+    #[serde(default)]
+    pub placement: PlacementSettings,
 }
 
 /// Listener and protocol settings.
@@ -144,6 +153,66 @@ impl Default for TtlSettings {
     }
 }
 
+/// Observability settings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservabilitySettings {
+    /// Threshold in milliseconds for slow-operation logs. Zero disables logging.
+    #[serde(default = "default_slow_query_threshold")]
+    pub slow_query_threshold_ms: u64,
+}
+
+impl Default for ObservabilitySettings {
+    fn default() -> Self {
+        Self {
+            slow_query_threshold_ms: default_slow_query_threshold(),
+        }
+    }
+}
+
+/// Workflow execution settings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowSettings {
+    /// Default `WF_START` execution mode. `async` submissions return
+    /// immediately and execute in the background.
+    #[serde(default)]
+    pub execution: WorkflowExecution,
+    /// Per-step timeout in milliseconds. Zero disables the timeout.
+    #[serde(default = "default_workflow_step_timeout_ms")]
+    pub step_timeout_ms: u64,
+}
+
+impl Default for WorkflowSettings {
+    fn default() -> Self {
+        Self {
+            execution: WorkflowExecution::default(),
+            step_timeout_ms: default_workflow_step_timeout_ms(),
+        }
+    }
+}
+
+/// Placement settings.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlacementSettings {
+    /// Backend identifier this process writes locally. Buckets placed on a
+    /// different backend reject local writes.
+    #[serde(default)]
+    pub local_backend_id: u64,
+}
+
+/// Default `WF_START` execution mode.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkflowExecution {
+    /// Steps run inside the request (default).
+    #[default]
+    Sync,
+    /// Steps run in a background task; submissions return immediately.
+    Async,
+}
+
 /// Configuration loading or validation failure.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -224,6 +293,7 @@ impl Config {
         config.max_batch_bytes = self.server.max_batch_bytes;
         config.max_decompressed_size = self.server.max_decompressed_size;
         config.compression_threshold = self.server.compression_threshold;
+        config.slow_query_threshold_ms = self.observability.slow_query_threshold_ms;
         if let Some(auth) = &self.auth {
             let authenticator = Authenticator::from_files_with_revocations(
                 &auth.secret_file,
@@ -373,4 +443,12 @@ const fn default_ttl_sweep_interval() -> u64 {
 
 const fn default_ttl_batch_size() -> usize {
     1_000
+}
+
+const fn default_slow_query_threshold() -> u64 {
+    200
+}
+
+fn default_workflow_step_timeout_ms() -> u64 {
+    5_000
 }

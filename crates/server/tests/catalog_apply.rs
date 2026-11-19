@@ -4,7 +4,9 @@ use std::sync::Arc;
 use prost::Message;
 use recolith_backend_fjall::FjallBackend;
 use recolith_backend_memory::MemoryBackend;
-use recolith_catalog::{Catalog, CatalogChanges, load_catalog};
+use recolith_catalog::{
+    Catalog, CatalogChanges, CatalogError, apply::PlacementChange, load_catalog,
+};
 use recolith_common::{
     BucketId, CollectionId, FieldId, FragmentId, IndexId, KeyspaceId, SchemaId, SchemaVersion,
 };
@@ -26,7 +28,7 @@ use recolith_protocol::messages::{
     catalog_drop_request, describe_collection_request, opcode, status, value,
 };
 use recolith_schema::{Field, RecordSchema, Type};
-use recolith_server::{DocumentStore, ServerConfig, serve};
+use recolith_server::{DocumentError, DocumentStore, ServerConfig, serve};
 use recolith_storage::encode_document_key;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -159,6 +161,7 @@ fn base_request() -> CatalogApplyRequest {
             }],
         }],
         indexes: Vec::new(),
+        placements: Vec::new(),
     }
 }
 
@@ -354,6 +357,7 @@ fn catalog_changes() -> CatalogChanges {
                 vec![FieldId::new(2)],
             ),
         )],
+        placements: Vec::new(),
     }
 }
 
@@ -844,4 +848,52 @@ async fn rejects_invalid_schemas_and_missing_references() {
     assert_eq!(header.opcode(), opcode::ERROR);
     assert_eq!(header.status(), status::NOT_FOUND);
     assert_eq!(store.catalog_generation().get(), 0);
+}
+
+#[test]
+fn applies_placements_with_validation() {
+    let backend = Arc::new(MemoryBackend::new());
+    let store = DocumentStore::new(Arc::new(Catalog::new()), backend.clone());
+    let generation = store
+        .apply_catalog(&catalog_changes(), None)
+        .expect("apply");
+
+    let mut placed = catalog_changes();
+    placed.placements = vec![PlacementChange {
+        bucket_id: BucketId::new(1),
+        backend_id: recolith_common::BackendId::new(4),
+        affinity_group: "us-east".to_owned(),
+    }];
+    let generation = store
+        .apply_catalog(&placed, Some(generation))
+        .expect("apply placement");
+    let snapshot = store.catalog_snapshot().expect("snapshot");
+    let placement = snapshot
+        .placements
+        .get(&BucketId::new(1))
+        .expect("placement");
+    assert_eq!(placement.backend_id().get(), 4);
+    assert_eq!(placement.partition_count(), 16);
+
+    // Identical reapplication is a no-op.
+    assert!(store.apply_catalog(&placed, Some(generation)).is_ok());
+    let snapshot = store.catalog_snapshot().expect("snapshot");
+    assert!(snapshot.placements.contains_key(&BucketId::new(1)));
+
+    // A different backend for the same bucket conflicts.
+    let mut conflicting = placed.clone();
+    conflicting.placements[0].backend_id = recolith_common::BackendId::new(5);
+    assert!(matches!(
+        store.apply_catalog(&conflicting, Some(generation)),
+        Err(DocumentError::Catalog(CatalogError::Conflict(message)))
+            if message.contains("placement")
+    ));
+
+    // An unknown bucket is rejected.
+    let mut unknown = placed;
+    unknown.placements[0].bucket_id = BucketId::new(9);
+    assert!(matches!(
+        store.apply_catalog(&unknown, Some(generation)),
+        Err(DocumentError::Catalog(CatalogError::NotFound("bucket")))
+    ));
 }

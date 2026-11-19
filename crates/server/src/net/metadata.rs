@@ -86,6 +86,7 @@ fn schema_field(field: &Field) -> Result<SchemaField, OperationError> {
         name: field.name().to_owned(),
         optional: field.optional(),
         r#type: Some(schema_type(field.ty())?),
+        unique: field.unique(),
     })
 }
 

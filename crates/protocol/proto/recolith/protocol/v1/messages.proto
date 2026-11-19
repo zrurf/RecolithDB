@@ -280,6 +280,233 @@ message BackupResponse {
   uint64 bytes = 4;
 }
 
+enum WorkflowState {
+  WORKFLOW_STATE_UNSPECIFIED = 0;
+  WORKFLOW_STATE_PENDING = 1;
+  WORKFLOW_STATE_RUNNING = 2;
+  WORKFLOW_STATE_COMPENSATING = 3;
+  WORKFLOW_STATE_COMPLETED = 4;
+  WORKFLOW_STATE_COMPENSATED = 5;
+  WORKFLOW_STATE_FAILED = 6;
+  WORKFLOW_STATE_ABANDONED = 7;
+}
+
+enum WorkflowExecutionMode {
+  WORKFLOW_EXECUTION_MODE_UNSPECIFIED = 0;
+  WORKFLOW_EXECUTION_MODE_SYNC = 1;
+  WORKFLOW_EXECUTION_MODE_ASYNC = 2;
+}
+
+enum WorkflowStepStatus {
+  WORKFLOW_STEP_STATUS_UNSPECIFIED = 0;
+  WORKFLOW_STEP_STATUS_PENDING = 1;
+  WORKFLOW_STEP_STATUS_SUCCEEDED = 2;
+  WORKFLOW_STEP_STATUS_FAILED = 3;
+  WORKFLOW_STEP_STATUS_COMPENSATED = 4;
+  WORKFLOW_STEP_STATUS_SKIPPED = 5;
+}
+
+message WorkflowPutDocument {
+  uint64 collection_id = 1;
+  uint32 partition = 2;
+  bytes document_key = 3;
+  repeated FragmentPayload fragments = 4;
+  optional uint64 ttl_seconds = 5;
+}
+
+message WorkflowDeleteDocument {
+  uint64 collection_id = 1;
+  uint32 partition = 2;
+  bytes document_key = 3;
+}
+
+message WorkflowIncrementField {
+  uint64 collection_id = 1;
+  uint32 partition = 2;
+  bytes document_key = 3;
+  uint32 fragment_id = 4;
+  uint32 field_id = 5;
+  sint64 delta = 6;
+}
+
+message WorkflowClaimReservation {
+  uint64 schema_id = 1;
+  uint32 field_id = 2;
+  Value value = 3;
+  uint64 collection_id = 4;
+  uint32 partition = 5;
+  bytes document_key = 6;
+  uint64 ttl_seconds = 7;
+}
+
+message WorkflowConfirmReservation {
+  uint64 schema_id = 1;
+  uint32 field_id = 2;
+  Value value = 3;
+  uint64 collection_id = 4;
+  uint32 partition = 5;
+  bytes document_key = 6;
+}
+
+message WorkflowStep {
+  oneof kind {
+    WorkflowPutDocument put_document = 1;
+    WorkflowDeleteDocument delete_document = 2;
+    WorkflowIncrementField increment_field = 3;
+    WorkflowClaimReservation claim_reservation = 4;
+    WorkflowConfirmReservation confirm_reservation = 5;
+  }
+}
+
+message WorkflowStepState {
+  WorkflowStep step = 1;
+  WorkflowStepStatus status = 2;
+  optional bytes before_value = 3;
+  optional bytes after_value = 4;
+}
+
+message WorkflowDefinition {
+  repeated WorkflowStep steps = 1;
+}
+
+message WorkflowRecord {
+  string id = 1;
+  WorkflowState state = 2;
+  uint32 current_step = 3;
+  repeated WorkflowStepState steps = 4;
+  string error = 5;
+  uint64 created_at_unix_micros = 6;
+  uint64 updated_at_unix_micros = 7;
+}
+
+message WorkflowStartRequest {
+  RequestMeta meta = 1;
+  string id = 2;
+  WorkflowDefinition definition = 3;
+  WorkflowExecutionMode execution_mode = 4;
+}
+
+message WorkflowStatusRequest {
+  RequestMeta meta = 1;
+  string id = 2;
+}
+
+message WorkflowCancelRequest {
+  RequestMeta meta = 1;
+  string id = 2;
+}
+
+message WorkflowStatusResponse {
+  string id = 1;
+  WorkflowState state = 2;
+  uint32 current_step = 3;
+  repeated WorkflowStepState steps = 4;
+  string error = 5;
+  uint64 created_at_unix_micros = 6;
+  uint64 updated_at_unix_micros = 7;
+}
+
+message WorkflowStartResponse {
+  WorkflowStatusResponse workflow = 1;
+}
+
+enum WorkflowResolveAction {
+  WORKFLOW_RESOLVE_ACTION_UNSPECIFIED = 0;
+  WORKFLOW_RESOLVE_ACTION_RETRY = 1;
+  WORKFLOW_RESOLVE_ACTION_ABANDON = 2;
+}
+
+message WorkflowResolveRequest {
+  RequestMeta meta = 1;
+  string id = 2;
+  WorkflowResolveAction action = 3;
+}
+
+message WorkflowResolveResponse {
+  WorkflowStatusResponse workflow = 1;
+}
+
+message WorkflowSummary {
+  string id = 1;
+  WorkflowState state = 2;
+  uint32 current_step = 3;
+  string error = 4;
+  uint64 created_at_unix_micros = 5;
+  uint64 updated_at_unix_micros = 6;
+}
+
+message WorkflowListRequest {
+  RequestMeta meta = 1;
+  string start_after = 2;
+  uint32 limit = 3;
+}
+
+message WorkflowListResponse {
+  repeated WorkflowSummary workflows = 1;
+}
+
+message BucketRecordId {
+  uint64 bucket_id = 1;
+  uint32 partition = 2;
+  uint32 fragment_id = 3;
+  bytes document_key = 4;
+  bytes subkey = 5;
+  optional string keyspace = 6;
+  optional string bucket_name = 7;
+}
+
+message BucketRecord {
+  BucketRecordId id = 1;
+  uint64 schema_id = 2;
+  uint32 schema_version = 3;
+  uint64 commit_ts = 4;
+  repeated FieldValue fields = 5;
+}
+
+message BucketGetRequest {
+  RequestMeta meta = 1;
+  BucketRecordId id = 2;
+}
+
+message BucketGetResponse {
+  BucketRecord record = 1;
+}
+
+message BucketPutRequest {
+  RequestMeta meta = 1;
+  BucketRecordId id = 2;
+  repeated FieldValue fields = 3;
+  optional uint64 if_match = 4;
+}
+
+message BucketPutResponse {
+  uint64 commit_ts = 1;
+}
+
+message BucketDeleteRequest {
+  RequestMeta meta = 1;
+  BucketRecordId id = 2;
+}
+
+message BucketDeleteResponse {
+  bool deleted = 1;
+}
+
+message BucketScanRequest {
+  RequestMeta meta = 1;
+  uint64 bucket_id = 2;
+  uint32 partition = 3;
+  optional uint32 fragment_id = 4;
+  bytes start_after = 5;
+  uint32 limit = 6;
+  optional string keyspace = 7;
+  optional string bucket_name = 8;
+}
+
+message BucketScanResponse {
+  repeated BucketRecord records = 1;
+}
+
 message ExplainRequest {
   RequestMeta meta = 1;
   uint32 partition = 2;
@@ -434,6 +661,7 @@ message SchemaField {
   string name = 2;
   bool optional = 3;
   SchemaType type = 4;
+  bool unique = 5;
 }
 
 message KeyFieldMetadata {
@@ -548,6 +776,13 @@ message CatalogApplyRequest {
   repeated BucketDefinition buckets = 4;
   repeated CollectionDefinition collections = 5;
   repeated IndexDefinition indexes = 6;
+  repeated PlacementDefinition placements = 7;
+}
+
+message PlacementDefinition {
+  uint64 bucket_id = 1;
+  uint64 backend_id = 2;
+  string affinity_group = 3;
 }
 
 message CatalogApplyResponse {

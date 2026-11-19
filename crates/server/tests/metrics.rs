@@ -46,3 +46,55 @@ fn overflow_bucket_uses_maximum() {
     assert_eq!(latency.p99_micros, 10_000_000);
     assert_eq!(latency.max_micros, 10_000_000);
 }
+
+#[test]
+fn tracks_new_operation_counters_and_latency() {
+    let metrics = ServerMetrics::new();
+    let operations = [
+        (opcode::DOC_DELETE, Duration::from_micros(50)),
+        (opcode::EXPLAIN, Duration::from_micros(60)),
+        (opcode::AGGREGATE, Duration::from_micros(70)),
+        (opcode::BACKUP, Duration::from_micros(80)),
+    ];
+    for (operation, duration) in operations {
+        metrics.request(operation);
+        metrics.observe_latency(operation, duration);
+    }
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.document_deletes, 1);
+    assert_eq!(snapshot.explanations, 1);
+    assert_eq!(snapshot.aggregates, 1);
+    assert_eq!(snapshot.backups, 1);
+    assert_eq!(snapshot.document_delete_latency.count, 1);
+    assert_eq!(snapshot.document_delete_latency.mean_micros, 50);
+    assert_eq!(snapshot.explain_latency.count, 1);
+    assert_eq!(snapshot.explain_latency.mean_micros, 60);
+    assert_eq!(snapshot.aggregate_latency.count, 1);
+    assert_eq!(snapshot.aggregate_latency.mean_micros, 70);
+    assert_eq!(snapshot.backup_latency.count, 1);
+    assert_eq!(snapshot.backup_latency.mean_micros, 80);
+}
+
+#[test]
+fn tracks_bucket_operation_counters_and_latency() {
+    let metrics = ServerMetrics::new();
+    let operations = [
+        opcode::BUCKET_GET,
+        opcode::BUCKET_PUT,
+        opcode::BUCKET_DELETE,
+        opcode::BUCKET_SCAN,
+    ];
+    for operation in operations {
+        metrics.request(operation);
+        metrics.observe_latency(operation, Duration::from_micros(40));
+    }
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(snapshot.bucket_ops, 4);
+    assert_eq!(snapshot.bucket_get_latency.count, 1);
+    assert_eq!(snapshot.bucket_put_latency.count, 1);
+    assert_eq!(snapshot.bucket_delete_latency.count, 1);
+    assert_eq!(snapshot.bucket_scan_latency.count, 1);
+    assert_eq!(snapshot.bucket_get_latency.p99_micros, 64);
+}

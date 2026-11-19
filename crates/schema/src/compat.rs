@@ -45,6 +45,9 @@ pub fn check_compatibility(old: &RecordSchema, new: &RecordSchema) -> Result<Com
         if old_field.optional() && !new_field.optional() {
             return Ok(Compatibility::RequiresMigration);
         }
+        if old_field.unique() != new_field.unique() {
+            return Ok(Compatibility::RequiresMigration);
+        }
     }
 
     let old_fields: BTreeMap<_, _> = old
@@ -111,5 +114,7 @@ fn records_compatible(old: &RecordSchema, new: &RecordSchema) -> bool {
 }
 
 fn field_compatible(old: &Field, new: &Field) -> bool {
-    types_compatible(old.ty(), new.ty()) && !(old.optional() && !new.optional())
+    types_compatible(old.ty(), new.ty())
+        && !(old.optional() && !new.optional())
+        && old.unique() == new.unique()
 }

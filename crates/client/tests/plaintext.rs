@@ -6,10 +6,13 @@ use prost::Message;
 use recolith_client::{BatchOperation, Client, ClientConfig, ClientError};
 use recolith_protocol::compression::CompressionAlgorithm;
 use recolith_protocol::messages::{
-    AggregateRequest, BackupRequest, DescribeCollectionRequest, DocumentDeleteRequest,
-    DocumentGetRequest, DocumentGetResponse, ExplainRequest, FieldSelection, NamedParameter,
-    QueryRequest, QueryStreamRequest, SecurityMode, Value, describe_collection_request,
-    explain_response, feature, opcode, status, value,
+    AggregateRequest, BackupRequest, BucketDeleteRequest, BucketGetRequest, BucketPutRequest,
+    BucketRecordId, BucketScanRequest, DescribeCollectionRequest, DocumentDeleteRequest,
+    DocumentGetRequest, DocumentGetResponse, ExplainRequest, FieldSelection, FieldValue,
+    NamedParameter, QueryRequest, QueryStreamRequest, SecurityMode, Value, WorkflowDefinition,
+    WorkflowExecutionMode, WorkflowListRequest, WorkflowPutDocument, WorkflowResolveRequest,
+    WorkflowStartRequest, WorkflowStep, describe_collection_request, explain_response, feature,
+    opcode, status, value, workflow_step,
 };
 use recolith_server::ServerConfig;
 
@@ -347,6 +350,201 @@ async fn writes_online_backups_through_the_client() {
 }
 
 #[tokio::test]
+async fn manages_bucket_records_through_the_client() {
+    let address = support::start_server(
+        ServerConfig::new("127.0.0.1:0".parse().expect("address")),
+        support::game_store(),
+    )
+    .await;
+    let mut client = Client::connect(ClientConfig::new(address.to_string()))
+        .await
+        .expect("connect");
+
+    let id = BucketRecordId {
+        bucket_id: 2,
+        partition: 3,
+        fragment_id: 9,
+        document_key: b"k1".to_vec(),
+        subkey: Vec::new(),
+        keyspace: None,
+        bucket_name: None,
+    };
+    let fields = vec![FieldValue {
+        field_id: 2,
+        value: Some(Value {
+            kind: Some(value::Kind::U32Value(10)),
+        }),
+    }];
+    let put = BucketPutRequest {
+        meta: None,
+        id: Some(id.clone()),
+        fields,
+        if_match: None,
+    };
+    let put_response = client.bucket_put(&put).await.expect("bucket put");
+    assert!(put_response.commit_ts > 0);
+
+    let get = client
+        .bucket_get(&BucketGetRequest {
+            meta: None,
+            id: Some(id.clone()),
+        })
+        .await
+        .expect("bucket get");
+    let record = get.record.expect("record");
+    assert_eq!(record.schema_id, 1);
+    assert_eq!(record.commit_ts, put_response.commit_ts);
+    assert_eq!(record.fields.len(), 1);
+
+    let strict_put = BucketPutRequest {
+        meta: None,
+        id: Some(BucketRecordId {
+            bucket_id: 1,
+            partition: 0,
+            fragment_id: 1,
+            document_key: support::document_key(1),
+            subkey: Vec::new(),
+            keyspace: None,
+            bucket_name: None,
+        }),
+        fields: Vec::new(),
+        if_match: None,
+    };
+    let error = client
+        .bucket_put(&strict_put)
+        .await
+        .expect_err("strict put");
+    assert!(
+        matches!(
+            error,
+            ClientError::Server {
+                status: status::INVALID_REQUEST,
+                ..
+            }
+        ),
+        "unexpected error: {error}"
+    );
+
+    let scan = client
+        .bucket_scan(&BucketScanRequest {
+            meta: None,
+            bucket_id: 2,
+            partition: 3,
+            fragment_id: None,
+            start_after: Vec::new(),
+            limit: 10,
+            keyspace: None,
+            bucket_name: None,
+        })
+        .await
+        .expect("bucket scan");
+    assert_eq!(scan.records.len(), 1);
+    let scanned_id = scan.records[0].id.as_ref().expect("record id");
+    assert_eq!(scanned_id.document_key, b"k1");
+    assert_eq!(scanned_id.fragment_id, 9);
+
+    let delete = client
+        .bucket_delete(&BucketDeleteRequest {
+            meta: None,
+            id: Some(id.clone()),
+        })
+        .await
+        .expect("bucket delete");
+    assert!(delete.deleted);
+    let delete = client
+        .bucket_delete(&BucketDeleteRequest {
+            meta: None,
+            id: Some(id),
+        })
+        .await
+        .expect("idempotent bucket delete");
+    assert!(!delete.deleted);
+}
+
+#[tokio::test]
+async fn resolves_bucket_names_through_the_client() {
+    let address = support::start_server(
+        ServerConfig::new("127.0.0.1:0".parse().expect("address")),
+        support::game_store(),
+    )
+    .await;
+    let mut client = Client::connect(ClientConfig::new(address.to_string()))
+        .await
+        .expect("connect");
+
+    let mut put = BucketPutRequest {
+        meta: None,
+        id: Some(BucketRecordId {
+            bucket_id: 0,
+            partition: 1,
+            fragment_id: 9,
+            document_key: b"n1".to_vec(),
+            subkey: Vec::new(),
+            keyspace: Some("game".to_owned()),
+            bucket_name: Some("scratch".to_owned()),
+        }),
+        fields: vec![FieldValue {
+            field_id: 2,
+            value: Some(Value {
+                kind: Some(value::Kind::U32Value(3)),
+            }),
+        }],
+        if_match: None,
+    };
+    client.bucket_put(&put).await.expect("put by name");
+
+    let get = client
+        .bucket_get(&BucketGetRequest {
+            meta: None,
+            id: put.id.clone(),
+        })
+        .await
+        .expect("get by name");
+    let record = get.record.expect("record");
+    assert_eq!(record.id.expect("id").bucket_id, 2);
+
+    // The same name without a keyspace is ambiguous between "game" and "meta".
+    put.id.as_mut().expect("id").keyspace = None;
+    let error = client
+        .bucket_get(&BucketGetRequest {
+            meta: None,
+            id: put.id.clone(),
+        })
+        .await
+        .expect_err("ambiguous name");
+    assert!(
+        matches!(
+            error,
+            ClientError::Server {
+                status: status::NOT_FOUND,
+                ..
+            }
+        ),
+        "unexpected error: {error}"
+    );
+
+    // An unknown name is also not found.
+    put.id.as_mut().expect("id").keyspace = Some("meta".to_owned());
+    put.id.as_mut().expect("id").bucket_name = Some("missing".to_owned());
+    let error = client
+        .bucket_get(&BucketGetRequest {
+            meta: None,
+            id: put.id.clone(),
+        })
+        .await
+        .expect_err("unknown name");
+    assert!(matches!(
+        error,
+        ClientError::Server {
+            status: status::NOT_FOUND,
+            ..
+        }
+    ));
+
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
 async fn deletes_documents_through_the_client() {
     let address = support::start_server(
         ServerConfig::new("127.0.0.1:0".parse().expect("address")),
@@ -499,4 +697,229 @@ async fn authenticates_with_bearer_tokens() {
         ),
         "unexpected error: {error}"
     );
+}
+
+#[tokio::test]
+async fn starts_and_tracks_workflows_through_the_client() {
+    use recolith_protocol::messages::{
+        WorkflowCancelRequest, WorkflowDefinition, WorkflowPutDocument, WorkflowStartRequest,
+        WorkflowState, WorkflowStatusRequest, WorkflowStep, workflow_step,
+    };
+
+    let address = support::start_server(
+        ServerConfig::new("127.0.0.1:0".parse().expect("address")),
+        support::game_store(),
+    )
+    .await;
+    let mut client = Client::connect(ClientConfig::new(address.to_string()))
+        .await
+        .expect("connect");
+    let key = support::document_key(7);
+
+    let definition = WorkflowDefinition {
+        steps: vec![WorkflowStep {
+            kind: Some(workflow_step::Kind::PutDocument(WorkflowPutDocument {
+                collection_id: 1,
+                partition: 0,
+                document_key: key.clone(),
+                fragments: vec![support::profile_payload(&key, "alex", b"wf-1")],
+                ttl_seconds: None,
+            })),
+        }],
+    };
+    let response = client
+        .start_workflow(&WorkflowStartRequest {
+            meta: None,
+            id: "client-saga".to_owned(),
+            definition: Some(definition),
+            execution_mode: WorkflowExecutionMode::Sync as i32,
+        })
+        .await
+        .expect("start workflow");
+    let workflow = response.workflow.expect("workflow");
+    assert_eq!(workflow.id, "client-saga");
+    assert_eq!(workflow.state, WorkflowState::Completed as i32);
+
+    let status = client
+        .workflow_status(&WorkflowStatusRequest {
+            meta: None,
+            id: "client-saga".to_owned(),
+        })
+        .await
+        .expect("status");
+    assert_eq!(status.state, WorkflowState::Completed as i32);
+
+    let cancelled = client
+        .cancel_workflow(&WorkflowCancelRequest {
+            meta: None,
+            id: "client-saga".to_owned(),
+        })
+        .await
+        .expect("cancel");
+    assert_eq!(cancelled.state, WorkflowState::Completed as i32);
+
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn starts_workflows_asynchronously_through_the_client() {
+    use recolith_protocol::messages::{WorkflowState, WorkflowStatusRequest};
+
+    let address = support::start_server(
+        ServerConfig::new("127.0.0.1:0".parse().expect("address")),
+        support::game_store(),
+    )
+    .await;
+    let mut client = Client::connect(ClientConfig::new(address.to_string()))
+        .await
+        .expect("connect");
+    let key = support::document_key(11);
+
+    let definition = WorkflowDefinition {
+        steps: vec![WorkflowStep {
+            kind: Some(workflow_step::Kind::PutDocument(WorkflowPutDocument {
+                collection_id: 1,
+                partition: 0,
+                document_key: key.clone(),
+                fragments: vec![support::profile_payload(&key, "alex", b"wf-async")],
+                ttl_seconds: None,
+            })),
+        }],
+    };
+    let response = client
+        .start_workflow(&WorkflowStartRequest {
+            meta: None,
+            id: "async-saga".to_owned(),
+            definition: Some(definition),
+            execution_mode: WorkflowExecutionMode::Async as i32,
+        })
+        .await
+        .expect("start async workflow");
+    let workflow = response.workflow.expect("workflow");
+    assert_eq!(workflow.id, "async-saga");
+    assert_ne!(workflow.state, WorkflowState::Failed as i32);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut state = workflow.state;
+    while state != WorkflowState::Completed as i32 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let status = client
+            .workflow_status(&WorkflowStatusRequest {
+                meta: None,
+                id: "async-saga".to_owned(),
+            })
+            .await
+            .expect("status");
+        state = status.state;
+    }
+    assert_eq!(state, WorkflowState::Completed as i32);
+
+    client.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn lists_and_resolves_workflows_through_the_client() {
+    use recolith_protocol::messages::WorkflowResolveAction;
+
+    let address = support::start_server(
+        ServerConfig::new("127.0.0.1:0".parse().expect("address")),
+        support::game_store(),
+    )
+    .await;
+    let mut client = Client::connect(ClientConfig::new(address.to_string()))
+        .await
+        .expect("connect");
+    let key = support::document_key(9);
+
+    client
+        .start_workflow(&WorkflowStartRequest {
+            meta: None,
+            id: "list-a".to_owned(),
+            definition: Some(WorkflowDefinition {
+                steps: vec![WorkflowStep {
+                    kind: Some(workflow_step::Kind::PutDocument(WorkflowPutDocument {
+                        collection_id: 1,
+                        partition: 0,
+                        document_key: key.clone(),
+                        fragments: vec![support::profile_payload(&key, "alex", b"list-1")],
+                        ttl_seconds: None,
+                    })),
+                }],
+            }),
+            execution_mode: WorkflowExecutionMode::Sync as i32,
+        })
+        .await
+        .expect("start");
+    client
+        .start_workflow(&WorkflowStartRequest {
+            meta: None,
+            id: "list-b".to_owned(),
+            definition: Some(WorkflowDefinition {
+                steps: vec![WorkflowStep {
+                    kind: Some(workflow_step::Kind::DeleteDocument(
+                        recolith_protocol::messages::WorkflowDeleteDocument {
+                            collection_id: 1,
+                            partition: 0,
+                            document_key: key.clone(),
+                        },
+                    )),
+                }],
+            }),
+            execution_mode: WorkflowExecutionMode::Sync as i32,
+        })
+        .await
+        .expect("start delete workflow");
+
+    let listed = client
+        .workflow_list(&WorkflowListRequest {
+            meta: None,
+            start_after: String::new(),
+            limit: 10,
+        })
+        .await
+        .expect("list");
+    let ids: Vec<_> = listed
+        .workflows
+        .iter()
+        .map(|summary| summary.id.as_str())
+        .collect();
+    assert_eq!(ids, ["list-a", "list-b"]);
+
+    let page = client
+        .workflow_list(&WorkflowListRequest {
+            meta: None,
+            start_after: "list-a".to_owned(),
+            limit: 10,
+        })
+        .await
+        .expect("list after");
+    let ids: Vec<_> = page
+        .workflows
+        .iter()
+        .map(|summary| summary.id.as_str())
+        .collect();
+    assert_eq!(ids, ["list-b"]);
+
+    // Deleting the doc makes the delete workflow's doc-delete step a no-op;
+    // both stay terminal so resolve is rejected.
+    let error = client
+        .resolve_workflow(&WorkflowResolveRequest {
+            meta: None,
+            id: "list-a".to_owned(),
+            action: WorkflowResolveAction::Retry as i32,
+        })
+        .await
+        .expect_err("non-failed workflow");
+    assert!(
+        matches!(
+            error,
+            ClientError::Server {
+                status: status::INVALID_REQUEST,
+                ..
+            }
+        ),
+        "unexpected error: {error}"
+    );
+
+    client.close().await.expect("close");
 }

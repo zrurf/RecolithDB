@@ -40,6 +40,24 @@ pub mod opcode {
     pub const CATALOG_ALTER: u16 = 0x0062;
     /// Online logical backup.
     pub const BACKUP: u16 = 0x0070;
+    /// Start a workflow.
+    pub const WF_START: u16 = 0x0080;
+    /// Query workflow status.
+    pub const WF_STATUS: u16 = 0x0081;
+    /// Cancel a workflow.
+    pub const WF_CANCEL: u16 = 0x0082;
+    /// Resolve a failed workflow.
+    pub const WF_RESOLVE: u16 = 0x0083;
+    /// List workflows.
+    pub const WF_LIST: u16 = 0x0084;
+    /// Direct bucket record read.
+    pub const BUCKET_GET: u16 = 0x0090;
+    /// Direct bucket record write.
+    pub const BUCKET_PUT: u16 = 0x0091;
+    /// Direct bucket record delete.
+    pub const BUCKET_DELETE: u16 = 0x0092;
+    /// Direct bucket record scan.
+    pub const BUCKET_SCAN: u16 = 0x0093;
     /// Structured error response.
     pub const ERROR: u16 = 0x0040;
     /// Session shutdown notice.
@@ -120,6 +138,10 @@ pub mod feature {
     pub const DOCUMENT_DELETE: u64 = 1 << 12;
     /// Document TTL expiry is supported.
     pub const TTL: u64 = 1 << 13;
+    /// Cross-partition workflows are supported.
+    pub const WORKFLOW: u64 = 1 << 14;
+    /// Direct bucket record operations are supported.
+    pub const BUCKET_OPS: u64 = 1 << 15;
 }
 
 /// Compression algorithm bits used by the handshake.

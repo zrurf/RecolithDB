@@ -8,18 +8,22 @@ pub mod document;
 pub mod metrics;
 pub mod migration;
 pub mod net;
+pub mod observability;
 pub mod offline_migration;
 mod query_cursor;
 pub mod reaper;
+pub mod workflow;
 
 pub use backup::{BackupError, BackupStats, backup, backup_snapshot, restore, verify};
 pub use bootstrap::{BootstrapError, load_bootstrap, parse_bootstrap};
 pub use config::{
-    AuthSettings, BackupSettings, CatalogSettings, Config, ConfigError, ServerSettings,
-    StorageSettings, TlsSettings, TtlSettings,
+    AuthSettings, BackupSettings, CatalogSettings, Config, ConfigError, ObservabilitySettings,
+    PlacementSettings, ServerSettings, StorageSettings, TlsSettings, TtlSettings,
+    WorkflowExecution, WorkflowSettings,
 };
 pub use document::{
-    DocumentError, DocumentStore, DocumentWrite, FragmentWriteRequest, Idempotency, TtlSweep,
+    BucketRecordData, CounterChange, DocumentError, DocumentStore, DocumentWrite,
+    FragmentWriteRequest, Idempotency, ReconcileStats, TtlSweep,
 };
 pub use metrics::{MetricsSnapshot, ServerMetrics};
 pub use migration::{
@@ -32,3 +36,4 @@ pub use offline_migration::{
     OfflineMigrationError, migration_in_progress,
 };
 pub use reaper::run_ttl_reaper;
+pub use workflow::{MAX_WORKFLOW_ID_LEN, MAX_WORKFLOW_STEPS, WorkflowError};

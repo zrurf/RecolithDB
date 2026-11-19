@@ -69,6 +69,19 @@ pub fn game_catalog() -> Catalog {
         )
         .expect("bucket");
     catalog
+        .create_bucket(
+            KeyspaceId::new(1),
+            Bucket::new(
+                BucketId::new(2),
+                "scratch",
+                8,
+                recolith_model::BucketPolicy::Raw,
+                SchemaId::new(1),
+                SchemaVersion::new(1),
+            ),
+        )
+        .expect("raw bucket");
+    catalog
         .create_collection(Collection::new(
             CollectionId::new(1),
             KeyspaceId::new(1),

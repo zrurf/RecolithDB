@@ -1,4 +1,4 @@
-use recolith_catalog::{Catalog, CatalogChanges, CatalogError};
+use recolith_catalog::{Catalog, CatalogChanges, CatalogError, apply::PlacementChange};
 use recolith_common::{
     BucketId, CollectionId, FieldId, FragmentId, IndexId, KeyspaceId, SchemaId, SchemaVersion,
 };
@@ -53,7 +53,52 @@ fn changes() -> CatalogChanges {
                 vec![FieldId::new(2)],
             ),
         )],
+        placements: Vec::new(),
     }
+}
+
+#[test]
+fn applies_placements_with_bucket_partition_count() {
+    let catalog = Catalog::new();
+    let updated = catalog
+        .apply_changes(&changes())
+        .expect("apply")
+        .expect("changed");
+    let mut placed = changes();
+    placed.placements = vec![PlacementChange {
+        bucket_id: BucketId::new(1),
+        backend_id: recolith_common::BackendId::new(5),
+        affinity_group: "us-east".to_owned(),
+    }];
+
+    let next = updated
+        .apply_changes(&placed)
+        .expect("apply")
+        .expect("changed");
+    let snapshot = next.snapshot().expect("snapshot");
+    let placement = snapshot
+        .placements
+        .get(&BucketId::new(1))
+        .expect("placement");
+    assert_eq!(placement.backend_id().get(), 5);
+    assert_eq!(placement.partition_count(), 16);
+
+    // Reapplying the identical placement is a no-op.
+    assert!(next.apply_changes(&placed).expect("apply").is_none());
+    // A different backend for the same bucket conflicts.
+    let mut conflicting = placed.clone();
+    conflicting.placements[0].backend_id = recolith_common::BackendId::new(6);
+    assert!(matches!(
+        next.apply_changes(&conflicting),
+        Err(CatalogError::Conflict(message)) if message.contains("placement")
+    ));
+    // An unknown bucket is rejected.
+    let mut unknown = placed;
+    unknown.placements[0].bucket_id = BucketId::new(9);
+    assert!(matches!(
+        next.apply_changes(&unknown),
+        Err(CatalogError::NotFound("bucket"))
+    ));
 }
 
 #[test]

@@ -109,11 +109,23 @@ pub enum Command {
         #[command(subcommand)]
         command: DocCommand,
     },
+    /// Reads or writes bucket records directly.
+    Bucket {
+        /// Bucket command.
+        #[command(subcommand)]
+        command: BucketCommand,
+    },
     /// Issues local authentication tokens.
     Token {
         /// Token command.
         #[command(subcommand)]
         command: TokenCommand,
+    },
+    /// Inspects and manages server-side workflows.
+    Workflow {
+        /// Workflow command.
+        #[command(subcommand)]
+        command: WorkflowCommand,
     },
     /// Creates catalog objects through the server.
     Catalog {
@@ -382,6 +394,119 @@ pub enum TokenCommand {
     },
 }
 
+/// Direct bucket record commands.
+#[derive(Debug, Subcommand)]
+pub enum BucketCommand {
+    /// Reads one record directly from a bucket.
+    Get {
+        /// Keyspace name used to disambiguate the bucket.
+        #[arg(long)]
+        keyspace: Option<String>,
+        /// Bucket name or identifier.
+        #[arg(long)]
+        bucket: String,
+        /// Partition index.
+        #[arg(long, default_value_t = 0)]
+        partition: u32,
+        /// Fragment identifier.
+        #[arg(long)]
+        fragment: u32,
+        /// Document key as hexadecimal.
+        #[arg(long, group = "get_key")]
+        key_hex: Option<String>,
+        /// Document key as UTF-8 text.
+        #[arg(long, group = "get_key")]
+        key: Option<String>,
+        /// Record subkey as hexadecimal.
+        #[arg(long, group = "get_subkey")]
+        subkey_hex: Option<String>,
+        /// Record subkey as UTF-8 text.
+        #[arg(long, group = "get_subkey")]
+        subkey: Option<String>,
+    },
+    /// Writes one record directly to a bucket.
+    Put {
+        /// Keyspace name used to disambiguate the bucket.
+        #[arg(long)]
+        keyspace: Option<String>,
+        /// Bucket name or identifier.
+        #[arg(long)]
+        bucket: String,
+        /// Partition index.
+        #[arg(long, default_value_t = 0)]
+        partition: u32,
+        /// Fragment identifier.
+        #[arg(long)]
+        fragment: u32,
+        /// Document key as hexadecimal.
+        #[arg(long, group = "put_key")]
+        key_hex: Option<String>,
+        /// Document key as UTF-8 text.
+        #[arg(long, group = "put_key")]
+        key: Option<String>,
+        /// Record subkey as hexadecimal.
+        #[arg(long, group = "put_subkey")]
+        subkey_hex: Option<String>,
+        /// Record subkey as UTF-8 text.
+        #[arg(long, group = "put_subkey")]
+        subkey: Option<String>,
+        /// Field value in `field_id=type:value` form.
+        #[arg(long = "field", value_name = "FIELD_ID=TYPE:VALUE")]
+        fields: Vec<String>,
+        /// Expected record commit timestamp for an optimistic write.
+        #[arg(long)]
+        if_match: Option<u64>,
+    },
+    /// Deletes one record directly from a bucket.
+    Delete {
+        /// Keyspace name used to disambiguate the bucket.
+        #[arg(long)]
+        keyspace: Option<String>,
+        /// Bucket name or identifier.
+        #[arg(long)]
+        bucket: String,
+        /// Partition index.
+        #[arg(long, default_value_t = 0)]
+        partition: u32,
+        /// Fragment identifier.
+        #[arg(long)]
+        fragment: u32,
+        /// Document key as hexadecimal.
+        #[arg(long, group = "delete_key")]
+        key_hex: Option<String>,
+        /// Document key as UTF-8 text.
+        #[arg(long, group = "delete_key")]
+        key: Option<String>,
+        /// Record subkey as hexadecimal.
+        #[arg(long, group = "delete_subkey")]
+        subkey_hex: Option<String>,
+        /// Record subkey as UTF-8 text.
+        #[arg(long, group = "delete_subkey")]
+        subkey: Option<String>,
+    },
+    /// Scans records of one bucket partition in storage-key order.
+    Scan {
+        /// Keyspace name used to disambiguate the bucket.
+        #[arg(long)]
+        keyspace: Option<String>,
+        /// Bucket name or identifier.
+        #[arg(long)]
+        bucket: String,
+        /// Partition index.
+        #[arg(long, default_value_t = 0)]
+        partition: u32,
+        /// Restricts the scan to one fragment identifier.
+        #[arg(long)]
+        fragment: Option<u32>,
+        /// Maximum number of records.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        /// Continues after this record key as hexadecimal.
+        #[arg(long)]
+        start_after_hex: Option<String>,
+    },
+}
+
 /// Document read and write commands.
 #[derive(Debug, Subcommand)]
 pub enum DocCommand {
@@ -472,5 +597,38 @@ pub enum DocCommand {
         /// Many-fragment subkey in `fragment=hex` form.
         #[arg(long = "subkey", value_name = "FRAGMENT=HEX")]
         subkeys: Vec<String>,
+    },
+}
+
+/// Workflow management commands.
+#[derive(Debug, Subcommand)]
+pub enum WorkflowCommand {
+    /// Prints one workflow's state and per-step results.
+    Status {
+        /// Workflow identifier.
+        id: String,
+    },
+    /// Cancels a running workflow and compensates succeeded steps.
+    Cancel {
+        /// Workflow identifier.
+        id: String,
+    },
+    /// Lists workflows ordered by identifier.
+    List {
+        /// Maximum number of workflows.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        /// List workflows after this identifier.
+        #[arg(long)]
+        start_after: Option<String>,
+    },
+    /// Resolves a failed workflow.
+    Resolve {
+        /// Workflow identifier.
+        id: String,
+        /// Resolution action: `retry` continues from the failed step,
+        /// `abandon` compensates and archives the workflow.
+        #[arg(long = "action", value_parser = ["retry", "abandon"])]
+        action: String,
     },
 }

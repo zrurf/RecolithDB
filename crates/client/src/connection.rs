@@ -9,13 +9,17 @@ use recolith_protocol::error::ProtocolError;
 use recolith_protocol::frame::{FrameCodec, FrameHeader, HEADER_LEN, VERSION_MAJOR, VERSION_MINOR};
 use recolith_protocol::messages::{
     AggregateRequest, AggregateResponse, AuthMethod, AuthResult, BackupRequest, BackupResponse,
+    BucketDeleteRequest, BucketDeleteResponse, BucketGetRequest, BucketGetResponse,
+    BucketPutRequest, BucketPutResponse, BucketScanRequest, BucketScanResponse,
     CatalogAlterRequest, CatalogAlterResponse, CatalogApplyRequest, CatalogApplyResponse,
     CatalogDropRequest, CatalogDropResponse, DescribeCollectionRequest, DescribeCollectionResponse,
     DocumentDeleteRequest, DocumentDeleteResponse, DocumentGetRequest, DocumentGetResponse,
     DocumentPutRequest, DocumentPutResponse, ErrorResponse, ExplainRequest, ExplainResponse,
     GoAway, HelloRequest, PingRequest, PingResponse, QueryChunk, QueryRequest, QueryResponse,
-    QueryStreamRequest, SecurityMode, WelcomeResponse, compression_bit, encoding_bit, feature,
-    opcode, status,
+    QueryStreamRequest, SecurityMode, WelcomeResponse, WorkflowCancelRequest, WorkflowListRequest,
+    WorkflowListResponse, WorkflowResolveRequest, WorkflowResolveResponse, WorkflowStartRequest,
+    WorkflowStartResponse, WorkflowStatusRequest, WorkflowStatusResponse, compression_bit,
+    encoding_bit, feature, opcode, status,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -354,6 +358,94 @@ impl Client {
         })
     }
 
+    /// Reads one record directly from a bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn bucket_get(
+        &mut self,
+        request: &BucketGetRequest,
+    ) -> Result<BucketGetResponse, ClientError> {
+        self.require_feature(feature::BUCKET_OPS, "bucket operations")?;
+        let body = self
+            .request(
+                opcode::BUCKET_GET,
+                opcode::BUCKET_GET,
+                &request.encode_to_vec(),
+            )
+            .await?;
+        BucketGetResponse::decode(body.as_slice()).map_err(|_| {
+            ClientError::UnexpectedResponse("malformed BUCKET_GET response".to_owned())
+        })
+    }
+
+    /// Writes one record directly to a bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn bucket_put(
+        &mut self,
+        request: &BucketPutRequest,
+    ) -> Result<BucketPutResponse, ClientError> {
+        self.require_feature(feature::BUCKET_OPS, "bucket operations")?;
+        let body = self
+            .request(
+                opcode::BUCKET_PUT,
+                opcode::BUCKET_PUT,
+                &request.encode_to_vec(),
+            )
+            .await?;
+        BucketPutResponse::decode(body.as_slice()).map_err(|_| {
+            ClientError::UnexpectedResponse("malformed BUCKET_PUT response".to_owned())
+        })
+    }
+
+    /// Deletes one record directly from a bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn bucket_delete(
+        &mut self,
+        request: &BucketDeleteRequest,
+    ) -> Result<BucketDeleteResponse, ClientError> {
+        self.require_feature(feature::BUCKET_OPS, "bucket operations")?;
+        let body = self
+            .request(
+                opcode::BUCKET_DELETE,
+                opcode::BUCKET_DELETE,
+                &request.encode_to_vec(),
+            )
+            .await?;
+        BucketDeleteResponse::decode(body.as_slice()).map_err(|_| {
+            ClientError::UnexpectedResponse("malformed BUCKET_DELETE response".to_owned())
+        })
+    }
+
+    /// Scans records of one bucket partition.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn bucket_scan(
+        &mut self,
+        request: &BucketScanRequest,
+    ) -> Result<BucketScanResponse, ClientError> {
+        self.require_feature(feature::BUCKET_OPS, "bucket operations")?;
+        let body = self
+            .request(
+                opcode::BUCKET_SCAN,
+                opcode::BUCKET_SCAN,
+                &request.encode_to_vec(),
+            )
+            .await?;
+        BucketScanResponse::decode(body.as_slice()).map_err(|_| {
+            ClientError::UnexpectedResponse("malformed BUCKET_SCAN response".to_owned())
+        })
+    }
+
     /// Explains how a query would be planned without executing it.
     ///
     /// # Errors
@@ -369,6 +461,104 @@ impl Client {
             .await?;
         ExplainResponse::decode(body.as_slice())
             .map_err(|_| ClientError::UnexpectedResponse("malformed EXPLAIN response".to_owned()))
+    }
+
+    /// Starts a workflow and runs it to a terminal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn start_workflow(
+        &mut self,
+        request: &WorkflowStartRequest,
+    ) -> Result<WorkflowStartResponse, ClientError> {
+        self.require_feature(feature::WORKFLOW, "workflows")?;
+        let body = self
+            .request(opcode::WF_START, opcode::WF_START, &request.encode_to_vec())
+            .await?;
+        WorkflowStartResponse::decode(body.as_slice())
+            .map_err(|_| ClientError::UnexpectedResponse("malformed WF_START response".to_owned()))
+    }
+
+    /// Returns one workflow's current state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn workflow_status(
+        &mut self,
+        request: &WorkflowStatusRequest,
+    ) -> Result<WorkflowStatusResponse, ClientError> {
+        self.require_feature(feature::WORKFLOW, "workflows")?;
+        let body = self
+            .request(
+                opcode::WF_STATUS,
+                opcode::WF_STATUS,
+                &request.encode_to_vec(),
+            )
+            .await?;
+        WorkflowStatusResponse::decode(body.as_slice())
+            .map_err(|_| ClientError::UnexpectedResponse("malformed WF_STATUS response".to_owned()))
+    }
+
+    /// Cancels one workflow and compensates succeeded steps.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn cancel_workflow(
+        &mut self,
+        request: &WorkflowCancelRequest,
+    ) -> Result<WorkflowStatusResponse, ClientError> {
+        self.require_feature(feature::WORKFLOW, "workflows")?;
+        let body = self
+            .request(
+                opcode::WF_CANCEL,
+                opcode::WF_CANCEL,
+                &request.encode_to_vec(),
+            )
+            .await?;
+        WorkflowStatusResponse::decode(body.as_slice())
+            .map_err(|_| ClientError::UnexpectedResponse("malformed WF_CANCEL response".to_owned()))
+    }
+
+    /// Resolves a failed workflow by retrying or abandoning it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn resolve_workflow(
+        &mut self,
+        request: &WorkflowResolveRequest,
+    ) -> Result<WorkflowResolveResponse, ClientError> {
+        self.require_feature(feature::WORKFLOW, "workflows")?;
+        let body = self
+            .request(
+                opcode::WF_RESOLVE,
+                opcode::WF_RESOLVE,
+                &request.encode_to_vec(),
+            )
+            .await?;
+        WorkflowResolveResponse::decode(body.as_slice()).map_err(|_| {
+            ClientError::UnexpectedResponse("malformed WF_RESOLVE response".to_owned())
+        })
+    }
+
+    /// Lists workflows ordered by identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError`] when the exchange fails.
+    pub async fn workflow_list(
+        &mut self,
+        request: &WorkflowListRequest,
+    ) -> Result<WorkflowListResponse, ClientError> {
+        self.require_feature(feature::WORKFLOW, "workflows")?;
+        let body = self
+            .request(opcode::WF_LIST, opcode::WF_LIST, &request.encode_to_vec())
+            .await?;
+        WorkflowListResponse::decode(body.as_slice())
+            .map_err(|_| ClientError::UnexpectedResponse("malformed WF_LIST response".to_owned()))
     }
 
     /// Describes a collection by name or identifier.
@@ -792,7 +982,8 @@ fn build_hello(config: &ClientConfig) -> HelloRequest {
             | feature::AGGREGATE
             | feature::BACKUP
             | feature::DOCUMENT_DELETE
-            | feature::TTL,
+            | feature::TTL
+            | feature::WORKFLOW,
         max_frame_size: to_u32(config.max_frame_size),
         max_batch_subframes: to_u32(config.max_batch_subframes),
         max_batch_bytes: to_u32(config.max_batch_bytes),

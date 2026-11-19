@@ -9,8 +9,9 @@ use recolith_protocol::messages::{
     BucketDefinition, BucketPolicy, CatalogAlterRequest, CatalogApplyRequest, CatalogDropRequest,
     CatalogIndexTarget, CollectionDefinition, FieldConversion, FieldMapping, FragmentCardinality,
     FragmentDefinition, IndexDefinition, IndexKind, KeyFieldDefinition, KeyFieldType,
-    KeyspaceDefinition, RedefineIndex, RequestMeta, SchemaDefinition, SchemaMigration,
-    SetBucketSchema, Value, catalog_alter_request, catalog_drop_request, field_mapping,
+    KeyspaceDefinition, PlacementDefinition, RedefineIndex, RequestMeta, SchemaDefinition,
+    SchemaMigration, SetBucketSchema, Value, catalog_alter_request, catalog_drop_request,
+    field_mapping,
 };
 
 use crate::args::CatalogCommand;
@@ -272,6 +273,13 @@ fn definition_request(definition: CatalogDefinition, generation: u64) -> Catalog
             name: index.name().to_owned(),
             kind: model_index_kind(index.kind()) as i32,
             fields: index.fields().iter().map(|field| field.get()).collect(),
+        });
+    }
+    for placement in definition.placements {
+        request.placements.push(PlacementDefinition {
+            bucket_id: placement.bucket_id.get(),
+            backend_id: placement.backend_id.get(),
+            affinity_group: placement.affinity_group.clone(),
         });
     }
 

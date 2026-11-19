@@ -1,6 +1,6 @@
 //! TCP and TLS server runtime and session handling.
 
-mod convert;
+pub(crate) mod convert;
 mod metadata;
 mod operations;
 mod session;
@@ -61,6 +61,8 @@ pub struct ServerConfig {
     pub max_decompressed_size: usize,
     /// Server compression threshold.
     pub compression_threshold: usize,
+    /// Threshold in milliseconds for slow-operation logs. Zero disables logging.
+    pub slow_query_threshold_ms: u64,
     /// Process-local server counters.
     pub metrics: Arc<ServerMetrics>,
     /// Optional token and role-based authenticator.
@@ -82,6 +84,7 @@ impl ServerConfig {
             max_batch_bytes: 1024 * 1024,
             max_decompressed_size: 16 * 1024 * 1024,
             compression_threshold: 512,
+            slow_query_threshold_ms: 200,
             metrics: Arc::new(ServerMetrics::new()),
             auth: None,
         }
